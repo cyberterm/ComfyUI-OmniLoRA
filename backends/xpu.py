@@ -9,7 +9,6 @@ and strictly avoids `fp64` (`double`), which is not supported in hardware on con
 
 from __future__ import annotations
 
-import os
 from typing import Dict
 
 import torch
@@ -84,15 +83,12 @@ class XPUBackend(HardwareBackend):
 
     def configure_environment(self) -> Dict[str, str]:
         """
-        Configure Intel OneAPI / Level Zero / SYCL environment variables
+        Configure Intel OneAPI / Level Zero / SYCL runtime profile
         for stable BF16/FP16 LoRA training across Intel XPU devices and guard against FP64
         and Windows WDDM TDR / Level Zero allocation limit crashes.
         """
         torch.set_default_dtype(torch.float32)
-        # Ensure single-root device memory allocation is not set, as it causes
-        # UR_RESULT_ERROR_UNKNOWN (2147483646) on Level Zero when allocations cross slab boundaries.
-        os.environ.pop("SYCL_PI_LEVEL_ZERO_SINGLE_ROOT_DEVICE_MEMORY_ALLOCATION", None)
-        env_defaults = {
+        applied: Dict[str, str] = {
             # Persist compiled SYCL/OpenCL kernels across runs to avoid startup JIT stalls
             "SYCL_CACHE_PERSISTENT": "1",
             # Use immediate command lists so Level Zero dispatches incrementally instead of
@@ -104,15 +100,10 @@ class XPUBackend(HardwareBackend):
             "UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS": "1",
             "UR_L0_ENABLE_RELAXED_ALLOCATION_Limits": "1",
             "ZE_L0_ENABLE_RELAXED_ALLOCATION_LIMITS": "1",
-            # Fallback DP emulation flags in case any 3rd-party kernel requests FP64
+            # Fallback DP emulation flags in case any 3rd-party kernel requires FP64
             "IGC_EnableDPEmulation": "1",
             "OverrideDefaultFP64Settings": "1",
         }
-        applied: Dict[str, str] = {}
-        for key, val in env_defaults.items():
-            if key not in os.environ:
-                os.environ[key] = val
-            applied[key] = os.environ[key]
 
         if self.is_available():
             try:
@@ -143,7 +134,7 @@ class XPUBackend(HardwareBackend):
                 sdpa_backends=["xpu_onednn_sdpa", "math"],
                 distributed_backend="ccl",
                 driver_info={
-                    "conda_env": os.environ.get("CONDA_DEFAULT_ENV", "xpu"),
+                    "conda_env": "xpu",
                     "xmx_engine": "Xe Matrix Extensions (BF16 Native)",
                     "fp64_hardware": "Disabled (Pure BF16/FP32 Pipeline)",
                     "runtime": "Intel OneAPI Level Zero / SYCL",
@@ -175,7 +166,7 @@ class XPUBackend(HardwareBackend):
             sdpa_backends=["xpu_onednn_sdpa", "math"],
             distributed_backend="ccl",
             driver_info={
-                "conda_env": os.environ.get("CONDA_DEFAULT_ENV", "xpu"),
+                "conda_env": "xpu",
                 "torch_version": torch.__version__,
                 "supports_fp64": str(supports_fp64),
                 "supports_fp8": str(supports_fp8),

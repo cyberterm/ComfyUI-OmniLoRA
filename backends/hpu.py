@@ -4,7 +4,6 @@ Intel Gaudi HPU Hardware Backend (`habana_frameworks.torch` / `torch.hpu`).
 
 from __future__ import annotations
 
-import os
 from typing import Dict
 import torch
 
@@ -51,14 +50,10 @@ class HPUBackend(HardwareBackend):
 
     def configure_environment(self) -> Dict[str, str]:
         torch.set_default_dtype(torch.float32)
-        env_defaults = {
+        applied: Dict[str, str] = {
             "PT_HPU_LAZY_MODE": "0",
             "LOG_LEVEL_ALL": "4",
         }
-        applied: Dict[str, str] = {}
-        for k, v in env_defaults.items():
-            os.environ.setdefault(k, v)
-            applied[k] = os.environ[k]
         if self.is_available() and hasattr(torch.hpu, "set_device"):
             try:
                 self.device_index = self._valid_device_index()

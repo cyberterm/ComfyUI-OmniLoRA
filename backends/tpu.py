@@ -5,7 +5,6 @@ Google Cloud TPU Hardware Backend (`torch_xla` / `xla:0` — TPU v5e-1, v4, v5p,
 from __future__ import annotations
 
 import contextlib
-import os
 from typing import Any, Dict, Iterator, Tuple
 import torch
 
@@ -79,14 +78,10 @@ class TPUBackend(HardwareBackend):
         # Keep XLA_USE_BF16=0 so FP32 master optimizer states (RAdamW exp_avg / exp_avg_sq)
         # and loss accumulators retain full 32-bit precision while autocast and bf16 weights
         # execute natively on the TPU bfloat16 Matrix Multiply Units (MXU).
-        env_defaults = {
+        applied: Dict[str, str] = {
             "PJRT_DEVICE": "TPU",
             "XLA_USE_BF16": "0",
         }
-        applied: Dict[str, str] = {}
-        for k, v in env_defaults.items():
-            os.environ.setdefault(k, v)
-            applied[k] = os.environ[k]
         self.device_index = self._valid_device_index()
         return applied
 

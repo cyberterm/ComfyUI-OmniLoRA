@@ -4,7 +4,6 @@ Huawei Ascend NPU Hardware Backend (`torch_npu` / `torch.npu`).
 
 from __future__ import annotations
 
-import os
 from typing import Dict
 import torch
 
@@ -50,14 +49,10 @@ class NPUBackend(HardwareBackend):
 
     def configure_environment(self) -> Dict[str, str]:
         torch.set_default_dtype(torch.float32)
-        env_defaults = {
+        applied: Dict[str, str] = {
             "TASK_QUEUE_ENABLE": "1",
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
         }
-        applied: Dict[str, str] = {}
-        for k, v in env_defaults.items():
-            os.environ.setdefault(k, v)
-            applied[k] = os.environ[k]
         if self.is_available():
             try:
                 self.device_index = self._valid_device_index()

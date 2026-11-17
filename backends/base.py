@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import abc
 import contextlib
-import ctypes
+import gc
 import math
 import os
 import sys
@@ -47,34 +47,23 @@ def query_comfy_device_memory_mb(device: torch.device) -> Optional[Tuple[float, 
 
 def query_host_ram_mb() -> Tuple[float, float]:
     """
-    Cross-platform query for `(total_ram_mb, available_ram_mb)` across Windows, Linux, and macOS
-    without requiring external packages.
+    Cross-platform query for `(total_ram_mb, available_ram_mb)` across Windows, Linux, and macOS.
     """
-    # 1. Windows via GlobalMemoryStatusEx
-    if sys.platform == "win32":
-        try:
-            class _MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
+    # 1. ComfyUI model_management / psutil (bundled in standard ComfyUI environments)
+    try:
+        import psutil  # type: ignore
 
-            stat = _MEMORYSTATUSEX()
-            stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):  # type: ignore[attr-defined]
-                total_mb = float(stat.ullTotalPhys) / (1024**2)
-                avail_mb = float(stat.ullAvailPhys) / (1024**2)
-                if total_mb > 0:
-                    return (round(total_mb, 1), round(avail_mb, 1))
-        except Exception:
-            pass
+        vm = psutil.virtual_memory()
+        total_mb = float(vm.total) / (1024**2)
+        avail_mb = float(vm.available) / (1024**2)
+        if total_mb > 0:
+            return (round(total_mb, 1), round(avail_mb, 1))
+    except Exception:
+        pass
+
+    comfy_cpu_mem = query_comfy_device_memory_mb(torch.device("cpu"))
+    if comfy_cpu_mem is not None and comfy_cpu_mem[0] > 0:
+        return comfy_cpu_mem
 
     # 2. Linux via /proc/meminfo
     if os.path.exists("/proc/meminfo"):
@@ -94,7 +83,7 @@ def query_host_ram_mb() -> Tuple[float, float]:
         except Exception:
             pass
 
-    # 3. POSIX sysconf (macOS / BSD / Linux fallback) + macOS sysctlbyname("hw.memsize")
+    # 3. POSIX sysconf (macOS / BSD / Linux fallback)
     try:
         if hasattr(os, "sysconf"):
             page_size = float(os.sysconf("SC_PAGE_SIZE"))
@@ -104,20 +93,6 @@ def query_host_ram_mb() -> Tuple[float, float]:
                 return (round(total_mb, 1), round(total_mb * 0.75, 1))
     except Exception:
         pass
-
-    if sys.platform == "darwin":
-        try:
-            import ctypes
-
-            libc = ctypes.CDLL("libSystem.B.dylib")
-            memsize = ctypes.c_uint64(0)
-            size = ctypes.c_size_t(ctypes.sizeof(memsize))
-            if libc.sysctlbyname(b"hw.memsize", ctypes.byref(memsize), ctypes.byref(size), None, 0) == 0:
-                total_mb = float(memsize.value) / (1024**2)
-                if total_mb > 0:
-                    return (round(total_mb, 1), round(total_mb * 0.75, 1))
-        except Exception:
-            pass
 
     return (32768.0, 24576.0)
 
@@ -940,43 +915,15 @@ def sanitize_module_no_fp64(module: nn.Module) -> nn.Module:
     return module
 
 
-_LINUX_LIBC: Optional[Any] = None
-_DARWIN_LIBSYSTEM: Optional[Any] = None
-
-
 def trim_process_working_set() -> None:
     """
-    Request the OS allocator to return *unused freed heap arenas/magazines* without
-    evicting active process working-set pages:
-    - Windows (`win32`): intentional no-op. Note that `K32EmptyWorkingSet(GetCurrentProcess())`
-      forcibly strips *all* active pages from the process working set (including `torch_xpu.dll`,
-      `dnnl.dll`, `ze_intel_gpu64.dll`, Level Zero / WDDM host command queues, cached training
-      latents, and CPU-offloaded weights), causing thousands of page faults and slowing down
-      subsequent training steps. Windows automatically reclaims clean `safetensors` mmap pages
-      when physical RAM is needed.
-    - Linux (`linux*`): calls `libc.malloc_trim(0)` to return freed glibc top-of-heap arenas.
-    - macOS (`darwin`): calls `malloc_zone_pressure_relief(None, 0)` in `libSystem.B.dylib`
-      to release unused libmalloc magazine pages back to Darwin unified memory.
+    Reclaim cyclic Python references and release unreferenced tensor storage without
+    evicting active process working-set pages.
     """
-    global _LINUX_LIBC, _DARWIN_LIBSYSTEM
-    if sys.platform == "win32":
-        return
-    elif sys.platform.startswith("linux"):
-        try:
-            if _LINUX_LIBC is None:
-                _LINUX_LIBC = ctypes.CDLL("libc.so.6")
-            if hasattr(_LINUX_LIBC, "malloc_trim"):
-                _LINUX_LIBC.malloc_trim(0)
-        except Exception:
-            pass
-    elif sys.platform == "darwin":
-        try:
-            if _DARWIN_LIBSYSTEM is None:
-                _DARWIN_LIBSYSTEM = ctypes.CDLL("libSystem.B.dylib")
-            if hasattr(_DARWIN_LIBSYSTEM, "malloc_zone_pressure_relief"):
-                _DARWIN_LIBSYSTEM.malloc_zone_pressure_relief(None, 0)
-        except Exception:
-            pass
+    try:
+        gc.collect()
+    except Exception:
+        pass
 
 
 

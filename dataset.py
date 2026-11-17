@@ -81,11 +81,7 @@ def _open_pil_image_any_format(img_path: Path):
          or `pillow-heif` when installed).
       2. `imageio.v3.imread` / `imageio.imread` fallback (supports AVIF via pyav/imageio plugins).
       3. `cv2.imread(..., cv2.IMREAD_UNCHANGED)` (`opencv-python`, standard in ComfyUI venvs).
-      4. `ffmpeg` subprocess pipe (`ffmpeg -i <file> -frames:v 1 -f image2pipe -vcodec png -`).
     """
-    import io
-    import shutil
-    import subprocess
     from PIL import Image, ImageOps
 
     _ensure_image_format_plugins_registered()
@@ -139,37 +135,6 @@ def _open_pil_image_any_format(img_path: Path):
                 return Image.fromarray(rgba_mat, mode="RGBA")
     except Exception:
         pass
-
-    # Fallback 3: ffmpeg pipe (commonly available in ComfyUI video/DirectML installations)
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin:
-        try:
-            proc = subprocess.run(
-                [
-                    ffmpeg_bin,
-                    "-nostdin",
-                    "-v",
-                    "error",
-                    "-i",
-                    str(img_path),
-                    "-frames:v",
-                    "1",
-                    "-f",
-                    "image2pipe",
-                    "-vcodec",
-                    "png",
-                    "-",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=15,
-                check=False,
-            )
-            if proc.returncode == 0 and proc.stdout:
-                with Image.open(io.BytesIO(proc.stdout)) as piped_img:
-                    return piped_img.copy()
-        except Exception:
-            pass
 
     ext_lower = img_path.suffix.lower()
     if ext_lower in (".avif", ".heic", ".heif"):
@@ -670,7 +635,8 @@ class OmniLoRADataset:
         for ext in (".txt", ".caption"):
             caption_file = img_path.with_suffix(ext)
             if caption_file.is_file():
-                return caption_file.read_text(encoding="utf-8", errors="ignore").strip()
+                with open(caption_file, "r", encoding="utf-8", errors="ignore") as f:
+                    return f.read().strip()
         if manifest_captions:
             for cand_key in (
                 img_path.name,
@@ -703,7 +669,9 @@ class OmniLoRADataset:
                 jl_path = scan_dir / jsonl_name
                 if jl_path.is_file():
                     try:
-                        for raw_line in jl_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        with open(jl_path, "r", encoding="utf-8", errors="ignore") as f:
+                            jl_lines = f.read().splitlines()
+                        for raw_line in jl_lines:
                             line = raw_line.strip()
                             if not line:
                                 continue
@@ -732,7 +700,8 @@ class OmniLoRADataset:
                 j_path = scan_dir / json_name
                 if j_path.is_file():
                     try:
-                        parsed = _json.loads(j_path.read_text(encoding="utf-8", errors="ignore"))
+                        with open(j_path, "r", encoding="utf-8", errors="ignore") as f:
+                            parsed = _json.loads(f.read())
                         if isinstance(parsed, dict):
                             for k, v in parsed.items():
                                 if isinstance(v, str) and v.strip():

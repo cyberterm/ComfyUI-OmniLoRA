@@ -554,7 +554,8 @@ class TestOmniLoRAFramework(unittest.TestCase):
         for wf_name in expected_workflows:
             wf_path = wf_dir / wf_name
             self.assertTrue(wf_path.is_file(), f"Missing workflow file: {wf_path}")
-            wf = json.loads(wf_path.read_text(encoding="utf-8"))
+            with open(wf_path, "r", encoding="utf-8") as f:
+                wf = json.load(f)
             self.assertIn("nodes", wf)
             self.assertIn("links", wf)
 
@@ -1497,7 +1498,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
         Verify:
         1. `OmniLoRADataset` never permanently drops captions or flips images at load time; instead,
            `OmniLoRAPrecomputeConditioning` caches both `latents` and `latents_flipped` plus the
-           sequence-padded `uncond_prompt_embeds` (`""`), and `OmniLoRATrainer` applies `random_flip`
+           unpadded `uncond_prompt_embeds` (`""`), and `OmniLoRATrainer` applies `random_flip`
            and `caption_dropout` dynamically per training step.
         2. All LR schedulers (`cosine`, `rex`, `constant_with_warmup`, `constant`, `linear`,
            `cosine_with_restarts`) perform linear warmup (`warmup_steps`) and proportional decay
@@ -1561,8 +1562,8 @@ class TestOmniLoRAFramework(unittest.TestCase):
         self.assertAlmostEqual(bundle.caption_dropout, 0.5, places=5)
         self.assertIsNotNone(bundle.uncond_prompt_embeds)
         assert bundle.uncond_prompt_embeds is not None
-        # Unconditional prompt (4 tokens) must be padded to match the 12-token conditional sequence length
-        self.assertEqual(tuple(bundle.uncond_prompt_embeds.shape), (1, 12, 64))
+        # Unconditional prompt (4 tokens) preserves its exact unpadded token sequence length
+        self.assertEqual(tuple(bundle.uncond_prompt_embeds.shape), (1, 4, 64))
         self.assertIn("latents_flipped", bundle.batches[0])
         lat_orig = bundle.batches[0]["latents"]
         lat_flip = bundle.batches[0]["latents_flipped"]

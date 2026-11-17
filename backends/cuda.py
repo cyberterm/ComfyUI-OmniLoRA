@@ -5,7 +5,6 @@ NVIDIA CUDA Hardware Backend (`torch.cuda`).
 from __future__ import annotations
 
 from typing import Dict
-import os
 import torch
 
 from .base import (
@@ -77,13 +76,9 @@ class CUDABackend(HardwareBackend):
 
     def configure_environment(self) -> Dict[str, str]:
         torch.set_default_dtype(torch.float32)
-        env_defaults = {
+        applied: Dict[str, str] = {
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         }
-        applied: Dict[str, str] = {}
-        for k, v in env_defaults.items():
-            os.environ.setdefault(k, v)
-            applied[k] = os.environ[k]
         if self.is_available():
             try:
                 self.device_index = self._valid_device_index()

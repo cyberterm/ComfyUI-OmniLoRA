@@ -771,7 +771,10 @@ class OmniLossTrackerWidget {
         this.ckptBtn.textContent = "Saving...";
         this.ckptBtn.classList.add("active");
         try {
-          const fetchFn = api && typeof api.fetchApi === "function" ? api.fetchApi.bind(api) : fetch;
+          const fetchFn =
+            api && typeof api.fetchApi === "function"
+              ? (url, options) => api.fetchApi(url, options)
+              : fetch;
           await fetchFn(`/omni_lora/metrics?save_checkpoint=1&_ts=${Date.now()}`, { cache: "no-store" });
           this.ckptBtn.textContent = "Queued ✓";
         } catch (_err) {

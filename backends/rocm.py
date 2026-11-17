@@ -4,7 +4,6 @@ AMD ROCm HIP Hardware Backend (`torch.cuda` + `torch.version.hip`).
 
 from __future__ import annotations
 
-import os
 from typing import Dict
 import torch
 
@@ -25,14 +24,10 @@ class ROCmBackend(CUDABackend):
 
     def configure_environment(self) -> Dict[str, str]:
         torch.set_default_dtype(torch.float32)
-        env_defaults = {
+        applied: Dict[str, str] = {
             "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
             "PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True",
         }
-        applied: Dict[str, str] = {}
-        for k, v in env_defaults.items():
-            os.environ.setdefault(k, v)
-            applied[k] = os.environ[k]
         if self.is_available():
             try:
                 self.device_index = self._valid_device_index()

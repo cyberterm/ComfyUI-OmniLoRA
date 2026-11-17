@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -24,12 +23,12 @@ _DISK_FLUSH_INTERVAL_SEC = 10.0
 
 
 def _default_state_file() -> Path:
-    return Path(tempfile.gettempdir()) / "omni_lora_tracker_runs.json"
+    return Path(__file__).resolve().parent / ".omni_lora_tracker_runs.json"
 
 
 class OmniLoRATelemetryStore:
     """
-    Thread-safe in-memory (with throttled atomic temp-file backup) store of OmniLoRA
+    Thread-safe in-memory (with throttled atomic state-file backup) store of OmniLoRA
     training runs and per-step metrics.
     """
 
@@ -53,7 +52,8 @@ class OmniLoRATelemetryStore:
         try:
             if not self._state_file.exists():
                 return
-            raw = self._state_file.read_text(encoding="utf-8")
+            with open(self._state_file, "r", encoding="utf-8") as f:
+                raw = f.read()
             if not raw.strip():
                 return
             parsed = json.loads(raw)

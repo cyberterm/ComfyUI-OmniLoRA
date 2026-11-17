@@ -330,7 +330,7 @@ def _load_lora_safetensors_or_pt(file_path: Path) -> Tuple[Dict[str, torch.Tenso
 
         raw_obj = comfy.utils.load_torch_file(str(file_path), safe_load=True)
     except Exception:
-        raw_obj = torch.load(str(file_path), map_location="cpu", weights_only=False)
+        raw_obj = torch.load(str(file_path), map_location="cpu", weights_only=True)
 
     if isinstance(raw_obj, dict):
         if "state_dict" in raw_obj and isinstance(raw_obj["state_dict"], dict):
