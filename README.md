@@ -17,7 +17,7 @@ Train LoRAs directly inside your ComfyUI workflow using the models, VAEs, and te
      Restart ComfyUI after cloning.
 2. **Load a Template**: [`example_workflows/omni_lora_basic_workflow.json`](./example_workflows/omni_lora_basic_workflow.json) can be found in the templates.
 3. **Set 3 Things & Click Queue**:
-   - In **`Load Diffusion Model` / `CLIPLoader` / `VAELoader`**: Pick your model, text encoder (set the matching `type`, e.g. `flux`, `qwen_image`, `wan`, `sd3`, `lumina2`), and VAE. You can also use a gguf loader of a checkpoint loader (SDXL).
+   - In **`Load Diffusion Model` / `CLIPLoader` / `VAELoader`**: Pick your model, text encoder (set the matching `type`, e.g. `flux`, `qwen_image`, `wan`, `sd3`, `lumina2`), and VAE. You can also use a gguf loader or a checkpoint loader (SDXL).
    - In **`OmniLoRA Dataset & Prompt Loader`**: Paste the folder path to your training images into `dataset_path` and set your `trigger_word` (e.g. `ohwx`).
    - Click **Queue Prompt**. Your trained `.safetensors` LoRA will be saved to `ComfyUI/models/loras/` and the patched `MODEL` output can wire straight into a `KSampler` for instant testing.
 
