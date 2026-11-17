@@ -4896,6 +4896,63 @@ class TestOmniLoRAFramework(unittest.TestCase):
                 _ = attn_mod.attention_sage(q_inf, k_inf, v_inf, 4)
                 _ = ck_mod.int8_attention(q_inf.view(1, 8, 4, 16).transpose(1, 2), k_inf.view(1, 8, 4, 16).transpose(1, 2), v_inf.view(1, 8, 4, 16).transpose(1, 2))
             self.assertEqual(infer_calls, ["ck_int8", "ck_int8_container", "sage", "raw_ck_int8"])
+
+            # 4. Verify `Anima.extra_conds` `t5xxl_ids` / `t5xxl_weights` unconditional `.unsqueeze(0)`
+            #    normalization through `ComfyModelAdapter._forward_backbone` for `batch_size=2`.
+            captured_anima_kw: Dict[str, Any] = {}
+
+            class _MockAnimaDiffusion(nn.Module):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.patch_spatial = 2
+                    self.patch_temporal = 1
+                    self.in_channels = 16
+                    self.out_channels = 16
+                    self.proj = nn.Linear(16, 16)
+
+                def forward(self, x: torch.Tensor, timesteps: torch.Tensor, context: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+                    captured_anima_kw["x_ndim"] = x.ndim
+                    captured_anima_kw["t5xxl_ids"] = kwargs.get("t5xxl_ids")
+                    captured_anima_kw["t5xxl_weights"] = kwargs.get("t5xxl_weights")
+                    return x + 0.0 * self.proj(context).mean()
+
+            class _MockAnimaBaseModel(nn.Module):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.diffusion_model = _MockAnimaDiffusion()
+
+                def extra_conds(self, **kwargs: Any) -> Dict[str, Any]:
+                    # Mirror `comfy.model_base.Anima.extra_conds` (`comfy/model_base.py:1548-1567`)
+                    out: Dict[str, Any] = {}
+                    cross_attn = kwargs.get("cross_attn")
+                    t5xxl_ids = kwargs.get("t5xxl_ids")
+                    t5xxl_weights = kwargs.get("t5xxl_weights")
+                    if cross_attn is not None:
+                        if t5xxl_ids is not None:
+                            if t5xxl_weights is not None:
+                                t5xxl_weights = t5xxl_weights.unsqueeze(0).unsqueeze(-1).to(cross_attn)
+                            t5xxl_ids = t5xxl_ids.unsqueeze(0)
+                            out["t5xxl_ids"] = types.SimpleNamespace(cond=t5xxl_ids)
+                            out["t5xxl_weights"] = types.SimpleNamespace(cond=t5xxl_weights)
+                        out["c_crossattn"] = types.SimpleNamespace(cond=cross_attn)
+                    return out
+
+            anima_base = _MockAnimaBaseModel()
+            anima_adapter = ComfyModelAdapter(comfy_model=anima_base, model_id="anima")
+            with torch.enable_grad():
+                _ = anima_adapter._forward_backbone(
+                    backbone=anima_base.diffusion_model,
+                    noisy_latents=torch.randn(2, 16, 1, 8, 8),
+                    timesteps=torch.tensor([0.5, 0.5]),
+                    prompt_embeds=torch.randn(2, 6, 16, requires_grad=True),
+                    extra_cond_dict={
+                        "t5xxl_ids": torch.tensor([[10, 11, 12, 0], [20, 21, 22, 23]], dtype=torch.int32),
+                        "t5xxl_weights": torch.ones((2, 4), dtype=torch.float32),
+                    },
+                )
+            self.assertEqual(tuple(captured_anima_kw["t5xxl_ids"].shape), (2, 4))
+            self.assertFalse(torch.is_floating_point(captured_anima_kw["t5xxl_ids"]))
+            self.assertEqual(tuple(captured_anima_kw["t5xxl_weights"].shape), (2, 4, 1))
         finally:
             for k_mod, orig_mod in saved_mods.items():
                 if orig_mod is None:

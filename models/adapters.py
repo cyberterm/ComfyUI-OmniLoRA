@@ -761,7 +761,17 @@ class ComfyModelAdapter(BaseModelAdapter):
                 self._cached_context_dim[bid] = in_f
                 return in_f
 
-        for attr in ("context_in", "context_embedder", "txt_embed", "cond_proj", "caption_projection", "txt_in", "llm_proj"):
+        for attr in (
+            "context_in",
+            "context_embedder",
+            "txt_embed",
+            "cond_proj",
+            "condition_proj",
+            "text_proj",
+            "caption_projection",
+            "txt_in",
+            "llm_proj",
+        ):
             mod = getattr(backbone, attr, None)
             in_f = _get_linear_in_features(mod)
             if in_f is not None:
@@ -799,6 +809,8 @@ class ComfyModelAdapter(BaseModelAdapter):
             "caption_channels",
             "cross_attention_dim",
             "context_dim",
+            "text_dim",
+            "text_in_dim",
             "llm_dim",
         ):
             cfg_val = getattr(backbone, cfg_key, self.unet_config.get(cfg_key))
@@ -1398,7 +1410,7 @@ class ComfyModelAdapter(BaseModelAdapter):
                         val = getattr(v, "cond", v)
 
                     if isinstance(val, torch.Tensor):
-                        val = val.detach().clone()
+                        val = val.clone() if (torch.is_grad_enabled() and val.requires_grad) else val.detach().clone()
                         if torch.is_floating_point(val):
                             val = safe_to_device(val, device=noisy_latents.device, dtype=noisy_latents.dtype)
                         else:
