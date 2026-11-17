@@ -1,0 +1,17 @@
+[project]
+name = "comfyui-omni-lora"
+description = "General-Purpose Multi-Backend PyTorch LoRA Trainer for ComfyUI (Intel Arc XPU, ROCm, CUDA, Cloud TPU, Ascend NPU, Gaudi HPU, DirectML, MPS, CPU) with FP64-free execution."
+version = "1.0.0"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+requires-python = ">=3.10"
+# Zero external pip dependencies: relies solely on packages already bundled in ComfyUI (torch, safetensors, Pillow)
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/omni-lora/comfyui-omni-lora"
+
+[tool.comfy]
+PublisherId = "omni-lora"
+DisplayName = "ComfyUI-OmniLoRA (Universal Multi-GPU & Intel Arc XPU LoRA Trainer)"
+Icon = ""
