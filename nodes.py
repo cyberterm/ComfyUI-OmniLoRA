@@ -186,20 +186,65 @@ def _check_comfy_interrupt() -> None:
         pass
 
 
-def _resolve_comfy_loras_dir(fallback_dir: str = "./models/loras") -> Path:
-    """Resolve `ComfyUI/models/loras` via `folder_paths` when running inside ComfyUI."""
+def _cleanup_stray_custom_nodes_models_dir() -> None:
+    """
+    If an earlier scanner run with cwd=`ComfyUI/custom_nodes` created an empty
+    `ComfyUI/custom_nodes/models/loras` directory (which lacks `__init__.py` and causes
+    ComfyUI to log a `Cannot import ...\\custom_nodes\\models` warning), remove it cleanly.
+    """
+    try:
+        pkg_dir = Path(__file__).resolve().parent
+        parent_dir = pkg_dir.parent
+        if parent_dir.name.lower() == "custom_nodes":
+            stray_models = parent_dir / "models"
+            if stray_models.is_dir() and not (stray_models / "__init__.py").exists():
+                stray_loras = stray_models / "loras"
+                if stray_loras.is_dir() and not any(stray_loras.iterdir()):
+                    stray_loras.rmdir()
+                if not any(stray_models.iterdir()):
+                    stray_models.rmdir()
+    except Exception:
+        pass
+
+
+_cleanup_stray_custom_nodes_models_dir()
+
+
+def _resolve_comfy_loras_dir(fallback_dir: str = "./models/loras", create: bool = True) -> Path:
+    """
+    Resolve `ComfyUI/models/loras` via `folder_paths` when running inside ComfyUI,
+    or via the parent ComfyUI root if located inside `ComfyUI/custom_nodes/<pack>`.
+    Never creates a `models/` directory inside `ComfyUI/custom_nodes/`.
+    """
     try:
         import folder_paths  # type: ignore
 
         paths = folder_paths.get_folder_paths("loras")
         if paths:
             out = Path(paths[0])
-            out.mkdir(parents=True, exist_ok=True)
+            if create:
+                out.mkdir(parents=True, exist_ok=True)
             return out
-    except ImportError:
+    except Exception:
         pass
+
+    pkg_dir = Path(__file__).resolve().parent
+    if pkg_dir.parent.name.lower() == "custom_nodes":
+        comfy_root = pkg_dir.parent.parent
+        out = comfy_root / "models" / "loras"
+        if create:
+            out.mkdir(parents=True, exist_ok=True)
+        return out
+
     out = Path(fallback_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    try:
+        resolved_parent = out.resolve().parent
+        if resolved_parent.parent.name.lower() == "custom_nodes":
+            out = resolved_parent.parent.parent / "models" / "loras"
+    except Exception:
+        pass
+    if create:
+        out.mkdir(parents=True, exist_ok=True)
     return out
 
 
@@ -224,7 +269,7 @@ def _resolve_target_output_dir(custom_dir: str, default_dir: Path) -> Path:
 
 
 def _list_available_comfy_loras() -> List[str]:
-    """Return available LoRA filenames from `ComfyUI/models/loras/` for dropdown selection."""
+    """Return available LoRA filenames from `ComfyUI/models/loras/` for dropdown selection without creating folders."""
     try:
         import folder_paths  # type: ignore
 
@@ -234,7 +279,7 @@ def _list_available_comfy_loras() -> List[str]:
     except Exception:
         pass
 
-    loras_dir = _resolve_comfy_loras_dir()
+    loras_dir = _resolve_comfy_loras_dir(create=False)
     found: List[str] = []
     if loras_dir.exists():
         for ext in ("*.safetensors", "*.pt", "*.ckpt", "*.bin"):
