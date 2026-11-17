@@ -45,3 +45,6 @@ models/loras/
 # Explicitly keep the omni_lora/models/ Python subpackage tracked
 !models/
 !models/*.py
+
+#loss tracker data
+.omni_lora_tracker_runs.json
