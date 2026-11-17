@@ -186,30 +186,6 @@ def _check_comfy_interrupt() -> None:
         pass
 
 
-def _cleanup_stray_custom_nodes_models_dir() -> None:
-    """
-    If an earlier scanner run with cwd=`ComfyUI/custom_nodes` created an empty
-    `ComfyUI/custom_nodes/models/loras` directory (which lacks `__init__.py` and causes
-    ComfyUI to log a `Cannot import ...\\custom_nodes\\models` warning), remove it cleanly.
-    """
-    try:
-        pkg_dir = Path(__file__).resolve().parent
-        parent_dir = pkg_dir.parent
-        if parent_dir.name.lower() == "custom_nodes":
-            stray_models = parent_dir / "models"
-            if stray_models.is_dir() and not (stray_models / "__init__.py").exists():
-                stray_loras = stray_models / "loras"
-                if stray_loras.is_dir() and not any(stray_loras.iterdir()):
-                    stray_loras.rmdir()
-                if not any(stray_models.iterdir()):
-                    stray_models.rmdir()
-    except Exception:
-        pass
-
-
-_cleanup_stray_custom_nodes_models_dir()
-
-
 def _resolve_comfy_loras_dir(fallback_dir: str = "./models/loras", create: bool = True) -> Path:
     """
     Resolve `ComfyUI/models/loras` via `folder_paths` when running inside ComfyUI,
