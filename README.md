@@ -6,7 +6,7 @@ Train LoRAs directly inside your ComfyUI workflow using the models, VAEs, and te
 
 ---
 
-## 60-Second Quick Start (For Impatient Users)
+## Quick Start
 
 1. **Install** *(zero external `pip` dependencies — uses ComfyUI's built-in `torch`, `safetensors`, and `Pillow`)*:
    - **ComfyUI Manager (Recommended)**: Open **ComfyUI Manager** $\rightarrow$ **Custom Nodes Manager**, search for **`OmniLoRA`**, click **Install**, and restart ComfyUI.
