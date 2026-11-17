@@ -12,6 +12,6 @@ dependencies = []
 Repository = "https://github.com/omni-lora/comfyui-omni-lora"
 
 [tool.comfy]
-PublisherId = "omni-lora"
+PublisherId = "cyberterm"
 DisplayName = "ComfyUI-OmniLoRA (Universal Multi-GPU & Intel Arc XPU LoRA Trainer)"
 Icon = ""
