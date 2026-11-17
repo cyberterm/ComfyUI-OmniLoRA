@@ -2609,7 +2609,7 @@ class OmniLoRALossTracker:
         }
 
 
-NODE_CLASS_MAPPINGS: Dict[str, Any] = {
+NODE_CLASS_MAPPINGS = {
     "OmniLoRADatasetLoader": OmniLoRADatasetLoader,
     "OmniLoRAPrecomputeConditioning": OmniLoRAPrecomputeConditioning,
     "OmniLoRALoader": OmniLoRALoader,
@@ -2618,7 +2618,7 @@ NODE_CLASS_MAPPINGS: Dict[str, Any] = {
     "OmniLoRALossTracker": OmniLoRALossTracker,
 }
 
-NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
+NODE_DISPLAY_NAME_MAPPINGS = {
     "OmniLoRADatasetLoader": "OmniLoRA Dataset & Prompt Loader",
     "OmniLoRAPrecomputeConditioning": "OmniLoRA VAE & CLIP Pre-Cache",
     "OmniLoRALoader": "OmniLoRA Load LoRA Network",
@@ -2626,4 +2626,5 @@ NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
     "OmniLoRASave": "OmniLoRA Save LoRA",
     "OmniLoRALossTracker": "OmniLoRA Loss Tracker",
 }
+
 

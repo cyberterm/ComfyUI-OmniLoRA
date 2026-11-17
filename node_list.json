@@ -1,0 +1,8 @@
+{
+  "OmniLoRADatasetLoader": "OmniLoRA Dataset & Prompt Loader: Loads training images and .txt captions from disk or ComfyUI IMAGE/MASK inputs with aspect-ratio bucketing and alpha mask weighting.",
+  "OmniLoRAPrecomputeConditioning": "OmniLoRA VAE & CLIP Pre-Cache: Pre-encodes dataset latents and text embeddings and unloads VAE/CLIP from VRAM before training.",
+  "OmniLoRALoader": "OmniLoRA Load LoRA Network: Loads an existing .safetensors or .pt LoRA checkpoint into an OMNILORA_NETWORK bundle to resume training.",
+  "OmniLoRATrainer": "OmniLoRA Universal Trainer (All GPUs / XPU / CUDA / ROCm): Universal FP64-free LoRA/DoRA/LoHa/LoKr trainer supporting all ComfyUI diffusion and Rectified Flow models.",
+  "OmniLoRASave": "OmniLoRA Save LoRA: Exports a trained OMNILORA_NETWORK bundle to ComfyUI/models/loras/ as .safetensors with training metadata.",
+  "OmniLoRALossTracker": "OmniLoRA Loss Tracker: Real-time interactive HTML5 canvas loss, EMA, noise-bin, and telemetry dashboard node."
+}
