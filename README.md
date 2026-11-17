@@ -10,10 +10,9 @@ Train LoRAs directly inside your ComfyUI workflow using the models, VAEs, and te
 
 1. **Install** *(zero external `pip` dependencies — uses ComfyUI's built-in `torch`, `safetensors`, and `Pillow`)*:
    - **ComfyUI Manager (Recommended)**: Open **ComfyUI Manager** $\rightarrow$ **Custom Nodes Manager**, search for **`OmniLoRA`**, click **Install**, and restart ComfyUI.
-   - **Git Clone**:
+   - **Git Clone** inside your custom_nodes folder:
      ```bash
-     cd ComfyUI/custom_nodes
-     git clone https://github.com/omni-lora/comfyui-omni-lora.git omni_lora
+     git clone [https://github.com/cyberterm/ComfyUI-OmniLoRA](https://github.com/cyberterm/ComfyUI-OmniLoRA)
      ```
      Restart ComfyUI after cloning.
 2. **Load a Template**: [`example_workflows/omni_lora_basic_workflow.json`](./example_workflows/omni_lora_basic_workflow.json) can be found in the templates.
