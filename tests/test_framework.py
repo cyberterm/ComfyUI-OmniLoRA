@@ -4623,6 +4623,286 @@ class TestOmniLoRAFramework(unittest.TestCase):
         self.assertEqual(batches[0]["latents"].shape[-2:], (64, 64))
         self.assertEqual(batches[0]["bucket"], "1024x1024")
 
+    def test_comfy_kitchen_and_sage_attention_training_override_and_fallback(self) -> None:
+        """
+        Verify that OmniLoRA safely handles `--use-ck-attention` (Comfy Kitchen INT8 / SOL),
+        `--use-sage-attention`, pre-loaded `ComfyAttention` checkpoints, and direct `comfy_kitchen` /
+        `comfy.quant_ops.ck` RoPE & AdaLN kernels during training while preserving inference behavior:
+        1. `ComfyModelAdapter._build_transformer_options()` sets `optimized_attention_override`
+           during training without mutating the source `model.model_options`.
+        2. `install_comfy_runtime_hooks()` wraps `attention_comfy_kitchen_int8` (and its
+           `.container_function`), `attention_comfy_kitchen_sol`, `attention_sage`, and `attention3_sage`,
+           rebinds pre-imported `comfy.*` references and pre-loaded `ComfyAttention` instances, and wraps
+           `comfy_kitchen` (`int8_attention`, `prequantize_int8_attention`, `sol_attn`, `rms_rope`,
+           `rms_rope1`, `rms_rope_split_half`, `apply_rope_split_half`, `apply_rope`, `apply_rope1`,
+           `adaln`, `rms_adaln`).
+        3. `_forward_backbone()` scopes `mm.in_training = True` during grad-enabled forward passes and
+           handles 1-arg `reset_prefix_cache(False)` (`QwenImage21`).
+        """
+        import functools
+        import sys
+        import types
+        from omni_lora.models.adapters import ComfyModelAdapter, install_comfy_runtime_hooks, unwrap_comfy_diffusion_model
+
+        infer_calls: List[str] = []
+
+        class _FakeContainer:
+            def __init__(self, t: torch.Tensor) -> None:
+                self.tensor: Optional[torch.Tensor] = t
+
+            def take(self) -> torch.Tensor:
+                assert self.tensor is not None, "Container already consumed"
+                t = self.tensor
+                self.tensor = None
+                return t
+
+        def _fake_wrap_attn(fn: Any) -> Any:
+            @functools.wraps(fn)
+            def _wrapped(*args: Any, **kwargs: Any) -> Any:
+                if len(args) >= 3 and isinstance(args[0], _FakeContainer):
+                    if getattr(_wrapped, "container_function", None) is not None:
+                        return _wrapped.container_function(*args, **kwargs)
+                    args = (args[0].take(), args[1].take(), args[2].take()) + args[3:]
+                return fn(*args, **kwargs)
+
+            _wrapped.container_function = None  # type: ignore[attr-defined]
+            return _wrapped
+
+        @_fake_wrap_attn
+        def _fake_attn_pytorch(
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+            heads: int,
+            mask: Optional[torch.Tensor] = None,
+            attn_precision: Any = None,
+            skip_reshape: bool = False,
+            skip_output_reshape: bool = False,
+            **kwargs: Any,
+        ) -> torch.Tensor:
+            b = int(q.shape[0])
+            if skip_reshape:
+                dim_head = int(q.shape[-1])
+            else:
+                dim_head = int(q.shape[-1]) // int(heads)
+                q = q.view(b, -1, heads, dim_head).transpose(1, 2)
+                k = k.view(b, -1, heads, dim_head).transpose(1, 2)
+                v = v.view(b, -1, heads, dim_head).transpose(1, 2)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+            if not skip_output_reshape:
+                out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+            return out
+
+        @_fake_wrap_attn
+        def _fake_ck_int8(q: Any, k: Any, v: Any, heads: int, **kwargs: Any) -> torch.Tensor:
+            if torch.is_grad_enabled():
+                raise RuntimeError("comfy_kitchen.int8_attention does not support autograd training")
+            infer_calls.append("ck_int8")
+            return q
+
+        def _fake_ck_int8_containers(q: _FakeContainer, k: _FakeContainer, v: _FakeContainer, heads: int, **kwargs: Any) -> torch.Tensor:
+            qt, kt, vt = q.take(), k.take(), v.take()
+            if torch.is_grad_enabled():
+                raise RuntimeError("comfy_kitchen.prequantize_int8_attention does not support autograd training")
+            infer_calls.append("ck_int8_container")
+            return qt + 0.0 * (kt + vt)
+
+        _fake_ck_int8.container_function = _fake_ck_int8_containers  # type: ignore[attr-defined]
+
+        @_fake_wrap_attn
+        def _fake_ck_sol(q: Any, k: Any, v: Any, heads: int, **kwargs: Any) -> torch.Tensor:
+            if torch.is_grad_enabled():
+                raise RuntimeError("comfy_kitchen.sol_attn does not support autograd training")
+            infer_calls.append("ck_sol")
+            return q
+
+        @_fake_wrap_attn
+        def _fake_sage(q: Any, k: Any, v: Any, heads: int, **kwargs: Any) -> torch.Tensor:
+            if torch.is_grad_enabled():
+                raise RuntimeError("sageattn does not support autograd training")
+            infer_calls.append("sage")
+            return q
+
+        def _fail_on_grad(name: str, ret_fn: Any) -> Any:
+            def _fn(*a: Any, **kw: Any) -> Any:
+                if torch.is_grad_enabled():
+                    raise RuntimeError(f"{name} unsupported during training")
+                infer_calls.append(name)
+                return ret_fn(*a, **kw)
+
+            return _fn
+
+        attn_mod = types.ModuleType("comfy.ldm.modules.attention")
+        attn_mod.attention_pytorch = _fake_attn_pytorch  # type: ignore[attr-defined]
+        attn_mod.attention_comfy_kitchen_int8 = _fake_ck_int8  # type: ignore[attr-defined]
+        attn_mod.attention_comfy_kitchen_sol = _fake_ck_sol  # type: ignore[attr-defined]
+        attn_mod.attention_sage = _fake_sage  # type: ignore[attr-defined]
+        attn_mod.optimized_attention = _fake_ck_int8  # type: ignore[attr-defined]
+        attn_mod.optimized_attention_masked = _fake_ck_int8  # type: ignore[attr-defined]
+        attn_mod.REGISTERED_ATTENTION_FUNCTIONS = {  # type: ignore[attr-defined]
+            "comfy_kitchen_int8": _fake_ck_int8,
+            "sage": _fake_sage,
+            "pytorch": _fake_attn_pytorch,
+        }
+
+        preimported_ldm_mod = types.ModuleType("comfy.ldm._mock_ernie")
+        preimported_ldm_mod.optimized_attention = _fake_ck_int8  # type: ignore[attr-defined]
+
+        ck_mod = types.ModuleType("comfy_kitchen")
+        ck_mod.int8_attention = _fail_on_grad("raw_ck_int8", lambda q, k, v, *a, **kw: q)  # type: ignore[attr-defined]
+        ck_mod.prequantize_int8_attention = _fail_on_grad("raw_preq", lambda q, k, v, *a, **kw: q)  # type: ignore[attr-defined]
+        ck_mod.int8_attention_from_prequantized = lambda quantized, *a, **kw: quantized  # type: ignore[attr-defined]
+        ck_mod.sol_attn = _fail_on_grad("raw_sol", lambda q, k, v, *a, **kw: q)  # type: ignore[attr-defined]
+        ck_mod.rms_rope = _fail_on_grad("raw_rms_rope", lambda q, k, *a, **kw: (q, k))  # type: ignore[attr-defined]
+        ck_mod.rms_rope1 = _fail_on_grad("raw_rms_rope1", lambda x, *a, **kw: x)  # type: ignore[attr-defined]
+        ck_mod.rms_rope_split_half = _fail_on_grad("raw_rms_rope_split", lambda q, k, *a, **kw: (q, k))  # type: ignore[attr-defined]
+        ck_mod.apply_rope_split_half = _fail_on_grad("raw_apply_rope_split", lambda q, k, *a, **kw: (q, k))  # type: ignore[attr-defined]
+        ck_mod.apply_rope = _fail_on_grad("raw_apply_rope", lambda q, k, *a, **kw: (q, k))  # type: ignore[attr-defined]
+        ck_mod.apply_rope1 = _fail_on_grad("raw_apply_rope1", lambda x, *a, **kw: x)  # type: ignore[attr-defined]
+        ck_mod.adaln = _fail_on_grad("raw_adaln", lambda x, *a, **kw: x)  # type: ignore[attr-defined]
+        ck_mod.rms_adaln = _fail_on_grad("raw_rms_adaln", lambda x, *a, **kw: x)  # type: ignore[attr-defined]
+
+        mm_mod = types.ModuleType("comfy.model_management")
+        mm_mod.in_training = False  # type: ignore[attr-defined]
+
+        # Simulate a model whose `ComfyAttention` was populated BEFORE `install_comfy_runtime_hooks()`
+        class _PreloadedAttentionModule(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(16, 16))
+                self.comfy_attention = types.SimpleNamespace(
+                    function=functools.partial(_fake_ck_sol, tau=1.25)
+                )
+                self.prefix_cache_enabled = True
+
+            def reset_prefix_cache(self, enabled: bool) -> None:
+                self.prefix_cache_enabled = bool(enabled)
+
+        preloaded_backbone = _PreloadedAttentionModule()
+
+        saved_mods = {
+            k: sys.modules.get(k)
+            for k in (
+                "comfy.ldm.modules.attention",
+                "comfy.ldm._mock_ernie",
+                "comfy_kitchen",
+                "comfy.model_management",
+            )
+        }
+        try:
+            sys.modules["comfy.ldm.modules.attention"] = attn_mod
+            sys.modules["comfy.ldm._mock_ernie"] = preimported_ldm_mod
+            sys.modules["comfy_kitchen"] = ck_mod
+            sys.modules["comfy.model_management"] = mm_mod
+
+            unwrapped_bb = unwrap_comfy_diffusion_model(preloaded_backbone, load_to_gpu=False)
+            self.assertIs(unwrapped_bb, preloaded_backbone)
+            self.assertTrue(getattr(preloaded_backbone.comfy_attention.function, "_omni_train_attn_safe", False))
+
+            # 1. Verify `ComfyModelAdapter._build_transformer_options()` overrides inference attention
+            #    during training without mutating the source `model_options`.
+            def _bad_infer_override(*a: Any, **kw: Any) -> torch.Tensor:
+                raise RuntimeError("inference override must not run during training")
+
+            class _MockPatcher:
+                def __init__(self) -> None:
+                    self.model = nn.Linear(16, 16)
+                    self.model_options = {
+                        "transformer_options": {"optimized_attention_override": _bad_infer_override}
+                    }
+
+            patcher = _MockPatcher()
+            adapter = ComfyModelAdapter(comfy_model=patcher, model_id="flux_dev")
+            with torch.enable_grad():
+                train_opts = adapter._build_transformer_options(
+                    noisy_latents=torch.zeros((1, 16, 8, 8)),
+                    timesteps=torch.tensor([0.5]),
+                )
+            override_fn = train_opts["optimized_attention_override"]
+            self.assertIsNot(override_fn, _bad_infer_override)
+            self.assertIs(
+                patcher.model_options["transformer_options"]["optimized_attention_override"],
+                _bad_infer_override,
+            )
+
+            # 2. Verify differentiable forward + backward across all guarded attention, RoPE, and AdaLN paths
+            with torch.enable_grad():
+                mm_mod.in_training = True
+                q = torch.randn(1, 8, 64, requires_grad=True)
+                k = torch.randn(1, 8, 64, requires_grad=True)
+                v = torch.randn(1, 8, 64, requires_grad=True)
+
+                out_override = override_fn(None, _FakeContainer(q), _FakeContainer(k), _FakeContainer(v), 4)
+                out_ck_container = _fake_ck_int8.container_function(_FakeContainer(q), _FakeContainer(k), _FakeContainer(v), 4)
+                out_preimported = preimported_ldm_mod.optimized_attention(q, k, v, 4)
+                out_preloaded_ca = preloaded_backbone.comfy_attention.function(q, k, v, 4)
+                out_sage = attn_mod.attention_sage(q, k, v, 4)
+                out_raw_ck = ck_mod.int8_attention(
+                    q.view(1, 8, 4, 16).transpose(1, 2),
+                    k.view(1, 8, 4, 16).transpose(1, 2),
+                    v.view(1, 8, 4, 16).transpose(1, 2),
+                )
+
+                # Test `rms_rope`, `rms_rope_split_half` (with `epsilon=` and `rot_dim=`), `apply_rope_split_half`, `adaln`, `rms_adaln`
+                q_rope = torch.randn(1, 8, 4, 16, requires_grad=True)
+                k_rope = torch.randn(1, 8, 4, 16, requires_grad=True)
+                q_sc = torch.ones(16, requires_grad=True)
+                k_sc = torch.ones(16, requires_grad=True)
+                angles = torch.randn(1, 8, 1, 8)
+                pe = torch.stack((angles.cos(), -angles.sin(), angles.sin(), angles.cos()), dim=-1).unflatten(-1, (2, 2))
+                rq, rk = ck_mod.rms_rope(q_rope, k_rope, pe, q_sc, k_sc, 1e-6)
+                sq1, sk1 = ck_mod.rms_rope_split_half(q_rope, k_rope, pe[:, :, :, :4], q_sc, k_sc, epsilon=1e-6, rot_dim=8)
+                sq2, sk2 = ck_mod.apply_rope_split_half(q_rope, k_rope, pe)
+
+                x_norm = torch.randn(1, 8, 16, requires_grad=True)
+                mod_scale = torch.randn(1, 1, 16, requires_grad=True)
+                mod_shift = torch.randn(1, 1, 16, requires_grad=True)
+                out_adaln = ck_mod.adaln(x_norm, mod_scale, mod_shift, 1e-6)
+                out_rms_adaln = ck_mod.rms_adaln(x_norm, mod_scale, mod_shift, 1e-6)
+
+                loss = (
+                    out_override.sum()
+                    + out_ck_container.sum()
+                    + out_preimported.sum()
+                    + out_preloaded_ca.sum()
+                    + out_sage.sum()
+                    + out_raw_ck.sum()
+                    + rq.sum()
+                    + rk.sum()
+                    + sq1.sum()
+                    + sk1.sum()
+                    + sq2.sum()
+                    + sk2.sum()
+                    + out_adaln.sum()
+                    + out_rms_adaln.sum()
+                )
+                loss.backward()
+                self.assertIsNotNone(q.grad)
+                self.assertIsNotNone(k.grad)
+                self.assertIsNotNone(v.grad)
+                self.assertIsNotNone(q_rope.grad)
+                self.assertIsNotNone(q_sc.grad)
+                self.assertIsNotNone(x_norm.grad)
+                self.assertEqual(infer_calls, [])
+
+            # 3. Outside training (`torch.inference_mode()` + `in_training = False`), inference kernels run normally
+            mm_mod.in_training = False
+            with torch.inference_mode():
+                q_inf = torch.randn(1, 8, 64)
+                k_inf = torch.randn(1, 8, 64)
+                v_inf = torch.randn(1, 8, 64)
+                _ = preimported_ldm_mod.optimized_attention(q_inf, k_inf, v_inf, 4)
+                _ = _fake_ck_int8.container_function(_FakeContainer(q_inf), _FakeContainer(k_inf), _FakeContainer(v_inf), 4)
+                _ = attn_mod.attention_sage(q_inf, k_inf, v_inf, 4)
+                _ = ck_mod.int8_attention(q_inf.view(1, 8, 4, 16).transpose(1, 2), k_inf.view(1, 8, 4, 16).transpose(1, 2), v_inf.view(1, 8, 4, 16).transpose(1, 2))
+            self.assertEqual(infer_calls, ["ck_int8", "ck_int8_container", "sage", "raw_ck_int8"])
+        finally:
+            for k_mod, orig_mod in saved_mods.items():
+                if orig_mod is None:
+                    sys.modules.pop(k_mod, None)
+                else:
+                    sys.modules[k_mod] = orig_mod
+
 
 def run_cloud_verification_suite(preferred_backend: str = "auto") -> int:
     """

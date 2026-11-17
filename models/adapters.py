@@ -140,6 +140,137 @@ class ToyBackbone(nn.Module):
 _SAMPLE_SIGMAS_MULT_CACHE: Dict[Tuple[str, int], torch.Tensor] = {}
 
 
+def _is_omni_training_active() -> bool:
+    """Return True when OmniLoRA autograd training is active (`grad` enabled or `mm.in_training`)."""
+    if torch.is_grad_enabled():
+        return True
+    mm_mod = sys.modules.get("comfy.model_management")
+    if mm_mod is not None and bool(getattr(mm_mod, "in_training", False)):
+        return True
+    return False
+
+
+def _unwrap_attn_tensor(tensor: Any) -> Any:
+    """Unwrap a ComfyUI `AttentionTensorContainer` without consuming raw tensors."""
+    if isinstance(tensor, torch.Tensor):
+        return tensor
+    if hasattr(tensor, "take") and callable(tensor.take):
+        return tensor.take()
+    return tensor
+
+
+def _run_pytorch_sdpa_attention(
+    q: Any,
+    k: Any,
+    v: Any,
+    heads: int,
+    mask: Optional[torch.Tensor] = None,
+    attn_precision: Any = None,
+    skip_reshape: bool = False,
+    skip_output_reshape: bool = False,
+    **kwargs: Any,
+) -> torch.Tensor:
+    """
+    Execute differentiable PyTorch SDPA (`attention_pytorch` / `F.scaled_dot_product_attention`)
+    using ComfyUI's exact `(q, k, v, heads, mask, skip_reshape, skip_output_reshape)` contract.
+    Includes a guard for `skip_output_reshape=True` when `b > 32768` (`SDP_BATCH_LIMIT`).
+    """
+    q = _unwrap_attn_tensor(q)
+    k = _unwrap_attn_tensor(k)
+    v = _unwrap_attn_tensor(v)
+
+    b_dim = int(q.shape[0]) if isinstance(q, torch.Tensor) and q.ndim >= 1 else 1
+    comfy_attn = sys.modules.get("comfy.ldm.modules.attention")
+    attn_pt = getattr(comfy_attn, "attention_pytorch", None) if comfy_attn is not None else None
+    if callable(attn_pt) and not (skip_output_reshape and b_dim > 32768):
+        raw_pt = getattr(attn_pt, "__wrapped__", None)
+        if callable(raw_pt):
+            return raw_pt(
+                q,
+                k,
+                v,
+                heads,
+                mask=mask,
+                attn_precision=attn_precision,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                **kwargs,
+            )
+        call_kw = dict(kwargs)
+        call_kw.pop("preferred_attention", None)
+        call_kw["_inside_attn_wrapper"] = True
+        return attn_pt(
+            q,
+            k,
+            v,
+            heads,
+            mask=mask,
+            attn_precision=attn_precision,
+            skip_reshape=skip_reshape,
+            skip_output_reshape=skip_output_reshape,
+            **call_kw,
+        )
+
+    enable_gqa = bool(kwargs.get("enable_gqa", False))
+    if skip_reshape:
+        b, q_heads, _, dim_head = q.shape
+    else:
+        b = int(q.shape[0])
+        dim_head = int(q.shape[-1]) // int(heads)
+        q_heads = int(heads)
+        k_heads = max(1, int(k.shape[-1]) // dim_head) if enable_gqa else q_heads
+        v_heads = max(1, int(v.shape[-1]) // dim_head) if enable_gqa else q_heads
+        q = q.reshape(b, -1, q_heads, dim_head).transpose(1, 2)
+        k = k.reshape(b, -1, k_heads, dim_head).transpose(1, 2)
+        v = v.reshape(b, -1, v_heads, dim_head).transpose(1, 2)
+
+    if mask is not None:
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        if mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+
+    if k.shape[1] != q.shape[1]:
+        rep_k = max(1, int(q.shape[1]) // max(1, int(k.shape[1])))
+        rep_v = max(1, int(q.shape[1]) // max(1, int(v.shape[1])))
+        if mask is not None:
+            k = k.repeat_interleave(rep_k, dim=1)
+            v = v.repeat_interleave(rep_v, dim=1)
+            enable_gqa = False
+        else:
+            enable_gqa = True
+    else:
+        enable_gqa = False
+
+    sdpa_kwargs: Dict[str, Any] = {}
+    if "scale" in kwargs and kwargs["scale"] is not None:
+        sdpa_kwargs["scale"] = kwargs["scale"]
+    if enable_gqa:
+        sdpa_kwargs["enable_gqa"] = True
+
+    out = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=mask,
+        dropout_p=0.0,
+        is_causal=False,
+        **sdpa_kwargs,
+    )
+    if not skip_output_reshape:
+        out = out.transpose(1, 2).reshape(b, -1, int(heads) * dim_head)
+    return out
+
+
+def _omni_training_attention_override(orig_func: Any, *args: Any, **kwargs: Any) -> torch.Tensor:
+    """
+    ComfyUI `transformer_options["optimized_attention_override"]` callback used during OmniLoRA
+    training so `--use-ck-attention`, `--use-sage-attention`, and checkpoint `ComfyAttention`
+    settings transparently execute via differentiable PyTorch SDPA.
+    """
+    return _run_pytorch_sdpa_attention(*args, **kwargs)
+
+
 def _build_training_sample_sigmas(
     timesteps: torch.Tensor,
     sigma: Optional[torch.Tensor] = None,
@@ -373,7 +504,15 @@ class ComfyModelAdapter(BaseModelAdapter):
             or (hasattr(self.diffusion_model, "label_emb") and num_classes is not None)
         )
 
-        raw_patch_size = getattr(self.diffusion_model, "patch_size", self.unet_config.get("patch_size", 2))
+        raw_patch_size = getattr(
+            self.diffusion_model,
+            "patch_size",
+            getattr(
+                self.diffusion_model,
+                "patch_spatial",
+                self.unet_config.get("patch_size", self.unet_config.get("patch_spatial", 2)),
+            ),
+        )
         resolved_patch_size = (
             int(raw_patch_size[0])
             if isinstance(raw_patch_size, (tuple, list)) and len(raw_patch_size) > 0
@@ -416,12 +555,14 @@ class ComfyModelAdapter(BaseModelAdapter):
         """
         Determine structurally whether `backbone.forward` expects 5D `[B, C, T, H, W]` video/3D-patched
         latents or 4D `[B, C, H, W]` image latents across any ComfyUI model:
-          - If `patch_size` is a 3-tuple `(pt, ph, pw)` or the backbone contains `nn.Conv3d` or `process_img`,
-            it accepts 5D latents.
+          - If `patch_size` is a 3-tuple `(pt, ph, pw)` or the backbone contains `nn.Conv3d`, `process_img`,
+            or `patch_temporal` + `patch_spatial` (e.g. Cosmos Predict2 / Anima `MiniTrainDIT`), it accepts 5D latents.
           - If `patch_size` is None or 1, has no `process_img` and no `nn.Conv3d`, and `img_in` is a 2D `Linear`
             matching `in_channels == out_channels` (e.g., 64-ch 2D patch-packed DiTs), it expects 4D latents.
         """
         if hasattr(backbone, "process_img"):
+            return True
+        if hasattr(backbone, "patch_temporal") and hasattr(backbone, "patch_spatial"):
             return True
         p = getattr(backbone, "patch_size", self.unet_config.get("patch_size", None))
         if isinstance(p, (tuple, list)) and len(p) == 3:
@@ -1017,7 +1158,15 @@ class ComfyModelAdapter(BaseModelAdapter):
             )
 
         if latents.ndim >= 4:
-            raw_ps = getattr(backbone, "patch_size", self.unet_config.get("patch_size", self.spec.patch_size))
+            raw_ps = getattr(
+                backbone,
+                "patch_size",
+                getattr(
+                    backbone,
+                    "patch_spatial",
+                    self.unet_config.get("patch_size", self.unet_config.get("patch_spatial", self.spec.patch_size)),
+                ),
+            )
             if isinstance(raw_ps, (tuple, list)) and len(raw_ps) >= 2:
                 stride_h = max(1, int(raw_ps[-2]))
                 stride_w = max(1, int(raw_ps[-1]))
@@ -1120,6 +1269,11 @@ class ComfyModelAdapter(BaseModelAdapter):
         opts.setdefault("patches_replace", {})
         opts.setdefault("wrappers", {})
         opts.setdefault("callbacks", {})
+        if _is_omni_training_active():
+            # Route all attention calls carrying `transformer_options` through differentiable PyTorch SDPA
+            # even if ComfyUI was launched with `--use-ck-attention` / `--use-sage-attention`, the
+            # checkpoint embeds a `ComfyAttention` config, or a workflow node patched `model_options`.
+            opts["optimized_attention_override"] = _omni_training_attention_override
         return opts
 
     def _forward_backbone(
@@ -1200,10 +1354,19 @@ class ComfyModelAdapter(BaseModelAdapter):
                         if ev is None:
                             continue
                         if ek not in cond_in or cond_in[ek] is None:
+                            ev_for_cond = ev
+                            # `comfy.model_base.Anima.extra_conds` assumes `t5xxl_ids` and `t5xxl_weights`
+                            # are 1D `(L_t5,)` tensors and unconditionally calls `.unsqueeze(0)` on them.
+                            if ek in ("t5xxl_ids", "t5xxl_weights") and isinstance(ev, torch.Tensor) and ev.ndim >= 2:
+                                ev_for_cond = ev[0] if int(ev.shape[0]) >= 1 else ev.squeeze(0)
                             cond_in[ek] = (
-                                safe_to_device(ev, device=noisy_latents.device, dtype=noisy_latents.dtype)
-                                if isinstance(ev, torch.Tensor) and torch.is_floating_point(ev)
-                                else (safe_to_device(ev, device=noisy_latents.device) if isinstance(ev, torch.Tensor) else ev)
+                                safe_to_device(ev_for_cond, device=noisy_latents.device, dtype=noisy_latents.dtype)
+                                if isinstance(ev_for_cond, torch.Tensor) and torch.is_floating_point(ev_for_cond)
+                                else (
+                                    safe_to_device(ev_for_cond, device=noisy_latents.device)
+                                    if isinstance(ev_for_cond, torch.Tensor)
+                                    else ev_for_cond
+                                )
                             )
 
                 if (
@@ -1260,12 +1423,42 @@ class ComfyModelAdapter(BaseModelAdapter):
             for ek, ev in extra_cond_dict.items():
                 if ev is None or ek in kwargs or ek in ("c_concat", "cross_attn", "c_crossattn", "pooled_output"):
                     continue
-                if ek in param_names:
+                if ek in param_names or accepts_var_kwargs:
                     kwargs[ek] = (
                         safe_to_device(ev, device=noisy_latents.device, dtype=noisy_latents.dtype)
                         if isinstance(ev, torch.Tensor) and torch.is_floating_point(ev)
                         else (safe_to_device(ev, device=noisy_latents.device) if isinstance(ev, torch.Tensor) else ev)
                     )
+
+            # Ensure Anima's `t5xxl_ids` (`[B, L_t5]` int) and `t5xxl_weights` (`[B, L_t5, 1]` float)
+            # preserve exact per-sample batch contents and tensor ranks when passed to `Anima.forward`.
+            raw_t5_ids = extra_cond_dict.get("t5xxl_ids")
+            if isinstance(raw_t5_ids, torch.Tensor) and ("t5xxl_ids" in kwargs or "t5xxl_ids" in param_names or accepts_var_kwargs):
+                if not torch.is_inference_mode_enabled() or "t5xxl_ids" in kwargs:
+                    t5_ids = safe_to_device(raw_t5_ids.detach().clone(), device=noisy_latents.device)
+                    if torch.is_floating_point(t5_ids):
+                        t5_ids = t5_ids.to(dtype=torch.long)
+                    if t5_ids.ndim == 1:
+                        t5_ids = t5_ids.unsqueeze(0)
+                    elif t5_ids.ndim >= 3 and int(t5_ids.shape[0]) == 1:
+                        t5_ids = t5_ids.squeeze(0)
+                    if t5_ids.ndim == 2 and int(t5_ids.shape[0]) == 1 and bsz > 1:
+                        t5_ids = t5_ids.repeat(bsz, 1)
+                    kwargs["t5xxl_ids"] = t5_ids
+
+            raw_t5_w = extra_cond_dict.get("t5xxl_weights")
+            if isinstance(raw_t5_w, torch.Tensor) and ("t5xxl_weights" in kwargs or "t5xxl_weights" in param_names or accepts_var_kwargs):
+                if not torch.is_inference_mode_enabled() or "t5xxl_weights" in kwargs:
+                    t5_w = safe_to_device(raw_t5_w.detach().clone(), device=noisy_latents.device, dtype=noisy_latents.dtype)
+                    if t5_w.ndim == 1:
+                        t5_w = t5_w.unsqueeze(0).unsqueeze(-1)
+                    elif t5_w.ndim == 2:
+                        t5_w = t5_w.unsqueeze(-1)
+                    elif t5_w.ndim == 4 and int(t5_w.shape[0]) == 1:
+                        t5_w = t5_w.squeeze(0)
+                    if t5_w.ndim == 3 and int(t5_w.shape[0]) == 1 and bsz > 1:
+                        t5_w = t5_w.repeat(bsz, 1, 1)
+                    kwargs["t5xxl_weights"] = t5_w
 
         # 2. Ensure primary text conditioning is mapped to the parameter name expected by backbone.forward
         if not any(k in kwargs for k in ("context", "prompt_embeds", "encoder_hidden_states", "txt")):
@@ -1390,17 +1583,37 @@ class ComfyModelAdapter(BaseModelAdapter):
                 if isinstance(v, torch.Tensor) and is_inference_tensor(v):
                     kwargs[k] = v.detach().clone()
 
+            mm_mod_for_train: Optional[Any] = None
+            prev_mm_in_training: Optional[bool] = None
             if torch.is_grad_enabled():
                 if not noisy_latents.requires_grad:
                     noisy_latents = noisy_latents.detach().requires_grad_(True)
                 mp_mod = sys.modules.get("comfy.model_prefetch")
-                if mp_mod is not None and not getattr( getattr(mp_mod, "prefetch_queue_pop", None), "_omni_patched", False):
+                attn_mod = sys.modules.get("comfy.ldm.modules.attention")
+                if (
+                    (mp_mod is not None and not getattr(getattr(mp_mod, "prefetch_queue_pop", None), "_omni_patched", False))
+                    or (attn_mod is not None and not getattr(attn_mod, "_omni_attn_hooks_installed", False))
+                ):
                     install_comfy_runtime_hooks()
+                _rebind_comfy_attention_modules(backbone)
                 if hasattr(backbone, "reset_prefix_cache") and callable(backbone.reset_prefix_cache):
                     try:
-                        backbone.reset_prefix_cache()
+                        backbone.reset_prefix_cache(False)
+                    except TypeError:
+                        try:
+                            backbone.reset_prefix_cache()
+                        except Exception:
+                            pass
                     except Exception:
                         pass
+                mm_mod_for_train = sys.modules.get("comfy.model_management")
+                if mm_mod_for_train is not None:
+                    prev_mm_in_training = bool(getattr(mm_mod_for_train, "in_training", False))
+                    if not prev_mm_in_training:
+                        try:
+                            mm_mod_for_train.in_training = True
+                        except Exception:
+                            mm_mod_for_train = None
 
             backbone_input: Any = noisy_latents
             latent_shapes = kwargs.pop("latent_shapes", None)
@@ -1413,17 +1626,24 @@ class ComfyModelAdapter(BaseModelAdapter):
                 except Exception:
                     backbone_input = noisy_latents
 
-            if kwargs:
-                try:
-                    out = backbone(backbone_input, timesteps, **kwargs)
-                except TypeError:
-                    if param_names:
-                        filtered_kw = {k: v for k, v in kwargs.items() if k in param_names}
-                        out = backbone(backbone_input, timesteps, **filtered_kw)
-                    else:
-                        raise
-            else:
-                out = backbone(backbone_input, timesteps, prompt_embeds)
+            try:
+                if kwargs:
+                    try:
+                        out = backbone(backbone_input, timesteps, **kwargs)
+                    except TypeError:
+                        if param_names:
+                            filtered_kw = {k: v for k, v in kwargs.items() if k in param_names}
+                            out = backbone(backbone_input, timesteps, **filtered_kw)
+                        else:
+                            raise
+                else:
+                    out = backbone(backbone_input, timesteps, prompt_embeds)
+            finally:
+                if mm_mod_for_train is not None and prev_mm_in_training is False:
+                    try:
+                        mm_mod_for_train.in_training = False
+                    except Exception:
+                        pass
 
             if isinstance(out, (tuple, list)):
                 if len(out) > 1 and all(isinstance(t, torch.Tensor) for t in out):
@@ -2638,6 +2858,559 @@ def install_comfy_runtime_hooks() -> None:
     except Exception:
         pass
 
+    # 7. Guard inference-only ComfyUI attention backends (`attention_comfy_kitchen_int8`,
+    # `attention_comfy_kitchen_sol`, `attention_sage`, `attention3_sage`), pre-loaded `ComfyAttention`
+    # instances, and direct `comfy_kitchen` / `comfy.quant_ops.ck` non-autograd kernels (`int8_attention`,
+    # `prequantize_int8_attention`, `sol_attn`, `rms_rope`, `rms_rope1`, `rms_rope_split_half`,
+    # `apply_rope`, `apply_rope1`, `apply_rope_split_half`, `adaln`, `rms_adaln`) during training.
+    def _sdpa_4d_fallback(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        scale: Optional[float] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if attn_mask is not None:
+            if attn_mask.ndim == 2:
+                attn_mask = attn_mask.unsqueeze(0)
+            if attn_mask.ndim == 3:
+                attn_mask = attn_mask.unsqueeze(1)
+        sdpa_kw: Dict[str, Any] = {}
+        if scale is not None:
+            sdpa_kw["scale"] = scale
+        if k.ndim == 4 and q.ndim == 4 and k.shape[1] != q.shape[1]:
+            rep_k = max(1, int(q.shape[1]) // max(1, int(k.shape[1])))
+            rep_v = max(1, int(q.shape[1]) // max(1, int(v.shape[1])))
+            k = k.repeat_interleave(rep_k, dim=1)
+            v = v.repeat_interleave(rep_v, dim=1)
+        return F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            **sdpa_kw,
+        )
+
+    def _rms_norm_t(
+        x_t: torch.Tensor,
+        w_t: Optional[torch.Tensor] = None,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        w_cast: Optional[torch.Tensor] = None
+        if isinstance(w_t, torch.Tensor):
+            w_cast = safe_to_device(w_t, device=x_t.device, dtype=x_t.dtype)
+        if hasattr(F, "rms_norm"):
+            return F.rms_norm(x_t, (int(x_t.shape[-1]),), weight=w_cast, eps=float(eps))
+        x_f32 = x_t.to(dtype=torch.float32)
+        ms = (x_f32 * x_f32).mean(dim=-1, keepdim=True)
+        out_t = (x_f32 * torch.rsqrt(ms + float(eps))).to(dtype=x_t.dtype)
+        if w_cast is not None:
+            out_t = out_t * w_cast
+        return out_t
+
+    def _torch_apply_rope_interleaved1(x_t: torch.Tensor, pe: torch.Tensor) -> torch.Tensor:
+        freqs = pe
+        x_ = x_t.to(dtype=freqs.dtype).reshape(*x_t.shape[:-1], -1, 1, 2)
+        if x_.ndim >= 4 and freqs.ndim >= 4 and x_.shape[2] != 1 and freqs.shape[2] != 1 and x_.shape[2] != freqs.shape[2]:
+            freqs = freqs[:, :, : x_.shape[2]]
+        x_out = freqs[..., 0] * x_[..., 0] + freqs[..., 1] * x_[..., 1]
+        return x_out.reshape(*x_t.shape).to(dtype=x_t.dtype)
+
+    def _torch_apply_rope_split_half1(
+        x_t: torch.Tensor,
+        pe: torch.Tensor,
+        rot_dim: Optional[int] = None,
+    ) -> torch.Tensor:
+        total_d = int(x_t.shape[-1])
+        pe_rot_d = int(pe.shape[-3]) * 2 if pe.ndim >= 3 else total_d
+        r_dim = int(rot_dim) if rot_dim is not None else min(total_d, pe_rot_d)
+        if 0 < r_dim < total_d:
+            head_part = x_t[..., :r_dim]
+            tail_part = x_t[..., r_dim:]
+            rot_head = _torch_apply_rope_split_half1(head_part, pe, rot_dim=r_dim)
+            return torch.cat((rot_head, tail_part), dim=-1)
+        x_ = x_t.to(dtype=pe.dtype).reshape(*x_t.shape[:-1], 2, -1).movedim(-2, -1).unsqueeze(-2)
+        x_out = pe[..., 0] * x_[..., 0] + pe[..., 1] * x_[..., 1]
+        return x_out.movedim(-1, -2).reshape(*x_t.shape).to(dtype=x_t.dtype)
+
+    def _torch_rms_rope_interleaved(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        pe: torch.Tensor,
+        q_scale: Optional[torch.Tensor],
+        k_scale: Optional[torch.Tensor],
+        eps: float = 1e-6,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        q_n = _rms_norm_t(q, q_scale, eps=eps)
+        k_n = _rms_norm_t(k, k_scale, eps=eps)
+        return _torch_apply_rope_interleaved1(q_n, pe), _torch_apply_rope_interleaved1(k_n, pe)
+
+    def _torch_rms_rope_split_half(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        pe: torch.Tensor,
+        q_scale: Optional[torch.Tensor],
+        k_scale: Optional[torch.Tensor],
+        eps: float = 1e-6,
+        rot_dim: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        q_n = _rms_norm_t(q, q_scale, eps=eps)
+        k_n = _rms_norm_t(k, k_scale, eps=eps)
+        return (
+            _torch_apply_rope_split_half1(q_n, pe, rot_dim=rot_dim),
+            _torch_apply_rope_split_half1(k_n, pe, rot_dim=rot_dim),
+        )
+
+    try:
+        comfy_attn = sys.modules.get("comfy.ldm.modules.attention")
+        if comfy_attn is None and "comfy.ldm" in sys.modules:
+            try:
+                import comfy.ldm.modules.attention as comfy_attn  # type: ignore
+            except Exception:
+                comfy_attn = None
+
+        if comfy_attn is not None:
+            import functools
+
+            target_attn_names = (
+                "attention_comfy_kitchen_int8",
+                "attention_comfy_kitchen_sol",
+                "attention_sage",
+                "attention3_sage",
+            )
+            replaced_map: Dict[int, Tuple[Any, Any]] = {}
+
+            for fn_name in target_attn_names:
+                cur_fn = getattr(comfy_attn, fn_name, None)
+                if cur_fn is None:
+                    continue
+
+                orig_fn = getattr(cur_fn, "_omni_orig_attn_fn", cur_fn)
+                if not getattr(cur_fn, "_omni_train_attn_safe", False):
+                    orig_container = getattr(orig_fn, "container_function", None)
+                    if callable(orig_container) and not getattr(orig_container, "_omni_train_attn_safe", False):
+                        def _make_safe_container(orig_c: Any) -> Any:
+                            def _safe_container(*c_args: Any, **c_kwargs: Any) -> Any:
+                                if _is_omni_training_active():
+                                    return _run_pytorch_sdpa_attention(*c_args, **c_kwargs)
+                                return orig_c(*c_args, **c_kwargs)
+
+                            setattr(_safe_container, "_omni_train_attn_safe", True)
+                            setattr(_safe_container, "_omni_orig_attn_fn", orig_c)
+                            return _safe_container
+
+                        safe_c = _make_safe_container(orig_container)
+                        try:
+                            setattr(orig_fn, "container_function", safe_c)
+                        except Exception:
+                            pass
+
+                    def _make_safe_attn_fn(orig_f: Any) -> Any:
+                        @functools.wraps(orig_f)
+                        def _safe_attn(*a: Any, **kw: Any) -> Any:
+                            if _is_omni_training_active():
+                                return _run_pytorch_sdpa_attention(*a, **kw)
+                            return orig_f(*a, **kw)
+
+                        setattr(_safe_attn, "_omni_train_attn_safe", True)
+                        setattr(_safe_attn, "_omni_orig_attn_fn", orig_f)
+                        if getattr(orig_f, "container_function", None) is not None:
+                            setattr(_safe_attn, "container_function", getattr(orig_f, "container_function"))
+                        return _safe_attn
+
+                    safe_fn = _make_safe_attn_fn(orig_fn)
+                    setattr(comfy_attn, fn_name, safe_fn)
+                    replaced_map[id(orig_fn)] = (orig_fn, safe_fn)
+                else:
+                    replaced_map[id(orig_fn)] = (orig_fn, cur_fn)
+
+            if replaced_map:
+                setattr(comfy_attn, "_omni_replaced_attn_map", replaced_map)
+                reg_map = getattr(comfy_attn, "REGISTERED_ATTENTION_FUNCTIONS", None)
+                if isinstance(reg_map, dict):
+                    for reg_k, reg_v in list(reg_map.items()):
+                        pair = replaced_map.get(id(reg_v))
+                        if pair is not None:
+                            reg_map[reg_k] = pair[1]
+
+                for global_attr in ("optimized_attention", "optimized_attention_masked"):
+                    g_val = getattr(comfy_attn, global_attr, None)
+                    pair = replaced_map.get(id(g_val))
+                    if pair is not None:
+                        setattr(comfy_attn, global_attr, pair[1])
+
+                # Rebind already-imported `from comfy.ldm.modules.attention import optimized_attention`
+                # references across loaded `comfy.*` submodules (e.g. ernie, mmdit, wan, qwen_image21).
+                for mod_name, mod_obj in list(sys.modules.items()):
+                    if not isinstance(mod_name, str) or not mod_name.startswith("comfy.") or mod_obj is None:
+                        continue
+                    for attr_n in ("optimized_attention", "optimized_attention_masked"):
+                        try:
+                            cur_ref = getattr(mod_obj, attr_n, None)
+                        except Exception:
+                            continue
+                        pair = replaced_map.get(id(cur_ref))
+                        if pair is not None:
+                            try:
+                                setattr(mod_obj, attr_n, pair[1])
+                            except Exception:
+                                pass
+
+            setattr(comfy_attn, "_omni_attn_hooks_installed", True)
+    except Exception:
+        pass
+
+    try:
+        import functools as _ft
+
+        ck_targets: List[Any] = []
+        ck_mod = sys.modules.get("comfy_kitchen")
+        if ck_mod is not None:
+            ck_targets.append(ck_mod)
+        qops_mod = sys.modules.get("comfy.quant_ops")
+        if qops_mod is not None and getattr(qops_mod, "ck", None) is not None:
+            qops_ck = getattr(qops_mod, "ck")
+            if qops_ck not in ck_targets:
+                ck_targets.append(qops_ck)
+
+        for ck_obj in ck_targets:
+            if hasattr(ck_obj, "int8_attention") and not getattr(ck_obj.int8_attention, "_omni_train_safe", False):
+                _orig_ck_int8 = getattr(ck_obj, "_omni_orig_int8_attention", ck_obj.int8_attention)
+                setattr(ck_obj, "_omni_orig_int8_attention", _orig_ck_int8)
+
+                def _make_ck_int8_wrapper(orig_f: Any) -> Any:
+                    def _safe_ck_int8(
+                        q: torch.Tensor,
+                        k: torch.Tensor,
+                        v: torch.Tensor,
+                        scale: Optional[float] = None,
+                        attn_mask: Optional[torch.Tensor] = None,
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> torch.Tensor:
+                        if _is_omni_training_active():
+                            return _sdpa_4d_fallback(q, k, v, scale=scale, attn_mask=attn_mask)
+                        return orig_f(q, k, v, scale=scale, attn_mask=attn_mask, *args, **kwargs)
+
+                    setattr(_safe_ck_int8, "_omni_train_safe", True)
+                    return _safe_ck_int8
+
+                setattr(ck_obj, "int8_attention", _make_ck_int8_wrapper(_orig_ck_int8))
+
+            if (
+                hasattr(ck_obj, "prequantize_int8_attention")
+                and hasattr(ck_obj, "int8_attention_from_prequantized")
+                and not getattr(ck_obj.prequantize_int8_attention, "_omni_train_safe", False)
+            ):
+                _orig_preq = getattr(ck_obj, "_omni_orig_prequantize_int8_attention", ck_obj.prequantize_int8_attention)
+                _orig_from_preq = getattr(
+                    ck_obj, "_omni_orig_int8_attention_from_prequantized", ck_obj.int8_attention_from_prequantized
+                )
+                setattr(ck_obj, "_omni_orig_prequantize_int8_attention", _orig_preq)
+                setattr(ck_obj, "_omni_orig_int8_attention_from_prequantized", _orig_from_preq)
+
+                def _make_preq_pair(orig_p: Any, orig_fp: Any) -> Tuple[Any, Any]:
+                    def _safe_preq(
+                        q: torch.Tensor,
+                        k: torch.Tensor,
+                        v: torch.Tensor,
+                        scale: Optional[float] = None,
+                        attn_mask: Optional[torch.Tensor] = None,
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> Any:
+                        if _is_omni_training_active():
+                            return {"_omni_sdpa_qkv": (q, k, v, scale, attn_mask)}
+                        return orig_p(q, k, v, scale=scale, attn_mask=attn_mask, *args, **kwargs)
+
+                    def _safe_from_preq(quantized: Any, *args: Any, **kwargs: Any) -> torch.Tensor:
+                        if isinstance(quantized, dict) and "_omni_sdpa_qkv" in quantized:
+                            q, k, v, scale, attn_mask = quantized["_omni_sdpa_qkv"]
+                            return _sdpa_4d_fallback(q, k, v, scale=scale, attn_mask=attn_mask)
+                        return orig_fp(quantized, *args, **kwargs)
+
+                    setattr(_safe_preq, "_omni_train_safe", True)
+                    setattr(_safe_from_preq, "_omni_train_safe", True)
+                    return _safe_preq, _safe_from_preq
+
+                safe_preq, safe_from_preq = _make_preq_pair(_orig_preq, _orig_from_preq)
+                setattr(ck_obj, "prequantize_int8_attention", safe_preq)
+                setattr(ck_obj, "int8_attention_from_prequantized", safe_from_preq)
+
+            if hasattr(ck_obj, "sol_attn") and not getattr(ck_obj.sol_attn, "_omni_train_safe", False):
+                _orig_sol = getattr(ck_obj, "_omni_orig_sol_attn", ck_obj.sol_attn)
+                setattr(ck_obj, "_omni_orig_sol_attn", _orig_sol)
+
+                def _make_sol_wrapper(orig_f: Any) -> Any:
+                    def _safe_sol(
+                        q: torch.Tensor,
+                        k: torch.Tensor,
+                        v: torch.Tensor,
+                        tau: float = 1.0,
+                        scale: Optional[float] = None,
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> torch.Tensor:
+                        if _is_omni_training_active():
+                            base_scale = float(scale) if scale is not None else float(int(q.shape[-1]) ** -0.5)
+                            eff_scale = base_scale / max(1e-6, float(tau or 1.0))
+                            out_4d = _sdpa_4d_fallback(
+                                q.transpose(1, 2),
+                                k.transpose(1, 2),
+                                v.transpose(1, 2),
+                                scale=eff_scale,
+                                attn_mask=None,
+                            )
+                            return out_4d.transpose(1, 2)
+                        return orig_f(q, k, v, tau=tau, scale=scale, *args, **kwargs)
+
+                    setattr(_safe_sol, "_omni_train_safe", True)
+                    return _safe_sol
+
+                setattr(ck_obj, "sol_attn", _make_sol_wrapper(_orig_sol))
+
+            if hasattr(ck_obj, "rms_rope") and not getattr(ck_obj.rms_rope, "_omni_train_safe", False):
+                _orig_rms_rope = getattr(ck_obj, "_omni_orig_rms_rope", ck_obj.rms_rope)
+                setattr(ck_obj, "_omni_orig_rms_rope", _orig_rms_rope)
+
+                def _make_rms_rope_wrapper(orig_f: Any) -> Any:
+                    def _safe_rms_rope(
+                        q: torch.Tensor,
+                        k: torch.Tensor,
+                        pe: torch.Tensor,
+                        q_scale: Optional[torch.Tensor] = None,
+                        k_scale: Optional[torch.Tensor] = None,
+                        eps: float = 1e-6,
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> Tuple[torch.Tensor, torch.Tensor]:
+                        if _is_omni_training_active():
+                            eff_eps = float(kwargs.get("epsilon", eps))
+                            return _torch_rms_rope_interleaved(q, k, pe, q_scale, k_scale, eps=eff_eps)
+                        return orig_f(q, k, pe, q_scale, k_scale, eps, *args, **kwargs)
+
+                    setattr(_safe_rms_rope, "_omni_train_safe", True)
+                    return _safe_rms_rope
+
+                setattr(ck_obj, "rms_rope", _make_rms_rope_wrapper(_orig_rms_rope))
+
+            if hasattr(ck_obj, "rms_rope1") and not getattr(ck_obj.rms_rope1, "_omni_train_safe", False):
+                _orig_rms_rope1 = getattr(ck_obj, "_omni_orig_rms_rope1", ck_obj.rms_rope1)
+                setattr(ck_obj, "_omni_orig_rms_rope1", _orig_rms_rope1)
+
+                def _make_rms_rope1_wrapper(orig_f: Any) -> Any:
+                    def _safe_rms_rope1(
+                        x: torch.Tensor,
+                        pe: torch.Tensor,
+                        scale: Optional[torch.Tensor] = None,
+                        eps: float = 1e-6,
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> torch.Tensor:
+                        if _is_omni_training_active():
+                            eff_eps = float(kwargs.get("epsilon", eps))
+                            return _torch_apply_rope_interleaved1(_rms_norm_t(x, scale, eps=eff_eps), pe)
+                        return orig_f(x, pe, scale, eps, *args, **kwargs)
+
+                    setattr(_safe_rms_rope1, "_omni_train_safe", True)
+                    return _safe_rms_rope1
+
+                setattr(ck_obj, "rms_rope1", _make_rms_rope1_wrapper(_orig_rms_rope1))
+
+            for split_fn_name in ("rms_rope_split_half", "rms_rope_split_half_"):
+                if hasattr(ck_obj, split_fn_name) and not getattr(getattr(ck_obj, split_fn_name), "_omni_train_safe", False):
+                    _orig_split = getattr(ck_obj, f"_omni_orig_{split_fn_name}", getattr(ck_obj, split_fn_name))
+                    setattr(ck_obj, f"_omni_orig_{split_fn_name}", _orig_split)
+                    is_inplace_split = split_fn_name.endswith("_")
+
+                    def _make_rms_rope_split_wrapper(orig_f: Any, inplace_flag: bool) -> Any:
+                        def _safe_rms_rope_split(
+                            q: torch.Tensor,
+                            k: torch.Tensor,
+                            pe: torch.Tensor,
+                            q_scale: Optional[torch.Tensor] = None,
+                            k_scale: Optional[torch.Tensor] = None,
+                            eps: float = 1e-6,
+                            *args: Any,
+                            **kwargs: Any,
+                        ) -> Tuple[torch.Tensor, torch.Tensor]:
+                            if _is_omni_training_active():
+                                eff_eps = float(kwargs.get("epsilon", eps))
+                                rot_dim = kwargs.get("rot_dim", args[0] if len(args) > 0 else None)
+                                rq, rk = _torch_rms_rope_split_half(
+                                    q, k, pe, q_scale, k_scale, eps=eff_eps, rot_dim=rot_dim
+                                )
+                                if inplace_flag and not (q.requires_grad or k.requires_grad):
+                                    q.copy_(rq)
+                                    k.copy_(rk)
+                                    return q, k
+                                return rq, rk
+                            return orig_f(q, k, pe, q_scale, k_scale, eps, *args, **kwargs)
+
+                        setattr(_safe_rms_rope_split, "_omni_train_safe", True)
+                        return _safe_rms_rope_split
+
+                    setattr(ck_obj, split_fn_name, _make_rms_rope_split_wrapper(_orig_split, is_inplace_split))
+
+            if hasattr(ck_obj, "apply_rope_split_half") and not getattr(ck_obj.apply_rope_split_half, "_omni_train_safe", False):
+                _orig_apply_split = getattr(ck_obj, "_omni_orig_apply_rope_split_half", ck_obj.apply_rope_split_half)
+                setattr(ck_obj, "_omni_orig_apply_rope_split_half", _orig_apply_split)
+
+                def _make_apply_rope_split_wrapper(orig_f: Any) -> Any:
+                    def _safe_apply_rope_split(
+                        xq: torch.Tensor,
+                        xk: torch.Tensor,
+                        freqs_cis: torch.Tensor,
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> Tuple[torch.Tensor, torch.Tensor]:
+                        if _is_omni_training_active():
+                            rot_dim = kwargs.get("rot_dim", args[0] if len(args) > 0 else None)
+                            return (
+                                _torch_apply_rope_split_half1(xq, freqs_cis, rot_dim=rot_dim),
+                                _torch_apply_rope_split_half1(xk, freqs_cis, rot_dim=rot_dim),
+                            )
+                        return orig_f(xq, xk, freqs_cis, *args, **kwargs)
+
+                    setattr(_safe_apply_rope_split, "_omni_train_safe", True)
+                    return _safe_apply_rope_split
+
+                setattr(ck_obj, "apply_rope_split_half", _make_apply_rope_split_wrapper(_orig_apply_split))
+
+            if hasattr(ck_obj, "apply_rope") and not getattr(ck_obj.apply_rope, "_omni_train_safe", False):
+                _orig_apply_rope = getattr(ck_obj, "_omni_orig_apply_rope", ck_obj.apply_rope)
+                setattr(ck_obj, "_omni_orig_apply_rope", _orig_apply_rope)
+
+                def _make_apply_rope_wrapper(orig_f: Any) -> Any:
+                    def _safe_apply_rope(
+                        xq: torch.Tensor,
+                        xk: torch.Tensor,
+                        freqs_cis: torch.Tensor,
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> Tuple[torch.Tensor, torch.Tensor]:
+                        if _is_omni_training_active():
+                            return (
+                                _torch_apply_rope_interleaved1(xq, freqs_cis),
+                                _torch_apply_rope_interleaved1(xk, freqs_cis),
+                            )
+                        return orig_f(xq, xk, freqs_cis, *args, **kwargs)
+
+                    setattr(_safe_apply_rope, "_omni_train_safe", True)
+                    return _safe_apply_rope
+
+                setattr(ck_obj, "apply_rope", _make_apply_rope_wrapper(_orig_apply_rope))
+
+            if hasattr(ck_obj, "apply_rope1") and not getattr(ck_obj.apply_rope1, "_omni_train_safe", False):
+                _orig_apply_rope1 = getattr(ck_obj, "_omni_orig_apply_rope1", ck_obj.apply_rope1)
+                setattr(ck_obj, "_omni_orig_apply_rope1", _orig_apply_rope1)
+
+                def _make_apply_rope1_wrapper(orig_f: Any) -> Any:
+                    def _safe_apply_rope1(
+                        x: torch.Tensor,
+                        freqs_cis: torch.Tensor,
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> torch.Tensor:
+                        if _is_omni_training_active():
+                            return _torch_apply_rope_interleaved1(x, freqs_cis)
+                        return orig_f(x, freqs_cis, *args, **kwargs)
+
+                    setattr(_safe_apply_rope1, "_omni_train_safe", True)
+                    return _safe_apply_rope1
+
+                setattr(ck_obj, "apply_rope1", _make_apply_rope1_wrapper(_orig_apply_rope1))
+
+            if hasattr(ck_obj, "adaln") and not getattr(ck_obj.adaln, "_omni_train_safe", False):
+                _orig_adaln = getattr(ck_obj, "_omni_orig_adaln", ck_obj.adaln)
+                setattr(ck_obj, "_omni_orig_adaln", _orig_adaln)
+
+                def _make_adaln_wrapper(orig_f: Any) -> Any:
+                    def _safe_adaln(
+                        x: torch.Tensor,
+                        scale: torch.Tensor,
+                        shift: torch.Tensor,
+                        eps: float = 1e-6,
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> torch.Tensor:
+                        if _is_omni_training_active():
+                            normed = F.layer_norm(x, (int(x.shape[-1]),), eps=float(eps or 1e-6))
+                            return torch.addcmul(shift, normed, 1.0 + scale)
+                        return orig_f(x, scale, shift, eps, *args, **kwargs)
+
+                    setattr(_safe_adaln, "_omni_train_safe", True)
+                    return _safe_adaln
+
+                setattr(ck_obj, "adaln", _make_adaln_wrapper(_orig_adaln))
+
+            if hasattr(ck_obj, "rms_adaln") and not getattr(ck_obj.rms_adaln, "_omni_train_safe", False):
+                _orig_rms_adaln = getattr(ck_obj, "_omni_orig_rms_adaln", ck_obj.rms_adaln)
+                setattr(ck_obj, "_omni_orig_rms_adaln", _orig_rms_adaln)
+
+                def _make_rms_adaln_wrapper(orig_f: Any) -> Any:
+                    def _safe_rms_adaln(
+                        x: torch.Tensor,
+                        scale: torch.Tensor,
+                        shift: torch.Tensor,
+                        eps: float = 1e-6,
+                        *args: Any,
+                        **kwargs: Any,
+                    ) -> torch.Tensor:
+                        if _is_omni_training_active():
+                            normed = _rms_norm_t(x, None, eps=float(eps or 1e-6))
+                            return torch.addcmul(shift, normed, 1.0 + scale)
+                        return orig_f(x, scale, shift, eps, *args, **kwargs)
+
+                    setattr(_safe_rms_adaln, "_omni_train_safe", True)
+                    return _safe_rms_adaln
+
+                setattr(ck_obj, "rms_adaln", _make_rms_adaln_wrapper(_orig_rms_adaln))
+    except Exception:
+        pass
+
+
+def _rebind_comfy_attention_modules(root: Optional[nn.Module]) -> None:
+    """
+    Ensure any pre-loaded `ComfyAttention` submodule on `root` whose `.function` (or
+    `functools.partial.func`) bound an unpatched `attention_comfy_kitchen_*` / `attention_sage`
+    callable before `install_comfy_runtime_hooks()` is rebound to the training-safe wrapper.
+    """
+    if root is None or not isinstance(root, nn.Module):
+        return
+    comfy_attn = sys.modules.get("comfy.ldm.modules.attention")
+    replaced_map = getattr(comfy_attn, "_omni_replaced_attn_map", None) if comfy_attn is not None else None
+    if not isinstance(replaced_map, dict) or not replaced_map:
+        return
+    import functools
+
+    for mod in root.modules():
+        candidates = [mod]
+        ca = getattr(mod, "comfy_attention", None)
+        if ca is not None and ca is not mod:
+            candidates.append(ca)
+        for obj in candidates:
+            fn = getattr(obj, "function", None)
+            if fn is None or getattr(fn, "_omni_train_attn_safe", False):
+                continue
+            pair = replaced_map.get(id(fn))
+            if pair is not None:
+                try:
+                    setattr(obj, "function", pair[1])
+                except Exception:
+                    pass
+            elif isinstance(fn, functools.partial):
+                inner_pair = replaced_map.get(id(fn.func))
+                if inner_pair is not None:
+                    try:
+                        new_partial = functools.partial(inner_pair[1], *fn.args, **(fn.keywords or {}))
+                        setattr(new_partial, "_omni_train_attn_safe", True)
+                        setattr(obj, "function", new_partial)
+                    except Exception:
+                        pass
+
 
 def unwrap_comfy_diffusion_model(
     comfy_model: Any,
@@ -2691,6 +3464,7 @@ def unwrap_comfy_diffusion_model(
             has_children = any(True for _ in cand.children())
             has_params = any(True for _ in cand.parameters())
             if has_children or has_params:
+                _rebind_comfy_attention_modules(cand)
                 LoRAInjector.capture_comfy_lora_key_map(cand, comfy_model=comfy_model)
                 return cand
 

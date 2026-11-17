@@ -55,6 +55,9 @@ Create a folder anywhere on your drive (for example `C:/datasets/my_character` o
 
 > **Using Your GPU for Your Monitor?**
 > If your display is plugged into the same GPU you train on, setting **`reserve_vram_gb = 0.5` to `1.5`** on `OmniLoRA Universal Trainer` may increase stability.
+>
+> **Using Comfy Kitchen (`--use-ck-attention`) or SageAttention (`--use-sage-attention`)?**
+> OmniLoRA automatically overrides inference-only attention and `comfy_kitchen` RoPE/AdaLN kernels with differentiable PyTorch SDPA (`attention_pytorch`) for the duration of training and restores your inference backend afterward — though launching ComfyUI with default PyTorch attention (`--use-pytorch-cross-attention`) remains the cleanest baseline for dedicated training sessions.
 
 ### Step 3: Monitor, Checkpoint & Test in One Click
 - **Live Loss Graph**: Connect `training_summary` from the Trainer to **`OmniLoRA Loss Tracker`** to watch real-time loss, smoothed EMA trend, learning rate, speed (`s/step`), ETA, and VRAM usage directly on the ComfyUI canvas.
@@ -238,6 +241,8 @@ Instead of relying on static percentage heuristics, `enforce_vram_budget` inspec
   Make sure the **`type`** dropdown on your ComfyUI `CLIPLoader` / `DualCLIPLoader` matches your diffusion model (e.g. `flux` for Flux, `sd3` for SD 3.5, `qwen_image` for Qwen-Image, `wan` for Wan 2.1/2.2, `lumina2` for Lumina 2 / Z-Image, `hidream` for HiDream) and that you connected the matching `VAELoader`.
 - **My PC lagged or ran out of VRAM while my browser / monitor was active:**
   Increase **`reserve_vram_gb`** on `OmniLoRA Universal Trainer` to **`1.0` or `1.5`**, or switch `optimizer` from `radamw` to **`adafactor`**.
+- **Can I train if I launch ComfyUI with `--use-ck-attention` (Comfy Kitchen) or `--use-sage-attention`?**
+  Yes. Comfy Kitchen INT8/SOL attention (`comfy_kitchen.int8_attention` / `sol_attn`), SageAttention (`sageattn`), and `comfy_kitchen` fused RoPE/AdaLN kernels are inference-only C++/Triton kernels without PyTorch autograd backward formulas. OmniLoRA automatically intercepts `transformer_options["optimized_attention_override"]`, `comfy.ldm.modules.attention`, pre-loaded `ComfyAttention` checkpoints, and `comfy_kitchen` / `comfy.quant_ops.ck` calls during training to route through differentiable PyTorch SDPA (`F.scaled_dot_product_attention`), and restores your inference attention backend as soon as training finishes.
 - **Can I use `.avif` or `.heic` images?**
   Yes. Pillow $\ge 11.2$, `imageio`, `opencv-python` (`cv2`), and `ffmpeg` are all checked automatically. If your Python environment has an older Pillow without AVIF support, run `pip install pillow-avif-plugin` or `pip install --upgrade Pillow>=11.2.0`.
 

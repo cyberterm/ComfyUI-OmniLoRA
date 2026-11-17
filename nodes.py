@@ -793,6 +793,13 @@ class OmniLoRAPrecomputeConditioning:
                                     batch_extra[ek] = torch.stack(padded_biases, dim=0)
                                 elif all(v.shape == single_list[0].shape for v in single_list):
                                     batch_extra[ek] = torch.stack(single_list, dim=0)
+                                elif all(v.ndim == 1 for v in single_list):
+                                    target_1d_len = max(int(v.shape[0]) for v in single_list)
+                                    padded_1d = [
+                                        (F.pad(v, (0, target_1d_len - int(v.shape[0])), value=0) if int(v.shape[0]) < target_1d_len else v[:target_1d_len])
+                                        for v in single_list
+                                    ]
+                                    batch_extra[ek] = torch.stack(padded_1d, dim=0)
                                 elif all(v.ndim >= 2 and v.shape[1:] == single_list[0].shape[1:] for v in single_list):
                                     batch_extra[ek] = _pad_and_stack_sequence_tensors(single_list)
                                 else:
@@ -838,7 +845,11 @@ class OmniLoRAPrecomputeConditioning:
                     if isinstance(u_pool, torch.Tensor):
                         uncond_pooled = u_pool.unsqueeze(0).clone() if u_pool.ndim == 1 else u_pool.clone()
                     uncond_extra = {
-                        ek: (ev.clone() if isinstance(ev, torch.Tensor) else ev)
+                        ek: (
+                            (ev.unsqueeze(0).clone() if ev.ndim == 1 else ev.clone())
+                            if isinstance(ev, torch.Tensor)
+                            else ev
+                        )
                         for ek, ev in u_ext.items()
                     }
         finally:
@@ -1406,8 +1417,27 @@ class OmniLoRATrainer:
                 if hasattr(cli_args, "args"):
                     orig_disable_compiler = getattr(cli_args.args, "disable_comfy_compiler", None)
                     cli_args.args.disable_comfy_compiler = True
+                    active_infer_attn: List[str] = []
+                    if bool(getattr(cli_args.args, "use_ck_attention", False)):
+                        active_infer_attn.append("--use-ck-attention (Comfy Kitchen)")
+                    if bool(getattr(cli_args.args, "use_sage_attention", False)):
+                        active_infer_attn.append("--use-sage-attention (SageAttention)")
+                    if (
+                        model is not None
+                        and isinstance(getattr(model, "model_options", None), dict)
+                        and isinstance(model.model_options.get("transformer_options"), dict)
+                        and "optimized_attention_override" in model.model_options["transformer_options"]
+                    ):
+                        active_infer_attn.append("model_options.optimized_attention_override")
+                    if active_infer_attn:
+                        logging.info(
+                            f"[OmniLoRA] Detected inference-only attention configuration ({', '.join(active_infer_attn)}); "
+                            "routing training attention and RoPE/AdaLN kernels through differentiable PyTorch SDPA."
+                        )
             except Exception:
                 pass
+
+            install_comfy_runtime_hooks()
 
             resumed_bundle: Optional[OmniLoRANetworkBundle] = None
             resolved_rank = int(rank)
