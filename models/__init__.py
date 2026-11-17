@@ -1,0 +1,56 @@
+"""
+Model Adapters & Universal ComfyUI Model Inspection for ComfyUI-OmniLoRA.
+"""
+
+from .adapters import (
+    MODEL_REGISTRY,
+    MODEL_SPECS,
+    ComfyModelAdapter,
+    FluxModelAdapter,
+    HunyuanVideoAdapter,
+    LTXVideoAdapter,
+    MossImageAdapter,
+    QwenImageAdapter,
+    SD15ModelAdapter,
+    SD3ModelAdapter,
+    SDXLModelAdapter,
+    ToyBackbone,
+    UniversalModelAdapter,
+    WanVideoAdapter,
+    detect_comfy_model_architecture,
+    discover_universal_target_modules,
+    ensure_comfy_importable,
+    install_comfy_runtime_hooks,
+    normalize_legacy_lora_key,
+    resolve_comfy_native_architecture,
+    resolve_model_adapter,
+    unwrap_comfy_diffusion_model,
+)
+from .base import BaseModelAdapter, ModelSpec
+
+__all__ = [
+    "BaseModelAdapter",
+    "ModelSpec",
+    "MODEL_SPECS",
+    "MODEL_REGISTRY",
+    "UniversalModelAdapter",
+    "ComfyModelAdapter",
+    "ToyBackbone",
+    "MossImageAdapter",
+    "FluxModelAdapter",
+    "SD3ModelAdapter",
+    "SDXLModelAdapter",
+    "SD15ModelAdapter",
+    "WanVideoAdapter",
+    "HunyuanVideoAdapter",
+    "LTXVideoAdapter",
+    "QwenImageAdapter",
+    "detect_comfy_model_architecture",
+    "discover_universal_target_modules",
+    "ensure_comfy_importable",
+    "install_comfy_runtime_hooks",
+    "normalize_legacy_lora_key",
+    "resolve_comfy_native_architecture",
+    "resolve_model_adapter",
+    "unwrap_comfy_diffusion_model",
+]
