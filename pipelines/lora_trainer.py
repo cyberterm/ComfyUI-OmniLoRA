@@ -606,9 +606,10 @@ def _install_chunked_sdpa_wrapper() -> None:
                     -65504.0 if scores.dtype == torch.float16 else -1e9,
                 )
             if attn_mask is not None:
-                if attn_mask.dtype == torch.bool:
+                if attn_mask.dtype == torch.bool or not attn_mask.is_floating_point():
+                    mask_bool = attn_mask if attn_mask.dtype == torch.bool else attn_mask.to(dtype=torch.bool)
                     scores = scores.masked_fill(
-                        ~attn_mask,
+                        ~mask_bool.to(device=scores.device),
                         -65504.0 if scores.dtype == torch.float16 else -1e9,
                     )
                 else:
@@ -626,6 +627,8 @@ def _install_chunked_sdpa_wrapper() -> None:
         scale: Optional[float] = None,
         enable_gqa: bool = False,
     ) -> torch.Tensor:
+        if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool and not attn_mask.is_floating_point():
+            attn_mask = attn_mask.to(dtype=torch.bool)
         q_dev_type = getattr(query.device, "type", "cpu") if isinstance(query, torch.Tensor) else "cpu"
         active_sdpa = _pure_fp32_sdpa if q_dev_type in ("privateuseone", "dml") else orig_sdpa
 

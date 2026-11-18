@@ -5,6 +5,16 @@ Versioning follows [Semantic Versioning](https://semver.org/) and is tracked via
 
 ---
 
+## [1.0.4] - 2026-04-12
+
+### Fixed
+- **Flux / Flux.2 / Chroma `int64` `attention_mask` SDPA Crash**:
+  - Fixed `RuntimeError: Expected attn_mask dtype to be bool or float or to match query dtype, but got attn_mask.dtype: __int64 and query.dtype: struct c10::BFloat16 instead.` during Flux / Flux.2 / Chroma training whenever text encoders or variable-length multi-sample batches produced a 2D `int64` `attention_mask` in `extra_conds`.
+  - Updated `ComfyModelAdapter._forward_backbone` to treat a successful `BaseModel.extra_conds(...)` call as authoritative instead of re-injecting omitted conditioning keys via `**kwargs`, preventing raw text token masks (dropped by `Flux.extra_conds` when `attention_mask_img_shape` is `None`) from reaching `Flux._forward` joint attention. Standalone backbones without `extra_conds` also restrict mask/bias keys to explicitly declared parameters.
+  - Added defensive SDPA attention mask normalization (`_normalize_sdpa_attn_mask` in training attention overrides/fallbacks, plus integer-to-`bool` conversion in `_wrapped_sdpa` and `_pure_fp32_sdpa`) so models that legitimately pass integer `0/1` or batched 2D `[B, L_k]` masks to `F.scaled_dot_product_attention` convert cleanly to `torch.bool` / `[B, 1, 1, L_k]`.
+
+---
+
 ## [1.0.3] - 2026-04-12
 
 ### Added

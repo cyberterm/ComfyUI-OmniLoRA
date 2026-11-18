@@ -5145,6 +5145,162 @@ class TestOmniLoRAFramework(unittest.TestCase):
         self.assertGreater(grad_count, 0)
         LoRAInjector.uninject(h3_dm)
 
+    def test_flux_attention_mask_not_leaked_and_sdpa_int_mask_normalized(self) -> None:
+        """
+        Regression test for `RuntimeError: Expected attn_mask dtype to be bool or float or to match
+        query dtype, but got attn_mask.dtype: __int64 and query.dtype: struct c10::BFloat16 instead.`
+        during Flux / Flux.2 training with `extra_conds["attention_mask"]` (`int64`, `[B, L_txt]`):
+          1. When `Flux.extra_conds` omits `attention_mask` (no `attention_mask_img_shape`),
+             `ComfyModelAdapter._forward_backbone` must NOT re-inject the raw `int64` text mask
+             into `Flux.forward(..., **kwargs)`.
+          2. Even without a `BaseModel` wrapper (standalone `comfy.ldm.flux.model.Flux`), raw
+             `attention_mask` must not be leaked via `**kwargs`.
+          3. `_normalize_sdpa_attn_mask` and `_install_chunked_sdpa_wrapper` must safely convert
+             integer (`int64`) `0/1` masks to `bool` and reshape batched 2D `[B, L_k]` masks to
+             `[B, 1, 1, L_k]` for models that legitimately pass text masks to SDPA.
+        """
+        import comfy.model_base
+        import comfy.ops
+        import comfy.supported_models
+        from comfy.ldm.flux.model import Flux
+        from omni_lora.models.adapters import _normalize_sdpa_attn_mask
+        from omni_lora.pipelines.lora_trainer import _install_chunked_sdpa_wrapper
+
+        ops = comfy.ops.manual_cast
+        flux_dm = Flux(
+            in_channels=16,
+            out_channels=16,
+            vec_in_dim=64,
+            context_in_dim=64,
+            hidden_size=64,
+            mlp_ratio=2.0,
+            num_heads=4,
+            depth=1,
+            depth_single_blocks=1,
+            axes_dim=[4, 6, 6],
+            theta=10000,
+            patch_size=2,
+            qkv_bias=True,
+            guidance_embed=True,
+            txt_ids_dims=[1, 2],
+            dtype=torch.bfloat16,
+            device="cpu",
+            operations=ops,
+        )
+        # `comfy.ops.manual_cast` disables weight initialization (`torch.empty`), so initialize
+        # all parameters and buffers deterministically before running the forward pass.
+        with torch.no_grad():
+            for name, param in flux_dm.named_parameters():
+                if param.is_floating_point():
+                    if "bias" in name:
+                        torch.nn.init.zeros_(param)
+                    elif param.ndim == 1:
+                        torch.nn.init.ones_(param)
+                    else:
+                        torch.nn.init.normal_(param, mean=0.0, std=0.02)
+            for buf in flux_dm.buffers():
+                if buf.is_floating_point():
+                    torch.nn.init.zeros_(buf)
+
+        cfg = comfy.supported_models.Flux({"disable_unet_model_creation": True, "hidden_size": 64})
+        base_model = comfy.model_base.Flux(cfg, model_type=comfy.model_base.ModelType.FLOW, device=torch.device("cpu"))
+        base_model.diffusion_model = flux_dm
+        base_model.manual_cast_dtype = torch.bfloat16
+
+        adapter = ComfyModelAdapter(comfy_model=base_model, model_id="flux_dev")
+        latents = torch.randn(2, 16, 4, 4, dtype=torch.bfloat16)
+        timesteps = torch.tensor([0.5, 0.5], dtype=torch.bfloat16)
+        prompt_embeds = torch.randn(2, 12, 64, dtype=torch.bfloat16)
+        pooled = torch.randn(2, 64, dtype=torch.bfloat16)
+        int64_text_mask = torch.tensor(
+            [[1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]],
+            dtype=torch.int64,
+        )
+
+        # 1. Real unbridged `Flux._forward` -> `DoubleStreamBlock` -> `attention_pytorch` -> SDPA
+        with torch.enable_grad():
+            out = adapter._forward_backbone(
+                backbone=flux_dm,
+                noisy_latents=latents,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                pooled_output=pooled,
+                extra_cond_dict={
+                    "attention_mask": int64_text_mask,
+                    "context_attention_bias": torch.zeros((2, 12), dtype=torch.bfloat16),
+                },
+            )
+        self.assertEqual(tuple(out.shape), (2, 16, 4, 4))
+        self.assertTrue(torch.isfinite(out.float()).all())
+
+        # 2. Standalone `Flux` without `BaseModel` wrapper
+        standalone_adapter = ComfyModelAdapter(comfy_model=flux_dm, model_id="flux_dev")
+        with torch.enable_grad():
+            out_standalone = standalone_adapter._forward_backbone(
+                backbone=flux_dm,
+                noisy_latents=latents,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                pooled_output=pooled,
+                extra_cond_dict={"attention_mask": int64_text_mask},
+            )
+        self.assertEqual(tuple(out_standalone.shape), (2, 16, 4, 4))
+        self.assertTrue(torch.isfinite(out_standalone.float()).all())
+
+        # 3. Mask-aware models (e.g. QwenImage / Lumina2 / HunyuanVideo) whose `extra_conds`
+        #    emits `attention_mask` must STILL receive their exact `int64` `attention_mask`.
+        captured_mask_aware: Dict[str, Any] = {}
+
+        class _MaskAwareDiffusion(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.proj = nn.Linear(16, 16)
+
+            def forward(self, x: torch.Tensor, timestep: torch.Tensor, context: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, **kwargs: Any) -> torch.Tensor:
+                captured_mask_aware["attention_mask"] = attention_mask
+                return x
+
+        class _MaskAwareBaseModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.diffusion_model = _MaskAwareDiffusion()
+
+            def extra_conds(self, **kwargs: Any) -> Dict[str, Any]:
+                out_c: Dict[str, Any] = {}
+                if kwargs.get("cross_attn") is not None:
+                    out_c["c_crossattn"] = types.SimpleNamespace(cond=kwargs["cross_attn"])
+                if kwargs.get("attention_mask") is not None:
+                    out_c["attention_mask"] = types.SimpleNamespace(cond=kwargs["attention_mask"])
+                return out_c
+
+        mask_base = _MaskAwareBaseModel()
+        mask_adapter = ComfyModelAdapter(comfy_model=mask_base, model_id="qwen_image")
+        _ = mask_adapter._forward_backbone(
+            backbone=mask_base.diffusion_model,
+            noisy_latents=latents,
+            timesteps=timesteps,
+            prompt_embeds=prompt_embeds,
+            extra_cond_dict={"attention_mask": int64_text_mask},
+        )
+        self.assertIsNotNone(captured_mask_aware.get("attention_mask"))
+        self.assertEqual(tuple(captured_mask_aware["attention_mask"].shape), (2, 12))
+        self.assertEqual(captured_mask_aware["attention_mask"].dtype, torch.int64)
+
+        # 4. Direct SDPA integer mask normalization and 2D batched key-mask reshaping
+        _install_chunked_sdpa_wrapper()
+        q = torch.randn(2, 4, 12, 16, dtype=torch.bfloat16)
+        k = torch.randn(2, 4, 12, 16, dtype=torch.bfloat16)
+        v = torch.randn(2, 4, 12, 16, dtype=torch.bfloat16)
+        norm_mask = _normalize_sdpa_attn_mask(int64_text_mask, q, k, skip_reshape=True)
+        self.assertIsNotNone(norm_mask)
+        assert norm_mask is not None
+        self.assertEqual(norm_mask.dtype, torch.bool)
+        self.assertEqual(tuple(norm_mask.shape), (2, 1, 1, 12))
+
+        sdpa_out = F.scaled_dot_product_attention(q, k, v, attn_mask=int64_text_mask[:, None, None, :])
+        self.assertEqual(tuple(sdpa_out.shape), (2, 4, 12, 16))
+        self.assertTrue(torch.isfinite(sdpa_out.float()).all())
+
 
 def run_cloud_verification_suite(preferred_backend: str = "auto") -> int:
     """

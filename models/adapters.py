@@ -159,6 +159,35 @@ def _unwrap_attn_tensor(tensor: Any) -> Any:
     return tensor
 
 
+def _normalize_sdpa_attn_mask(
+    mask: Optional[torch.Tensor],
+    q: Any,
+    k: Any,
+    skip_reshape: bool = True,
+) -> Optional[torch.Tensor]:
+    """
+    Ensure `attn_mask` satisfies PyTorch `F.scaled_dot_product_attention` dtype and rank rules:
+      1. Convert integer `0/1` token masks (`int64`/`int32`/`uint8`) to `torch.bool` (`0 -> False`,
+         `!= 0 -> True`), since SDPA strictly rejects non-bool integer masks.
+      2. Reshape batched 2D key masks `[B, L_k]` (`B > 1` and `B != L_q`) to `[B, 1, 1, L_k]`
+         before ComfyUI's `attention_pytorch` unsqueezes 2D masks into `[1, 1, dim0, dim1]`.
+    """
+    if mask is None or not isinstance(mask, torch.Tensor):
+        return mask
+    if mask.dtype != torch.bool and not mask.is_floating_point():
+        mask = mask.to(dtype=torch.bool)
+    if mask.ndim == 2 and isinstance(q, torch.Tensor) and isinstance(k, torch.Tensor):
+        if skip_reshape and q.ndim == 4 and k.ndim == 4:
+            b_sz, q_len, k_len = int(q.shape[0]), int(q.shape[-2]), int(k.shape[-2])
+        elif not skip_reshape and q.ndim == 3 and k.ndim == 3:
+            b_sz, q_len, k_len = int(q.shape[0]), int(q.shape[1]), int(k.shape[1])
+        else:
+            b_sz, q_len, k_len = 0, 0, 0
+        if b_sz > 1 and int(mask.shape[0]) == b_sz and int(mask.shape[1]) == k_len and b_sz != q_len:
+            mask = mask[:, None, None, :]
+    return mask
+
+
 def _run_pytorch_sdpa_attention(
     q: Any,
     k: Any,
@@ -178,6 +207,7 @@ def _run_pytorch_sdpa_attention(
     q = _unwrap_attn_tensor(q)
     k = _unwrap_attn_tensor(k)
     v = _unwrap_attn_tensor(v)
+    mask = _normalize_sdpa_attn_mask(mask, q, k, skip_reshape=skip_reshape)
 
     b_dim = int(q.shape[0]) if isinstance(q, torch.Tensor) and q.ndim >= 1 else 1
     comfy_attn = sys.modules.get("comfy.ldm.modules.attention")
@@ -1361,6 +1391,7 @@ class ComfyModelAdapter(BaseModelAdapter):
         spatial_w = int(noisy_latents.shape[-1]) * spacial_ratio if noisy_latents.ndim >= 4 else 1024
 
         # 1. Ask ComfyUI's native BaseModel.encode_adm(...) & BaseModel.extra_conds(...) to construct conditioning
+        extra_conds_succeeded = False
         if self.inner_model is not None and hasattr(self.inner_model, "extra_conds"):
             try:
                 expected_v = self._infer_backbone_vector_dim(backbone)
@@ -1440,6 +1471,7 @@ class ComfyModelAdapter(BaseModelAdapter):
                         pass
 
                 built_conds = self.inner_model.extra_conds(**cond_in)
+                extra_conds_succeeded = isinstance(built_conds, dict)
                 for k, v in built_conds.items():
                     val = None
                     if hasattr(v, "process_cond") and callable(v.process_cond):
@@ -1474,20 +1506,40 @@ class ComfyModelAdapter(BaseModelAdapter):
             c_concat_tensor = extra_cond_dict["c_concat"]
 
         if extra_cond_dict:
-            for ek, ev in extra_cond_dict.items():
-                if ev is None or ek in kwargs or ek in ("c_concat", "cross_attn", "c_crossattn", "pooled_output"):
-                    continue
-                if ek in param_names or accepts_var_kwargs:
-                    kwargs[ek] = (
-                        safe_to_device(ev, device=noisy_latents.device, dtype=noisy_latents.dtype)
-                        if isinstance(ev, torch.Tensor) and torch.is_floating_point(ev)
-                        else (safe_to_device(ev, device=noisy_latents.device) if isinstance(ev, torch.Tensor) else ev)
-                    )
+            # When `BaseModel.extra_conds` succeeded, it has already authoritatively filtered, renamed,
+            # or upscaled conditioning keys for `backbone.forward` (e.g., `Flux.extra_conds` intentionally
+            # drops text-only `int64` `attention_mask` when `attention_mask_img_shape` is None because
+            # `Flux._forward` passes `kwargs.get("attention_mask")` verbatim to joint SDPA; `HunyuanDiT`
+            # maps `attention_mask` -> `text_embedding_mask`; `FluxSchnell` strips `guidance`).
+            # Only fall back to forwarding raw `extra_cond_dict` keys when `extra_conds` did not run,
+            # and never leak mask/bias keys blindly through `**kwargs` if not explicitly declared.
+            if not extra_conds_succeeded:
+                _explicit_only_mask_keys = (
+                    "attention_mask",
+                    "attention_mask_img_shape",
+                    "attn_mask",
+                    "mask",
+                    "txt_mask",
+                    "context_attention_bias",
+                )
+                for ek, ev in extra_cond_dict.items():
+                    if ev is None or ek in kwargs or ek in ("c_concat", "cross_attn", "c_crossattn", "pooled_output"):
+                        continue
+                    if ek in param_names or (accepts_var_kwargs and ek not in _explicit_only_mask_keys):
+                        kwargs[ek] = (
+                            safe_to_device(ev, device=noisy_latents.device, dtype=noisy_latents.dtype)
+                            if isinstance(ev, torch.Tensor) and torch.is_floating_point(ev)
+                            else (safe_to_device(ev, device=noisy_latents.device) if isinstance(ev, torch.Tensor) else ev)
+                        )
 
             # Ensure Anima's `t5xxl_ids` (`[B, L_t5]` int) and `t5xxl_weights` (`[B, L_t5, 1]` float)
             # preserve exact per-sample batch contents and tensor ranks when passed to `Anima.forward`.
             raw_t5_ids = extra_cond_dict.get("t5xxl_ids")
-            if isinstance(raw_t5_ids, torch.Tensor) and ("t5xxl_ids" in kwargs or "t5xxl_ids" in param_names or accepts_var_kwargs):
+            if isinstance(raw_t5_ids, torch.Tensor) and (
+                "t5xxl_ids" in kwargs
+                or "t5xxl_ids" in param_names
+                or (not extra_conds_succeeded and accepts_var_kwargs)
+            ):
                 if not torch.is_inference_mode_enabled() or "t5xxl_ids" in kwargs:
                     t5_ids = safe_to_device(raw_t5_ids.detach().clone(), device=noisy_latents.device)
                     if torch.is_floating_point(t5_ids):
@@ -1501,7 +1553,11 @@ class ComfyModelAdapter(BaseModelAdapter):
                     kwargs["t5xxl_ids"] = t5_ids
 
             raw_t5_w = extra_cond_dict.get("t5xxl_weights")
-            if isinstance(raw_t5_w, torch.Tensor) and ("t5xxl_weights" in kwargs or "t5xxl_weights" in param_names or accepts_var_kwargs):
+            if isinstance(raw_t5_w, torch.Tensor) and (
+                "t5xxl_weights" in kwargs
+                or "t5xxl_weights" in param_names
+                or (not extra_conds_succeeded and accepts_var_kwargs)
+            ):
                 if not torch.is_inference_mode_enabled() or "t5xxl_weights" in kwargs:
                     t5_w = safe_to_device(raw_t5_w.detach().clone(), device=noisy_latents.device, dtype=noisy_latents.dtype)
                     if t5_w.ndim == 1:
@@ -3005,6 +3061,7 @@ def install_comfy_runtime_hooks() -> None:
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if attn_mask is not None:
+            attn_mask = _normalize_sdpa_attn_mask(attn_mask, q, k, skip_reshape=True)
             if attn_mask.ndim == 2:
                 attn_mask = attn_mask.unsqueeze(0)
             if attn_mask.ndim == 3:
