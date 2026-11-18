@@ -52,9 +52,10 @@ def _clone_tensors_for_grad(obj: Any) -> Any:
     if isinstance(obj, torch.Tensor):
         if is_custom_quantized_tensor(obj):
             return obj
-        if not obj.requires_grad and obj.ndim >= 5:
-            return obj
         restore_dev = getattr(obj, "_omni_restore_device", None)
+        # CPU-offloaded snapshots are detached, so a 5D one must still be moved back below.
+        if not obj.requires_grad and obj.ndim >= 5 and restore_dev is None:
+            return obj
         restore_req_grad = bool(getattr(obj, "_omni_requires_grad", False)) or bool(obj.requires_grad)
         if isinstance(restore_dev, torch.device) and obj.device != restore_dev:
             with torch.no_grad():

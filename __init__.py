@@ -8,7 +8,15 @@ Supports Intel Arc XPU (`torch.xpu` in native `bf16` with strict FP64-free guard
 AMD ROCm, NVIDIA CUDA, Google Cloud TPU (`torch_xla`), Huawei Ascend NPU, Intel Gaudi HPU, Windows DirectML, Apple MPS, and CPU.
 """
 
+import os as _os
 from pathlib import Path as _Path
+
+import torch as _torch
+
+# PyTorch caches this flag on the first SDPA eligibility check, so it must be set at import time,
+# before any attention runs. Without it, archs AOTriton lists as experimental fall back to math SDPA.
+if getattr(_torch.version, "hip", None):
+    _os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 
 _PKG_DIR = str(_Path(__file__).resolve().parent)
 if "_PKG_DIR" in globals():

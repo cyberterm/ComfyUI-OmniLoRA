@@ -4,6 +4,7 @@ AMD ROCm HIP Hardware Backend (`torch.cuda` + `torch.version.hip`).
 
 from __future__ import annotations
 
+import os
 from typing import Dict
 import torch
 
@@ -28,6 +29,7 @@ class ROCmBackend(CUDABackend):
             "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
             "PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True",
         }
+        os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
         if self.is_available():
             try:
                 self.device_index = self._valid_device_index()
