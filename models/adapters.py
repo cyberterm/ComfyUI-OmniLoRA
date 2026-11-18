@@ -555,19 +555,46 @@ class ComfyModelAdapter(BaseModelAdapter):
         """
         Determine structurally whether `backbone.forward` expects 5D `[B, C, T, H, W]` video/3D-patched
         latents or 4D `[B, C, H, W]` image latents across any ComfyUI model:
-          - If `patch_size` is a 3-tuple `(pt, ph, pw)` or the backbone contains `nn.Conv3d`, `process_img`,
-            or `patch_temporal` + `patch_spatial` (e.g. Cosmos Predict2 / Anima `MiniTrainDIT`), it accepts 5D latents.
-          - If `patch_size` is None or 1, has no `process_img` and no `nn.Conv3d`, and `img_in` is a 2D `Linear`
-            matching `in_channels == out_channels` (e.g., 64-ch 2D patch-packed DiTs), it expects 4D latents.
+          - If `patch_size` is a 3-tuple `(pt, ph, pw)` or the backbone contains `nn.Conv3d`, `patch_temporal` + `patch_spatial`
+            (e.g. Cosmos Predict2 / Anima `MiniTrainDIT`), or a 5D `process_img` / `_forward` (e.g. `QwenImageTransformer2DModel`,
+            `Krea2` `SingleStreamDiT`), it accepts 5D latents.
+          - Models whose `_forward` and `process_img` unpack 4D `[B, C, H, W]` (e.g. `Flux`, `Flux2`, `Chroma`, `MageFlow`) or
+            where `patch_size` is None or 1 with 2D `img_in` (`in_channels == out_channels`) expect 4D latents.
         """
-        if hasattr(backbone, "process_img"):
-            return True
         if hasattr(backbone, "patch_temporal") and hasattr(backbone, "patch_spatial"):
             return True
         p = getattr(backbone, "patch_size", self.unet_config.get("patch_size", None))
         if isinstance(p, (tuple, list)) and len(p) == 3:
             return True
         if any(isinstance(m, nn.Conv3d) for m in backbone.modules()):
+            return True
+        if hasattr(backbone, "process_img"):
+            # Distinguish 5D process_img / _forward models (QwenImage: `bs, c, t, h, w = x.shape` in process_img;
+            # Krea2 SingleStreamDiT: `temporal = x.ndim == 5; b5, c5, t5, h5, w5 = x.shape` in _forward)
+            # from 4D image DiTs (Flux / Flux2 / Chroma / LongCatImage / MageFlow: `bs, c, h, w = x.shape`).
+            if hasattr(backbone, "double_blocks") and hasattr(backbone, "single_blocks"):
+                return False
+            inner_fwd = getattr(backbone, "_forward", getattr(backbone, "forward", None))
+            fwd_code = getattr(inner_fwd, "__code__", None)
+            if fwd_code is not None:
+                fwd_vars = getattr(fwd_code, "co_varnames", ())
+                if any(v in fwd_vars for v in ("temporal", "t5", "b5")):
+                    return True
+            proc_fn = getattr(backbone, "process_img", None)
+            proc_code = getattr(proc_fn, "__code__", None)
+            if proc_code is not None:
+                varnames = getattr(proc_code, "co_varnames", ())
+                if "t" in varnames or "t_len" in varnames or "frames" in varnames:
+                    return True
+                if any(v in varnames for v in ("h_orig", "w_orig", "h", "w")):
+                    return False
+            cls_mod = f"{backbone.__class__.__module__}.{backbone.__class__.__name__}".lower()
+            if any(k in cls_mod for k in ("qwen_image", "krea", "wan", "hunyuan_video", "ltx", "cosmos", "mochi", "cogvideo")):
+                return True
+            if any(k in cls_mod for k in ("flux", "chroma", "mage_flow", "longcat")):
+                return False
+            if self.latent_format is not None:
+                return int(getattr(self.latent_format, "latent_dimensions", 2)) >= 3
             return True
         if p in (None, 1):
             img_in = getattr(backbone, "img_in", None)
@@ -580,10 +607,15 @@ class ComfyModelAdapter(BaseModelAdapter):
     def _backbone_strictly_requires_channels(self, backbone: nn.Module, inferred_c: int) -> bool:
         """
         Return True when `backbone` structurally consumes unpatched `inferred_c`-channel latents
-        directly into `img_in` (with `patch_size in (None, 1)` and no internal `process_img` patch packing).
+        directly into `img_in` (with `patch_size == 1`, or `patch_size is None` and no internal `process_img` patch packing),
+        or when `backbone` explicitly declares `latents_dim == inferred_c` (e.g. `MiniMaxH3Model` where `latents_dim=24`
+        defines the video stream channel count while `MiniMaxH3AV.latent_channels=32` is the max across video/audio).
         """
+        latents_dim = getattr(backbone, "latents_dim", self.unet_config.get("latents_dim", None))
+        if isinstance(latents_dim, int) and latents_dim > 0 and latents_dim == inferred_c:
+            return True
         p = getattr(backbone, "patch_size", self.unet_config.get("patch_size", None))
-        if p in (None, 1) and not hasattr(backbone, "process_img"):
+        if p == 1 or (p is None and not hasattr(backbone, "process_img")):
             img_in = getattr(backbone, "img_in", None)
             in_f = _get_linear_in_features(img_in)
             if isinstance(in_f, int) and in_f == inferred_c:
@@ -666,6 +698,10 @@ class ComfyModelAdapter(BaseModelAdapter):
             return self._cached_latent_channels[bid]
 
         resolved_c: Optional[int] = None
+        latents_dim = getattr(backbone, "latents_dim", self.unet_config.get("latents_dim", None))
+        if isinstance(latents_dim, int) and latents_dim > 0:
+            resolved_c = int(latents_dim)
+
         out_ch = getattr(
             backbone,
             "out_channels",
@@ -682,8 +718,9 @@ class ComfyModelAdapter(BaseModelAdapter):
         # patch-packed (e.g. QwenImage 1.0: in_channels=64, out_channels=16, patch_size=2),
         # `out_channels` is the unpacked VAE latent channel count.
         if (
-            isinstance(out_ch, int)
-            and out_ch in (3, 4, 8, 12, 16, 32, 48, 64, 128)
+            resolved_c is None
+            and isinstance(out_ch, int)
+            and out_ch in (3, 4, 8, 12, 16, 24, 32, 48, 64, 128)
             and isinstance(in_ch, int)
             and in_ch != out_ch
         ):
@@ -707,9 +744,9 @@ class ComfyModelAdapter(BaseModelAdapter):
                             if isinstance(explicit_patch_size, (tuple, list)) and len(explicit_patch_size) >= 2
                             else (int(explicit_patch_size[-1]) ** 2 if isinstance(explicit_patch_size, (tuple, list)) else int(explicit_patch_size) ** 2)
                         )
-                        if p_area > 1 and in_f % p_area == 0 and (in_f // p_area) in (3, 4, 8, 12, 16, 32, 48, 64, 128):
+                        if p_area > 1 and in_f % p_area == 0 and (in_f // p_area) in (3, 4, 8, 12, 16, 24, 32, 48, 64, 128):
                             resolved_c = in_f // p_area
-                    if resolved_c is None and in_f in (3, 4, 8, 12, 16, 32, 48, 64, 128):
+                    if resolved_c is None and in_f in (3, 4, 8, 12, 16, 24, 32, 48, 64, 128):
                         resolved_c = in_f
 
         if resolved_c is None:
@@ -1005,6 +1042,11 @@ class ComfyModelAdapter(BaseModelAdapter):
                     raw_c = in_ch // 4
                 else:
                     raw_c = int(in_ch)
+
+        if raw_c is None:
+            latents_dim = getattr(backbone, "latents_dim", self.unet_config.get("latents_dim", None))
+            if isinstance(latents_dim, int) and latents_dim > 0:
+                raw_c = int(latents_dim)
 
         self._cached_raw_input_channels[bid] = raw_c
         return raw_c
@@ -1626,6 +1668,49 @@ class ComfyModelAdapter(BaseModelAdapter):
                             mm_mod_for_train.in_training = True
                         except Exception:
                             mm_mod_for_train = None
+                minimax_mod = sys.modules.get("comfy.ldm.minimax.model")
+                if minimax_mod is not None:
+                    try:
+                        ms_fn = getattr(minimax_mod, "_mod_scale_shift", None)
+                        if callable(ms_fn) and not getattr(ms_fn, "_omni_autograd_safe", False):
+                            def _omni_mod_scale_shift(h: Any, shift: Any, scale: Any, segments: Any) -> Any:
+                                if not torch.is_grad_enabled():
+                                    for a, b, row in segments:
+                                        h[a:b].mul_(1.0 + scale[row].to(h.dtype)).add_(shift[row].to(h.dtype))
+                                    return h
+                                pieces = []
+                                cur = 0
+                                for a, b, row in sorted(segments, key=lambda s: int(s[0])):
+                                    if a > cur:
+                                        pieces.append(h[cur:a])
+                                    pieces.append(h[a:b] * (1.0 + scale[row].to(h.dtype)) + shift[row].to(h.dtype))
+                                    cur = b
+                                if cur < h.shape[0]:
+                                    pieces.append(h[cur:])
+                                return torch.cat(pieces, dim=0) if pieces else h
+                            _omni_mod_scale_shift._omni_autograd_safe = True  # type: ignore[attr-defined]
+                            setattr(minimax_mod, "_mod_scale_shift", _omni_mod_scale_shift)
+                        mg_fn = getattr(minimax_mod, "_mod_gate", None)
+                        if callable(mg_fn) and not getattr(mg_fn, "_omni_autograd_safe", False):
+                            def _omni_mod_gate(x: Any, gate: Any, other: Any, segments: Any) -> Any:
+                                if not torch.is_grad_enabled():
+                                    for a, b, row in segments:
+                                        x[a:b].addcmul_(other[a:b], gate[row].to(x.dtype))
+                                    return x
+                                pieces = []
+                                cur = 0
+                                for a, b, row in sorted(segments, key=lambda s: int(s[0])):
+                                    if a > cur:
+                                        pieces.append(x[cur:a])
+                                    pieces.append(x[a:b] + other[a:b] * gate[row].to(x.dtype))
+                                    cur = b
+                                if cur < x.shape[0]:
+                                    pieces.append(x[cur:])
+                                return torch.cat(pieces, dim=0) if pieces else x
+                            _omni_mod_gate._omni_autograd_safe = True  # type: ignore[attr-defined]
+                            setattr(minimax_mod, "_mod_gate", _omni_mod_gate)
+                    except Exception:
+                        pass
 
             backbone_input: Any = noisy_latents
             latent_shapes = kwargs.pop("latent_shapes", None)
@@ -1637,6 +1722,28 @@ class ComfyModelAdapter(BaseModelAdapter):
                         backbone_input = _cu.unpack_latents(noisy_latents, latent_shapes)
                 except Exception:
                     backbone_input = noisy_latents
+            elif (
+                isinstance(backbone_input, torch.Tensor)
+                and isinstance(getattr(backbone, "audio_latents_dim", None), int)
+                and int(getattr(backbone, "audio_latents_dim", 0)) > 0
+                and getattr(backbone, "audio_patch_proj", None) is not None
+            ):
+                # Dual-stream video+audio backbones (e.g. `MiniMaxH3Model`, whereas `MiniMaxH3ImageModel`
+                # sets `audio_latents_dim = None` and takes a single tensor) unpack `video_x, audio_x = x[0], x[1]`
+                # inside `forward`/`_forward`. When training on a single video/image latent stream without packed
+                # `latent_shapes`, synthesize the companion silent audio latent stream matching `MiniMaxH3AV`.
+                video_in = backbone_input.unsqueeze(2) if backbone_input.ndim == 4 else backbone_input
+                audio_c = int(getattr(backbone, "audio_latents_dim", 32))
+                t_tokens = int(video_in.shape[2]) if video_in.ndim >= 5 else 1
+                frames_per_token = (1, 4, 4, 4, 4)
+                frame_count = sum(frames_per_token[i % len(frames_per_token)] for i in range(max(1, t_tokens)))
+                audio_t = max(1, int(round(frame_count * (5.0 / 3.0))))
+                dummy_audio = torch.zeros(
+                    (int(video_in.shape[0]), audio_c, 2, audio_t),
+                    device=video_in.device,
+                    dtype=video_in.dtype,
+                )
+                backbone_input = [video_in, dummy_audio]
 
             try:
                 if kwargs:
@@ -1658,7 +1765,11 @@ class ComfyModelAdapter(BaseModelAdapter):
                         pass
 
             if isinstance(out, (tuple, list)):
-                if len(out) > 1 and all(isinstance(t, torch.Tensor) for t in out):
+                if (
+                    latent_shapes is not None
+                    and len(out) > 1
+                    and all(isinstance(t, torch.Tensor) for t in out)
+                ):
                     try:
                         import comfy.utils as _cu  # type: ignore
 
@@ -1821,8 +1932,19 @@ class ComfyModelAdapter(BaseModelAdapter):
             # Pass broadcast-shaped sigma [B, 1, 1, 1] to noise_scaling so both CONST and EPS
             # (which computes `noise * sigma` without reshaping) work for any batch_size >= 1.
             sigma_b = sigma.view(*broadcast_shape)
-            noisy_latents = sampling.noise_scaling(sigma_b, noise, latents).to(dtype=dtype)
-            xc = sampling.calculate_input(sigma_b, noisy_latents).to(dtype=dtype)
+            if callable(getattr(sampling, "noise_scaling", None)):
+                noisy_latents = sampling.noise_scaling(sigma_b, noise, latents).to(dtype=dtype)
+            elif is_flow_objective:
+                noisy_latents = (sigma_b * noise + (1.0 - sigma_b) * latents).to(dtype=dtype)
+            else:
+                noisy_latents = (latents + noise * sigma_b).to(dtype=dtype)
+
+            if callable(getattr(sampling, "calculate_input", None)):
+                xc = sampling.calculate_input(sigma_b, noisy_latents).to(dtype=dtype)
+            elif is_flow_objective:
+                xc = noisy_latents
+            else:
+                xc = (noisy_latents / torch.sqrt(1.0 + sigma_b * sigma_b)).to(dtype=dtype)
             t_dtype = dtype if device.type in ("privateuseone", "dml") else torch.float32
             timesteps = self._compute_device_timesteps(sampling, sigma, device=device, dtype=t_dtype).view(bsz)
 

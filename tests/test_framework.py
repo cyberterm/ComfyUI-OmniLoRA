@@ -4960,6 +4960,191 @@ class TestOmniLoRAFramework(unittest.TestCase):
                 else:
                     sys.modules[k_mod] = orig_mod
 
+    def test_flux2_klein_and_4d_vs_5d_process_img_disambiguation(self) -> None:
+        """
+        Regression test for Flux.2 Klein (`flux-2-klein-base-9b-fp8.safetensors`, `comfy.ldm.flux.model.Flux`
+        with 128-channel `Flux2` latents and `patch_size=1`), Flux.1, Chroma, MageFlow, Krea2, and QwenImage 1.0:
+          - 2D image models that define `process_img(self, x, ...)` unpacking 4D `bs, c, h, w = x.shape`
+            must resolve `_infer_backbone_accepts_5d(...) == False` and keep 4D `[B, C, H, W]` latents.
+          - 5D models that define `process_img(self, x, ...)` unpacking 5D `bs, c, t, h, w = x.shape`
+            (`QwenImageTransformer2DModel`) must resolve `_infer_backbone_accepts_5d(...) == True`.
+        """
+        import comfy.ops
+        from comfy.ldm.flux.model import Flux
+        from comfy.ldm.krea2.model import SingleStreamDiT
+        from comfy.ldm.mage_flow.model import MageFlowTransformer2DModel
+        from comfy.ldm.qwen_image.model import QwenImageTransformer2DModel
+        from omni_lora.tests.comfy_emulator import build_native_comfy_patcher
+
+        ops = comfy.ops.manual_cast
+        # 1. Flux.2 Klein (`in_channels=128, out_channels=128, patch_size=1, vec_in_dim=None, global_modulation=True`)
+        flux2_dm = Flux(
+            image_model="flux2",
+            in_channels=128,
+            out_channels=128,
+            vec_in_dim=None,
+            context_in_dim=128,
+            hidden_size=64,
+            mlp_ratio=2.0,
+            num_heads=4,
+            depth=2,
+            depth_single_blocks=2,
+            axes_dim=[4, 4, 4, 4],
+            theta=2000,
+            patch_size=1,
+            qkv_bias=False,
+            guidance_embed=False,
+            global_modulation=True,
+            mlp_silu_act=True,
+            ops_bias=False,
+            txt_ids_dims=[3],
+            dtype=torch.float32,
+            device="cpu",
+            operations=ops,
+        )
+        flux2_patcher = build_native_comfy_patcher(
+            "flux_dev",
+            flux2_dm,
+            unet_config={"image_model": "flux2", "in_channels": 128, "out_channels": 128, "patch_size": 1},
+            dtype=torch.float32,
+            expected_objective="rectified_flow",
+        )
+        flux2_adapter = ComfyModelAdapter(comfy_model=flux2_patcher, model_id="auto")
+        self.assertFalse(flux2_adapter.spec.supports_video_5d)
+        self.assertFalse(flux2_adapter._infer_backbone_accepts_5d(flux2_dm))
+        self.assertEqual(flux2_adapter.spec.latent_channels, 128)
+        lat4d = torch.randn(2, 128, 8, 8)
+        prepared_flux2 = flux2_adapter._validate_and_prepare_latents(lat4d, flux2_dm)
+        self.assertEqual(prepared_flux2.ndim, 4)
+        self.assertEqual(tuple(prepared_flux2.shape), (2, 128, 8, 8))
+
+        # Verify genuine `Flux._forward` executes cleanly on 4D `[2, 128, 8, 8]` without unpacking error
+        raw_out = flux2_dm._forward(
+            prepared_flux2,
+            torch.tensor([0.5, 0.5]),
+            torch.randn(2, 16, 128),
+            y=None,
+            guidance=None,
+        )
+        self.assertEqual(tuple(raw_out.shape), (2, 128, 8, 8))
+
+        # 2. MageFlow (4D `process_img`) vs Krea2 & QwenImage 1.0 (5D `_forward` / `process_img` with Wan21 latent_format)
+        mage_dm = MageFlowTransformer2DModel(
+            in_channels=16, out_channels=16, num_layers=1,
+            attention_head_dim=16, num_attention_heads=4, joint_attention_dim=64,
+            axes_dims_rope=(4, 6, 6), dtype=torch.float32, device="cpu", operations=ops,
+        )
+        krea_dm = SingleStreamDiT(
+            features=64, tdim=32, txtdim=64, heads=4, kvheads=2, multiplier=2,
+            layers=1, patch=2, channels=16, txtlayers=1, txtheads=4, txtkvheads=4,
+            dtype=torch.float32, device="cpu", operations=ops,
+        )
+        qwen_dm = QwenImageTransformer2DModel(
+            patch_size=2, in_channels=64, out_channels=16, num_layers=1,
+            attention_head_dim=16, num_attention_heads=4, joint_attention_dim=64,
+            axes_dims_rope=(4, 6, 6), dtype=torch.float32, device="cpu", operations=ops,
+        )
+        self.assertFalse(flux2_adapter._infer_backbone_accepts_5d(mage_dm))
+        self.assertTrue(flux2_adapter._infer_backbone_accepts_5d(krea_dm))
+        self.assertTrue(flux2_adapter._infer_backbone_accepts_5d(qwen_dm))
+
+    def test_minimax_h3_dual_stream_av_and_24ch_video_latents(self) -> None:
+        """
+        Regression test for MiniMax H3 (`MiniMaxH3Model` + `MiniMaxH3AV` latent_format):
+          - `MiniMaxH3AV.latent_channels` is 32 (max of video=24 and audio=32), while the video VAE
+            (`Sol-H3-VAE` / `MiniMaxH3Video`) and `MiniMaxH3Model.latents_dim` are 24 channels.
+          - `MiniMaxH3Model.forward` expects `x = [video_latent, audio_latent]` and returns `[-video_out, -audio_out]`.
+          - Verify `ComfyModelAdapter` resolves `latent_channels == 24`, synthesizes the silent audio stream
+            when training on 24-channel video/image latents, unpacks `out[0]` cleanly, and flows gradients to LoRA layers.
+        """
+        import comfy.ops as comfy_ops  # type: ignore
+        import comfy.latent_formats as comfy_lf  # type: ignore
+        import comfy.model_sampling as comfy_ms  # type: ignore
+        from comfy.ldm.minimax.model import MiniMaxH3Model  # type: ignore
+        from omni_lora.models.adapters import ComfyModelAdapter
+        from omni_lora.lora.layers import LoRAConfig, LoRAInjector
+
+        ops = comfy_ops.manual_cast
+        h3_dm = MiniMaxH3Model(
+            hidden_size=64,
+            num_layers=1,
+            token_refiner_num_layers=1,
+            num_attention_heads=4,
+            attention_head_dim=16,
+            ffn_hidden_size=128,
+            latents_dim=24,
+            audio_latents_dim=32,
+            patch_size=(1, 2, 2),
+            text_dim=32,
+            timestep_input_dim=32,
+            time_embed_hidden_size=64,
+            time_embed_dim=32,
+            rope_inv_freq_len=2,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            operations=ops,
+        )
+        h3_dm.rope.inv_freq.fill_(0.01)
+
+        class DummyInnerH3:
+            def __init__(self, dm: nn.Module) -> None:
+                self.diffusion_model = dm
+                self.latent_format = comfy_lf.MiniMaxH3AV()
+                self.model_sampling = comfy_ms.ModelSamplingDiscreteFlow()
+                self.model_config = type(
+                    "Cfg",
+                    (),
+                    {"unet_config": {"image_model": "minimax_h3", "latents_dim": 24, "audio_latents_dim": 32}},
+                )()
+
+        class DummyPatcherH3:
+            def __init__(self, dm: nn.Module) -> None:
+                self.model = DummyInnerH3(dm)
+
+            def get_model_object(self, name: str) -> Any:
+                return getattr(self.model, name, None)
+
+        adapter = ComfyModelAdapter(comfy_model=DummyPatcherH3(h3_dm), model_id="auto")
+        self.assertEqual(adapter.spec.latent_channels, 24)
+        self.assertTrue(adapter.spec.supports_video_5d)
+
+        from omni_lora.lora.layers import LoRAConfig, LoRAInjector, LoRALinear
+
+        injected = LoRAInjector.inject(
+            h3_dm,
+            LoRAConfig(rank=4, alpha=4.0, target_modules=adapter.spec.default_target_modules),
+            lora_dtype=torch.float32,
+        )
+        self.assertGreater(len(injected), 0)
+        lora_mods = [m for m in h3_dm.modules() if isinstance(m, LoRALinear)]
+        self.assertEqual(len(lora_mods), len(injected))
+        for mod in lora_mods:
+            nn.init.normal_(mod.lora_B.weight, std=0.02)
+
+        video_latents_24ch = torch.randn(1, 24, 2, 8, 8, dtype=torch.float32)
+        prompt_embeds = torch.randn(1, 8, 32, dtype=torch.float32)
+        loss = adapter.compute_training_loss(
+            backbone=h3_dm,
+            batch={
+                "latents": video_latents_24ch,
+                "prompt_embeds": prompt_embeds,
+            },
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        grad_count = sum(
+            1
+            for m in lora_mods
+            if (
+                (m.lora_A.weight.grad is not None and float(m.lora_A.weight.grad.abs().sum().item()) > 0.0)
+                or (m.lora_B.weight.grad is not None and float(m.lora_B.weight.grad.abs().sum().item()) > 0.0)
+            )
+        )
+        self.assertGreater(grad_count, 0)
+        LoRAInjector.uninject(h3_dm)
+
 
 def run_cloud_verification_suite(preferred_backend: str = "auto") -> int:
     """

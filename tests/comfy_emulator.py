@@ -324,7 +324,9 @@ def _attach_universal_forward_bridge(diffusion_model: nn.Module) -> None:
 
     target_suffixes = tuple(discover_universal_target_modules(diffusion_model))
 
-    def _bridged_forward(x: torch.Tensor, timestep: Optional[torch.Tensor] = None, *args: Any, **kwargs: Any) -> torch.Tensor:
+    def _bridged_forward(x: Any, timestep: Optional[torch.Tensor] = None, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if isinstance(x, (list, tuple)) and len(x) > 0:
+            x = x[0]
         dtype = x.dtype
         device = x.device
         batch_size = x.shape[0]
