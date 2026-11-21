@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-omni-lora"
 description = "General-Purpose Multi-Backend PyTorch LoRA Trainer for ComfyUI (Intel Arc XPU, ROCm, CUDA, Cloud TPU, Ascend NPU, Gaudi HPU, DirectML, MPS, CPU)."
-version = "1.0.4"
+version = "1.1.0"
 license = { text = "Apache-2.0" }
 readme = "README.md"
 requires-python = ">=3.10"

@@ -812,6 +812,26 @@ class ComfyModelAdapter(BaseModelAdapter):
         if bid in self._cached_context_dim:
             return self._cached_context_dim[bid]
 
+        # Fibo2 chunks incoming `context` along dim=-1 into `1 + len(injection_layers)` bundles
+        # (first bundle -> `perceiver`, remaining bundles -> each injection block's `cross_attention`),
+        # so the expected incoming context width is `(1 + len(injection_layers)) * cap_feat_dim`.
+        perceiver = getattr(backbone, "perceiver", None)
+        inj_layers = getattr(backbone, "injection_layers", None)
+        if perceiver is not None and isinstance(inj_layers, (tuple, list)):
+            bundle_dim: Optional[int] = None
+            p_layers = getattr(perceiver, "layers", None)
+            if isinstance(p_layers, (nn.ModuleList, list, tuple)) and len(p_layers) > 0:
+                ca = getattr(p_layers[0], "cross_attention", None)
+                bundle_dim = _get_linear_in_features(getattr(ca, "to_kv", None)) if ca is not None else None
+            if bundle_dim is None:
+                cfg_cap = self.unet_config.get("cap_feat_dim")
+                if isinstance(cfg_cap, int) and cfg_cap > 0:
+                    bundle_dim = cfg_cap
+            if isinstance(bundle_dim, int) and bundle_dim > 0:
+                total_dim = bundle_dim * (1 + len(inj_layers))
+                self._cached_context_dim[bid] = total_dim
+                return total_dim
+
         for norm_attr in ("llm_cond_norm", "context_norm", "txt_norm"):
             norm_mod = getattr(backbone, norm_attr, None)
             if norm_mod is not None:
@@ -1025,7 +1045,7 @@ class ComfyModelAdapter(BaseModelAdapter):
 
         # 2. Check DiT / MMDiT `x_embedder`, `patch_embed`, `img_in`, `init_x_linear`, or `emb_in`
         if raw_c is None:
-            for emb_attr in ("x_embedder", "patch_embed", "img_in", "init_x_linear", "patchify_proj"):
+            for emb_attr in ("x_embedder", "patch_embed", "img_in", "init_x_linear", "patchify_proj", "video_embedder"):
                 emb_mod = getattr(backbone, emb_attr, None)
                 if emb_mod is None:
                     continue
@@ -1087,6 +1107,7 @@ class ComfyModelAdapter(BaseModelAdapter):
         backbone: nn.Module,
         c_concat: Optional[torch.Tensor] = None,
         clean_latents: Optional[torch.Tensor] = None,
+        allow_clean_fallback: bool = True,
     ) -> torch.Tensor:
         """
         Apply ComfyUI's `c_concat` channel concatenation and automatically pad any remaining
@@ -1096,8 +1117,32 @@ class ComfyModelAdapter(BaseModelAdapter):
             cc = c_concat.to(device=noisy_latents.device, dtype=noisy_latents.dtype)
             if cc.ndim == noisy_latents.ndim - 1 and noisy_latents.ndim == 5:
                 cc = cc.unsqueeze(2).expand(-1, -1, noisy_latents.shape[2], -1, -1)
+            elif cc.ndim == noisy_latents.ndim + 1 and noisy_latents.ndim == 4:
+                cc = cc[:, :, 0, :, :]
             if cc.shape[0] == 1 and noisy_latents.shape[0] > 1:
                 cc = cc.repeat(noisy_latents.shape[0], *([1] * (cc.ndim - 1)))
+            if cc.shape[2:] != noisy_latents.shape[2:] and cc.ndim == noisy_latents.ndim:
+                if cc.ndim == 4:
+                    cc = F.interpolate(
+                        cc,
+                        size=(int(noisy_latents.shape[-2]), int(noisy_latents.shape[-1])),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                elif cc.ndim == 5:
+                    b_c, ch_c, t_c, _, _ = cc.shape
+                    cc_4d = cc.permute(0, 2, 1, 3, 4).reshape(b_c * t_c, ch_c, cc.shape[-2], cc.shape[-1])
+                    cc_4d = F.interpolate(
+                        cc_4d,
+                        size=(int(noisy_latents.shape[-2]), int(noisy_latents.shape[-1])),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    cc = cc_4d.reshape(b_c, t_c, ch_c, noisy_latents.shape[-2], noisy_latents.shape[-1]).permute(0, 2, 1, 3, 4)
+                    if cc.shape[2] < noisy_latents.shape[2]:
+                        cc = F.pad(cc, (0, 0, 0, 0, 0, noisy_latents.shape[2] - cc.shape[2]))
+                    elif cc.shape[2] > noisy_latents.shape[2]:
+                        cc = cc[:, :, : noisy_latents.shape[2]]
             if cc.shape[2:] == noisy_latents.shape[2:]:
                 noisy_latents = torch.cat([noisy_latents, cc], dim=1)
 
@@ -1106,7 +1151,8 @@ class ComfyModelAdapter(BaseModelAdapter):
         if raw_in_c is not None and raw_in_c > actual_c:
             extra_c = raw_in_c - actual_c
             if (
-                isinstance(clean_latents, torch.Tensor)
+                allow_clean_fallback
+                and isinstance(clean_latents, torch.Tensor)
                 and clean_latents.shape == noisy_latents.shape
                 and extra_c >= actual_c
             ):
@@ -1178,6 +1224,31 @@ class ComfyModelAdapter(BaseModelAdapter):
             return adapted_4d.reshape(b, t, expected_c, new_h, new_w).permute(0, 2, 1, 3, 4)
         return adapted_4d
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _guard_single_stream_latent_shapes(inner_model: Any):
+        """
+        Temporarily clear stale `inner_model.latent_shapes` left on multimodal ComfyUI models
+        (e.g. `MiniMaxH3`, `LTXAV`) by a previous KSampler inference run whenever OmniLoRA invokes
+        `process_latent_in` or `extra_conds` on single-stream video/image latents, restoring the
+        original value in `finally:`.
+        """
+        had_stale = inner_model is not None and getattr(inner_model, "latent_shapes", None) is not None
+        prev_shapes = getattr(inner_model, "latent_shapes", None) if had_stale else None
+        if had_stale:
+            try:
+                inner_model.latent_shapes = None
+            except Exception:
+                had_stale = False
+        try:
+            yield
+        finally:
+            if had_stale:
+                try:
+                    inner_model.latent_shapes = prev_shapes
+                except Exception:
+                    pass
+
     def _validate_and_prepare_latents(
         self,
         latents: torch.Tensor,
@@ -1194,7 +1265,8 @@ class ComfyModelAdapter(BaseModelAdapter):
             process_in = getattr(self.inner_model, "process_latent_in", None) if self.inner_model is not None else None
             if callable(process_in):
                 try:
-                    latents = process_in(latents)
+                    with self._guard_single_stream_latent_shapes(self.inner_model):
+                        latents = process_in(latents)
                     scaled_ok = True
                 except Exception:
                     pass
@@ -1218,7 +1290,8 @@ class ComfyModelAdapter(BaseModelAdapter):
             process_in = getattr(self.inner_model, "process_latent_in", None) if self.inner_model is not None else None
             if callable(process_in):
                 try:
-                    latents = process_in(latents)
+                    with self._guard_single_stream_latent_shapes(self.inner_model):
+                        latents = process_in(latents)
                 except Exception:
                     pass
             elif self.latent_format is not None and hasattr(self.latent_format, "process_in"):
@@ -1268,14 +1341,107 @@ class ComfyModelAdapter(BaseModelAdapter):
                 latents = F.pad(latents, (0, pad_w, 0, pad_h))
         return latents
 
+    @staticmethod
+    def _collect_valid_backbone_context_dims(
+        backbone: Optional[nn.Module],
+        unet_config: Optional[Dict[str, Any]] = None,
+    ) -> set[int]:
+        """
+        Collect all valid incoming text conditioning feature widths accepted by `backbone`
+        (including pre-connector projections such as `caption_projection.linear_1`, dual-modality
+        concatenated context widths such as LTXAV `cross_attention_dim + audio_cross_attention_dim`
+        or `caption_channels * 2`, and connector `inner_dim` widths) so neither `_prepare_prompt_embeds`
+        nor ComfyUI's `BaseModel.extra_conds` hook slices or pads valid multi-width embeddings.
+        """
+        valid: set[int] = set()
+        if backbone is None:
+            return valid
+        ucfg = unet_config if isinstance(unet_config, dict) else {}
+        for attr in (
+            "caption_projection",
+            "audio_caption_projection",
+            "condition_proj",
+            "text_proj",
+            "context_embedder",
+            "context_in",
+            "txt_in",
+            "llm_proj",
+        ):
+            mod = getattr(backbone, attr, None)
+            if mod is None:
+                continue
+            in_f = _get_linear_in_features(mod)
+            if isinstance(in_f, int) and in_f > 0:
+                valid.add(in_f)
+            lin1 = getattr(mod, "linear_1", None)
+            in_f1 = _get_linear_in_features(lin1)
+            if isinstance(in_f1, int) and in_f1 > 0:
+                valid.add(in_f1)
+
+        has_audio_text = any(
+            getattr(backbone, a, None) is not None
+            for a in (
+                "audio_embeddings_connector",
+                "audio_cross_attention_dim",
+                "audio_patchify_proj",
+                "audio_caption_projection",
+            )
+        )
+        cap_c = getattr(backbone, "caption_channels", ucfg.get("caption_channels"))
+        if isinstance(cap_c, int) and cap_c > 0:
+            valid.add(cap_c)
+            if has_audio_text:
+                valid.add(cap_c * 2)
+
+        v_ca = getattr(backbone, "cross_attention_dim", ucfg.get("cross_attention_dim"))
+        a_ca = getattr(backbone, "audio_cross_attention_dim", ucfg.get("audio_cross_attention_dim"))
+        if isinstance(v_ca, int) and v_ca > 0 and isinstance(a_ca, int) and a_ca > 0:
+            valid.add(v_ca)
+            valid.add(v_ca + a_ca)
+
+        v_conn = getattr(backbone, "video_embeddings_connector", None)
+        a_conn = getattr(backbone, "audio_embeddings_connector", None)
+        v_conn_dim = getattr(v_conn, "inner_dim", None) if v_conn is not None else None
+        a_conn_dim = getattr(a_conn, "inner_dim", None) if a_conn is not None else None
+        if isinstance(v_conn_dim, int) and v_conn_dim > 0:
+            valid.add(v_conn_dim)
+            if isinstance(a_conn_dim, int) and a_conn_dim > 0:
+                valid.add(v_conn_dim + a_conn_dim)
+
+        # Fibo2 bundled multi-layer context: `(1 + len(injection_layers)) * cap_feat_dim`
+        perceiver = getattr(backbone, "perceiver", None)
+        inj_layers = getattr(backbone, "injection_layers", None)
+        if perceiver is not None and isinstance(inj_layers, (tuple, list)):
+            bundle_dim: Optional[int] = None
+            p_layers = getattr(perceiver, "layers", None)
+            if isinstance(p_layers, (nn.ModuleList, list, tuple)) and len(p_layers) > 0:
+                ca = getattr(p_layers[0], "cross_attention", None)
+                bundle_dim = _get_linear_in_features(getattr(ca, "to_kv", None)) if ca is not None else None
+            if bundle_dim is None:
+                cfg_cap = ucfg.get("cap_feat_dim")
+                if isinstance(cfg_cap, int) and cfg_cap > 0:
+                    bundle_dim = cfg_cap
+            if isinstance(bundle_dim, int) and bundle_dim > 0:
+                valid.add(bundle_dim * (1 + len(inj_layers)))
+
+        return valid
+
+    def _get_valid_backbone_context_dims(self, backbone: nn.Module) -> set[int]:
+        return self._collect_valid_backbone_context_dims(backbone, self.unet_config)
+
     def _prepare_prompt_embeds(self, prompt_embeds: torch.Tensor, backbone: nn.Module) -> torch.Tensor:
         """
         Validate and automatically adapt the connected CLIP text encoder's embedding dimension
         against the diffusion model's text input projection or conditioning norm (handling both
-        integer-multiple multi-layer widths like 4096 <-> 53248 and cross-encoder widths like 768 -> 4096).
+        integer-multiple multi-layer widths like 4096 <-> 53248 and cross-encoder widths like 768 -> 4096),
+        while preserving valid multi-width / pre-connector embeddings (e.g. LTXAV 6144 / 7680 / 3840).
         """
+        if prompt_embeds.ndim < 2:
+            return prompt_embeds
+        if int(prompt_embeds.shape[-1]) in self._get_valid_backbone_context_dims(backbone):
+            return prompt_embeds
         expected_dim = self._infer_backbone_context_dim(backbone)
-        if expected_dim is None or prompt_embeds.ndim < 2:
+        if expected_dim is None:
             return prompt_embeds
         return _adapt_context_width(prompt_embeds, expected_dim, model_name=self.spec.display_name)
 
@@ -1298,7 +1464,8 @@ class ComfyModelAdapter(BaseModelAdapter):
         param_names: set[str] = set()
         accepts_var_kwargs = True
         try:
-            sig_fwd = inspect.signature(backbone.forward)
+            cls_fwd = getattr(type(backbone), "forward", backbone.forward)
+            sig_fwd = inspect.signature(cls_fwd)
             param_names.update(sig_fwd.parameters.keys())
             fwd_var_kw = any(
                 p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_fwd.parameters.values()
@@ -1320,12 +1487,327 @@ class ComfyModelAdapter(BaseModelAdapter):
         self._cached_forward_sig[bid] = (param_names, accepts_var_kwargs)
         return param_names, accepts_var_kwargs
 
+    @staticmethod
+    def _is_minimax_h3_backbone(backbone: Optional[nn.Module]) -> bool:
+        """Return True strictly for ComfyUI `comfy.ldm.minimax.*` backbones (`MiniMaxH3Model`, `MiniMaxH3ImageModel`)."""
+        if backbone is None:
+            return False
+        return getattr(backbone.__class__, "__module__", "").startswith("comfy.ldm.minimax.")
+
+    def _get_model_transformer_options(self) -> Dict[str, Any]:
+        """Return a shallow copy of `comfy_model.model_options['transformer_options']` when present."""
+        if self.comfy_model is not None:
+            model_opts = getattr(self.comfy_model, "model_options", None)
+            if isinstance(model_opts, dict):
+                base_to = model_opts.get("transformer_options")
+                if isinstance(base_to, dict):
+                    return dict(base_to)
+        return {}
+
+    @classmethod
+    def _get_minimax_pdd_grid(
+        cls,
+        backbone: Optional[nn.Module],
+        transformer_options: Optional[Dict[str, Any]] = None,
+    ) -> Optional[List[float]]:
+        """
+        Return the decreasing `[1.0, ..., 0.0]` PDD sigma grid for PDD-distilled MiniMax H3 / H3-Image
+        models (`final_layer.pdd_steps > 1`), respecting any `minimax_h3_sigma_shift_video` override
+        in `transformer_options`, or `None` for non-PDD / non-MiniMax models.
+        """
+        if not cls._is_minimax_h3_backbone(backbone):
+            return None
+        final_layer = getattr(backbone, "final_layer", None)
+        if final_layer is None:
+            return None
+        try:
+            pdd_steps = int(getattr(final_layer, "pdd_steps", 1) or 1)
+        except Exception:
+            pdd_steps = 1
+        if pdd_steps <= 1:
+            return None
+
+        default_shift_v = float(getattr(backbone, "sigma_shift_video", 1.0) or 1.0)
+        override_shift_v = (
+            transformer_options.get("minimax_h3_sigma_shift_video")
+            if isinstance(transformer_options, dict)
+            else None
+        )
+        has_custom_shift = (
+            isinstance(override_shift_v, (int, float))
+            and float(override_shift_v) > 0.0
+            and abs(float(override_shift_v) - default_shift_v) > 1e-6
+        )
+        shift_v = float(override_shift_v) if has_custom_shift else default_shift_v
+
+        raw_sigmas = getattr(backbone, "pdd_sigmas", None)
+        if not has_custom_shift and isinstance(raw_sigmas, (list, tuple)) and len(raw_sigmas) >= 2:
+            return [float(s) for s in raw_sigmas]
+
+        minimax_mod = sys.modules.get("comfy.ldm.minimax.model")
+        pdd_grid_fn = getattr(minimax_mod, "pdd_grid", None) if minimax_mod is not None else None
+        if callable(pdd_grid_fn):
+            try:
+                grid_vals = pdd_grid_fn(pdd_steps, shift_v)
+                if isinstance(grid_vals, (list, tuple)) and len(grid_vals) >= 2:
+                    return [float(s) for s in grid_vals]
+            except Exception:
+                pass
+        if abs(shift_v - 1.0) > 1e-6:
+            return [
+                float(shift_v * (k / float(pdd_steps)) / (1.0 + (shift_v - 1.0) * (k / float(pdd_steps))))
+                for k in range(pdd_steps, -1, -1)
+            ]
+        return [1.0 - float(k) / float(pdd_steps) for k in range(pdd_steps + 1)]
+
+    @classmethod
+    def _requires_batch_size_one(cls, backbone: Optional[nn.Module]) -> bool:
+        """Return True for backbones whose native ComfyUI `_forward` strictly raises on `batch_size != 1`."""
+        return cls._is_minimax_h3_backbone(backbone)
+
+    def resolve_control_mode(
+        self,
+        backbone: Optional[nn.Module] = None,
+        requested_mode: str = "auto",
+    ) -> str:
+        """
+        Determine how control/reference image latents should be routed into ComfyUI's `BaseModel.extra_conds`:
+          - `"reference_latents"`: token-concatenated reference conditioning (`ref_latents` via `CONDList`,
+            used by Flux Kontext, Flux2, Flux3, QwenImage 1.0/2.1, MageFlow, OmniGen2, Boogu, MOSSImage,
+            Fibo2, Krea2, JoyImage, Lumina2, LongCatImage, etc.).
+          - `"concat_latent_image"`: channel-concatenated / image-cond conditioning (`c_concat` / `image_cond`,
+            used by SD1.5/SDXL InstructPix2Pix, Flux Fill/Depth/Canny, HiDream-E1, Wan I2V, widened control adapters).
+
+        Uses 100% live structural introspection on `self.inner_model` and `backbone` with zero hardcoded model lists,
+        while honoring any explicit user selection (`"reference_latents"` or `"concat_latent_image"`).
+        """
+        req = str(requested_mode or "auto").strip().lower()
+        if req in ("reference_latents", "ref_latents"):
+            return "reference_latents"
+        if req in ("concat_latent_image", "c_concat", "concat"):
+            return "concat_latent_image"
+
+        target_backbone = backbone if isinstance(backbone, nn.Module) else self.diffusion_model
+        if isinstance(target_backbone, nn.Module):
+            raw_in_c = self._infer_backbone_raw_input_channels(target_backbone)
+            latent_c = self._infer_backbone_latent_channels(target_backbone, fallback_channels=raw_in_c or 16)
+            if raw_in_c is not None and latent_c is not None and raw_in_c > latent_c:
+                return "concat_latent_image"
+
+        if self.inner_model is not None:
+            mem_conds = getattr(self.inner_model, "memory_usage_factor_conds", ())
+            if isinstance(mem_conds, (tuple, list, set)) and "ref_latents" in mem_conds:
+                return "reference_latents"
+
+        if isinstance(target_backbone, nn.Module):
+            param_names, _ = self._get_forward_signature_info(target_backbone)
+            if "ref_latents" in param_names:
+                return "reference_latents"
+            if "image_cond" in param_names:
+                return "concat_latent_image"
+
+        if self.inner_model is not None:
+            concat_keys = getattr(self.inner_model, "concat_keys", ())
+            if isinstance(concat_keys, (tuple, list, set)) and len(concat_keys) > 0:
+                return "concat_latent_image"
+            extra_conds_fn = getattr(type(self.inner_model), "extra_conds", None)
+            if callable(extra_conds_fn):
+                try:
+                    src = inspect.getsource(extra_conds_fn)
+                    if "reference_latents" in src:
+                        return "reference_latents"
+                    if "concat_latent_image" in src:
+                        return "concat_latent_image"
+                except Exception:
+                    pass
+
+        return "reference_latents"
+
+    def _prepare_control_latent_for_extra_conds(
+        self,
+        ctrl: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        backbone: nn.Module,
+        control_mode: str = "reference_latents",
+    ) -> torch.Tensor:
+        """
+        Align an unscaled control VAE latent to match `noisy_latents`'s rank (4D/5D), device,
+        compute dtype, channel packing, and patch-size spatial divisibility BEFORE handing it
+        to ComfyUI's `BaseModel.extra_conds` (which applies `self.process_latent_in` natively).
+        For channel-concatenated / `image_cond` models (`control_mode == "concat_latent_image"`),
+        also bilinearly aligns spatial `(H, W)` to `noisy_latents` so `preserve_aspect` datasets
+        never trigger spatial mismatch errors while `reference_latents` keeps native aspect ratio.
+        """
+        t = safe_to_device(ctrl, device=noisy_latents.device, dtype=noisy_latents.dtype)
+        if t.ndim == 3:
+            t = t.unsqueeze(0)
+        if noisy_latents.ndim == 5 and t.ndim == 4:
+            t = t.unsqueeze(2)
+        elif noisy_latents.ndim == 4 and t.ndim == 5:
+            t = t[:, :, 0, :, :]
+
+        expected_c = self._infer_backbone_latent_channels(backbone, fallback_channels=int(noisy_latents.shape[1]))
+        if int(t.shape[1]) != expected_c:
+            adapted = self._adapt_latent_channels_spatial(t, expected_c)
+            if adapted is not None:
+                t = adapted
+
+        if (
+            str(control_mode or "").strip().lower() == "concat_latent_image"
+            and t.ndim >= 4
+            and noisy_latents.ndim >= 4
+        ):
+            target_h, target_w = int(noisy_latents.shape[-2]), int(noisy_latents.shape[-1])
+            if int(t.shape[-2]) != target_h or int(t.shape[-1]) != target_w:
+                orig_dtype = t.dtype
+                if t.ndim == 5:
+                    b_c, c_c, f_c, h_c, w_c = t.shape
+                    flat = t.permute(0, 2, 1, 3, 4).reshape(b_c * f_c, c_c, h_c, w_c).float()
+                    resized = F.interpolate(flat, size=(target_h, target_w), mode="bilinear", align_corners=False)
+                    t = resized.reshape(b_c, f_c, c_c, target_h, target_w).permute(0, 2, 1, 3, 4).contiguous().to(dtype=orig_dtype)
+                else:
+                    t = F.interpolate(t.float(), size=(target_h, target_w), mode="bilinear", align_corners=False).to(dtype=orig_dtype)
+
+        if t.ndim >= 4:
+            raw_ps = getattr(
+                backbone,
+                "patch_size",
+                getattr(
+                    backbone,
+                    "patch_spatial",
+                    self.unet_config.get("patch_size", self.unet_config.get("patch_spatial", self.spec.patch_size)),
+                ),
+            )
+            if isinstance(raw_ps, (tuple, list)) and len(raw_ps) >= 2:
+                stride_h = max(1, int(raw_ps[-2]))
+                stride_w = max(1, int(raw_ps[-1]))
+            elif isinstance(raw_ps, int) and raw_ps > 1:
+                stride_h = stride_w = int(raw_ps)
+            else:
+                stride_h = stride_w = max(2, int(self.spec.patch_size or 2))
+            if hasattr(backbone, "input_blocks") and hasattr(backbone, "output_blocks"):
+                stride_h = max(stride_h, 4)
+                stride_w = max(stride_w, 4)
+            lat_h, lat_w = int(t.shape[-2]), int(t.shape[-1])
+            pad_h = (stride_h - (lat_h % stride_h)) % stride_h
+            pad_w = (stride_w - (lat_w % stride_w)) % stride_w
+            if pad_h > 0 or pad_w > 0:
+                t = F.pad(t, (0, pad_w, 0, pad_h))
+        return t
+
+    @classmethod
+    def _requires_batch_size_one_for_batch(cls, backbone: Optional[nn.Module], batch: Dict[str, Any]) -> bool:
+        """
+        Return True when `backbone` must microbatch `batch` into single-item forwards:
+          - Always for strict `batch_size == 1` architectures (`MiniMaxH3Model`, `MiniMaxH3ImageModel`).
+          - For `HunyuanVideo` / `OmniGen2` / `Boogu` when `extra_conds` carries a multi-row `attention_mask` (`shape[0] > 1`).
+          - For paired edit batches carrying `control_latents` when `batch_size > 1` and either:
+            * samples have mixed controlled/dropped (`None`) states or differing control spatial resolutions, or
+            * `control_mode != "concat_latent_image"` (microbatching `reference_latents` guarantees 100% compatibility
+              with ComfyUI's `CONDList` reference pipelines across every DiT architecture).
+        """
+        if cls._requires_batch_size_one(backbone):
+            return True
+        raw_lat = batch.get("latents")
+        bsz = int(raw_lat.shape[0]) if isinstance(raw_lat, torch.Tensor) and raw_lat.ndim >= 1 else 1
+        if bsz > 1:
+            ctrl_in = batch.get("control_latents")
+            ctrl_dropped = batch.get("control_dropped")
+            if isinstance(ctrl_dropped, list) and len(ctrl_dropped) == bsz and any(ctrl_dropped) and not all(ctrl_dropped):
+                return True
+            if ctrl_in is not None:
+                req_ctrl_mode = str(batch.get("control_mode", "auto") or "auto").strip().lower()
+                if req_ctrl_mode != "concat_latent_image":
+                    return True
+                if isinstance(ctrl_in, list):
+                    if any(c is None for c in ctrl_in):
+                        return True
+                    shapes = {tuple(c.shape) for c in ctrl_in if isinstance(c, torch.Tensor)}
+                    if len(shapes) != 1:
+                        return True
+        if backbone is not None:
+            cls_id = f"{backbone.__class__.__module__}.{backbone.__class__.__name__}".lower()
+            if (
+                "hunyuan_video" in cls_id
+                or backbone.__class__.__name__ == "HunyuanVideo"
+                or "omnigen" in cls_id
+                or "boogu" in cls_id
+            ):
+                extra = batch.get("extra_conds")
+                if isinstance(extra, dict):
+                    am = extra.get("attention_mask", extra.get("mask", extra.get("txt_mask")))
+                    if isinstance(am, torch.Tensor) and am.ndim >= 2 and int(am.shape[0]) > 1:
+                        return True
+        return False
+
+    @staticmethod
+    def _slice_single_item_batch(batch: Dict[str, Any], idx: int, bsz: int) -> Dict[str, Any]:
+        """Extract a `batch_size == 1` slice at index `idx` and trim batch-padded prompt tokens if masked."""
+        sub: Dict[str, Any] = {}
+        for k, v in batch.items():
+            if k == "extra_conds" and isinstance(v, dict):
+                sub_extra: Dict[str, Any] = {}
+                for ek, ev in v.items():
+                    if isinstance(ev, torch.Tensor) and ev.ndim >= 1 and int(ev.shape[0]) == bsz:
+                        sub_extra[ek] = ev[idx : idx + 1]
+                    else:
+                        sub_extra[ek] = ev
+                sub[k] = sub_extra
+            elif k == "control_latents":
+                if isinstance(v, list):
+                    elem = v[idx] if idx < len(v) else None
+                    if isinstance(elem, torch.Tensor):
+                        sub[k] = [elem if (elem.ndim >= 4 and int(elem.shape[0]) == 1) else (elem.unsqueeze(0) if elem.ndim == 3 else elem[0:1])]
+                    else:
+                        sub[k] = None
+                elif isinstance(v, torch.Tensor) and v.ndim >= 1 and int(v.shape[0]) == bsz:
+                    sub[k] = [v[idx : idx + 1]]
+                else:
+                    sub[k] = v
+            elif k == "control_dropped":
+                if isinstance(v, list) and len(v) == bsz:
+                    sub[k] = bool(v[idx])
+                else:
+                    sub[k] = bool(v)
+            elif isinstance(v, torch.Tensor) and v.ndim >= 1 and int(v.shape[0]) == bsz:
+                sub[k] = v[idx : idx + 1]
+            else:
+                sub[k] = v
+
+        # When `OmniLoRAPrecomputeConditioning` stacked differing-length captions for `batch_size > 1`,
+        # it synthesized `attention_mask` (`[B, max_L]`). Trim trailing padded tokens on the unbatched
+        # item so architectures that pack raw text tokens without an attention mask (MiniMax H3)
+        # do not attend over zero-padded tokens.
+        sub_pe = sub.get("prompt_embeds")
+        sub_extra_d = sub.get("extra_conds")
+        if isinstance(sub_pe, torch.Tensor) and sub_pe.ndim >= 2 and isinstance(sub_extra_d, dict):
+            seq_len = int(sub_pe.shape[1])
+            attn_m = sub_extra_d.get("attention_mask")
+            if isinstance(attn_m, torch.Tensor) and attn_m.ndim == 2 and int(attn_m.shape[1]) == seq_len:
+                valid_len = int((attn_m[0] > 0).sum().item())
+                if 0 < valid_len < seq_len:
+                    sub["prompt_embeds"] = sub_pe[:, :valid_len]
+                    trimmed_extra: Dict[str, Any] = {}
+                    for ek, ev in sub_extra_d.items():
+                        if (
+                            isinstance(ev, torch.Tensor)
+                            and ev.ndim >= 2
+                            and int(ev.shape[0]) == 1
+                            and int(ev.shape[1]) == seq_len
+                        ):
+                            trimmed_extra[ek] = ev[:, :valid_len]
+                        else:
+                            trimmed_extra[ek] = ev
+                    sub["extra_conds"] = trimmed_extra
+        return sub
+
     def _build_transformer_options(
         self,
         noisy_latents: torch.Tensor,
         timesteps: torch.Tensor,
         sigma: Optional[torch.Tensor] = None,
         existing: Optional[Dict[str, Any]] = None,
+        backbone: Optional[nn.Module] = None,
     ) -> OmniTransformerOptions:
         """
         Construct a complete ComfyUI `transformer_options` dictionary populated with
@@ -1342,7 +1824,19 @@ class ComfyModelAdapter(BaseModelAdapter):
             opts.update(existing)
 
         bsz = int(noisy_latents.shape[0]) if noisy_latents.ndim >= 1 else 1
-        opts["sample_sigmas"] = _build_training_sample_sigmas(timesteps=timesteps, sigma=sigma)
+        minimax_pdd_grid = self._get_minimax_pdd_grid(backbone, transformer_options=opts)
+        if minimax_pdd_grid is not None:
+            # MiniMax H3 / H3-Image PDD `FinalLayer.forward` compares `sample_sigmas` against
+            # normalized `sigma = timestep / 1000.0` in `[0, 1]` to select the PDD head interval
+            # `[start, stop)`. Supplying the exact decreasing PDD grid ensures each step resolves
+            # cleanly to its single PDD interval `[start, start + 1)` instead of collapsing to `0.0`.
+            opts["sample_sigmas"] = safe_to_device(
+                torch.tensor(minimax_pdd_grid, dtype=torch.float32),
+                device=timesteps.device,
+                dtype=torch.float32,
+            )
+        else:
+            opts["sample_sigmas"] = _build_training_sample_sigmas(timesteps=timesteps, sigma=sigma)
         opts["sigmas"] = (
             sigma.detach().to(device=timesteps.device, dtype=timesteps.dtype)
             if isinstance(sigma, torch.Tensor)
@@ -1360,6 +1854,103 @@ class ComfyModelAdapter(BaseModelAdapter):
             opts["optimized_attention_override"] = _omni_training_attention_override
         return opts
 
+    @contextlib.contextmanager
+    def _comfy_training_runtime_context(self, backbone: nn.Module):
+        """
+        Activate ComfyUI training-safe runtime guards once across the full forward pass
+        (`encode_adm`, `extra_conds` / `preprocess_text_embeds`, `process_timestep`, and
+        `backbone.forward`):
+          1. Install runtime attention/RoPE/kitchen hooks and rebind pre-loaded attention modules.
+          2. Reset any inference prefix cache on `backbone`.
+          3. Set `comfy.model_management.in_training = True` (always restored in `finally:`).
+          4. Patch MiniMax H3 in-place `_mod_scale_shift` / `_mod_gate` helpers for autograd.
+        """
+        if not torch.is_grad_enabled():
+            yield
+            return
+
+        mp_mod = sys.modules.get("comfy.model_prefetch")
+        attn_mod = sys.modules.get("comfy.ldm.modules.attention")
+        if (
+            (mp_mod is not None and not getattr(getattr(mp_mod, "prefetch_queue_pop", None), "_omni_patched", False))
+            or (attn_mod is not None and not getattr(attn_mod, "_omni_attn_hooks_installed", False))
+        ):
+            install_comfy_runtime_hooks()
+        _rebind_comfy_attention_modules(backbone)
+        if hasattr(backbone, "reset_prefix_cache") and callable(backbone.reset_prefix_cache):
+            try:
+                backbone.reset_prefix_cache(False)
+            except TypeError:
+                try:
+                    backbone.reset_prefix_cache()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        mm_mod_for_train = sys.modules.get("comfy.model_management")
+        prev_mm_in_training: Optional[bool] = None
+        if mm_mod_for_train is not None:
+            prev_mm_in_training = bool(getattr(mm_mod_for_train, "in_training", False))
+            if not prev_mm_in_training:
+                try:
+                    mm_mod_for_train.in_training = True
+                except Exception:
+                    mm_mod_for_train = None
+
+        minimax_mod = sys.modules.get("comfy.ldm.minimax.model")
+        if minimax_mod is not None:
+            try:
+                ms_fn = getattr(minimax_mod, "_mod_scale_shift", None)
+                if callable(ms_fn) and not getattr(ms_fn, "_omni_autograd_safe", False):
+                    def _omni_mod_scale_shift(h: Any, shift: Any, scale: Any, segments: Any) -> Any:
+                        if not torch.is_grad_enabled():
+                            for a, b, row in segments:
+                                h[a:b].mul_(1.0 + scale[row].to(h.dtype)).add_(shift[row].to(h.dtype))
+                            return h
+                        pieces = []
+                        cur = 0
+                        for a, b, row in sorted(segments, key=lambda s: int(s[0])):
+                            if a > cur:
+                                pieces.append(h[cur:a])
+                            pieces.append(h[a:b] * (1.0 + scale[row].to(h.dtype)) + shift[row].to(h.dtype))
+                            cur = b
+                        if cur < h.shape[0]:
+                            pieces.append(h[cur:])
+                        return torch.cat(pieces, dim=0) if pieces else h
+                    _omni_mod_scale_shift._omni_autograd_safe = True  # type: ignore[attr-defined]
+                    setattr(minimax_mod, "_mod_scale_shift", _omni_mod_scale_shift)
+                mg_fn = getattr(minimax_mod, "_mod_gate", None)
+                if callable(mg_fn) and not getattr(mg_fn, "_omni_autograd_safe", False):
+                    def _omni_mod_gate(x: Any, gate: Any, other: Any, segments: Any) -> Any:
+                        if not torch.is_grad_enabled():
+                            for a, b, row in segments:
+                                x[a:b].addcmul_(other[a:b], gate[row].to(x.dtype))
+                            return x
+                        pieces = []
+                        cur = 0
+                        for a, b, row in sorted(segments, key=lambda s: int(s[0])):
+                            if a > cur:
+                                pieces.append(x[cur:a])
+                            pieces.append(x[a:b] + other[a:b] * gate[row].to(x.dtype))
+                            cur = b
+                        if cur < x.shape[0]:
+                            pieces.append(x[cur:])
+                        return torch.cat(pieces, dim=0) if pieces else x
+                    _omni_mod_gate._omni_autograd_safe = True  # type: ignore[attr-defined]
+                    setattr(minimax_mod, "_mod_gate", _omni_mod_gate)
+            except Exception:
+                pass
+
+        try:
+            yield
+        finally:
+            if mm_mod_for_train is not None and prev_mm_in_training is False:
+                try:
+                    mm_mod_for_train.in_training = False
+                except Exception:
+                    pass
+
     def _forward_backbone(
         self,
         backbone: nn.Module,
@@ -1370,17 +1961,73 @@ class ComfyModelAdapter(BaseModelAdapter):
         extra_cond_dict: Optional[Dict[str, Any]] = None,
         sigma: Optional[torch.Tensor] = None,
         clean_latents: Optional[torch.Tensor] = None,
+        control_latents: Optional[List[torch.Tensor]] = None,
+        control_mode: str = "auto",
+        reference_latents_method: str = "auto",
+        control_dropped: bool = False,
     ) -> torch.Tensor:
         """
         Dispatch forward pass through ComfyUI's native `encode_adm`, `extra_conds`, `c_concat`,
-        `process_timestep`, `transformer_options`, and `diffusion_model` without mutating inference tensors.
+        `reference_latents`, `process_timestep`, `transformer_options`, and `diffusion_model`
+        without mutating inference tensors.
         """
+        try:
+            from ..pipelines.lora_trainer import _scoped_training_op_wrappers
+
+            op_ctx: Any = _scoped_training_op_wrappers()
+        except Exception:
+            op_ctx = contextlib.nullcontext()
+        with op_ctx, self._comfy_training_runtime_context(backbone):
+            return self._forward_backbone_impl(
+                backbone=backbone,
+                noisy_latents=noisy_latents,
+                timesteps=timesteps,
+                prompt_embeds=prompt_embeds,
+                pooled_output=pooled_output,
+                extra_cond_dict=extra_cond_dict,
+                sigma=sigma,
+                clean_latents=clean_latents,
+                control_latents=control_latents,
+                control_mode=control_mode,
+                reference_latents_method=reference_latents_method,
+                control_dropped=control_dropped,
+            )
+
+    def _forward_backbone_impl(
+        self,
+        backbone: nn.Module,
+        noisy_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        pooled_output: Optional[torch.Tensor] = None,
+        extra_cond_dict: Optional[Dict[str, Any]] = None,
+        sigma: Optional[torch.Tensor] = None,
+        clean_latents: Optional[torch.Tensor] = None,
+        control_latents: Optional[List[torch.Tensor]] = None,
+        control_mode: str = "auto",
+        reference_latents_method: str = "auto",
+        control_dropped: bool = False,
+    ) -> torch.Tensor:
         prompt_embeds = self._prepare_prompt_embeds(prompt_embeds, backbone)
         param_names, accepts_var_kwargs = self._get_forward_signature_info(backbone)
 
         kwargs: Dict[str, Any] = {}
         c_concat_tensor: Optional[torch.Tensor] = None
         bsz = int(noisy_latents.shape[0]) if noisy_latents.ndim >= 1 else 1
+
+        resolved_ctrl_mode = self.resolve_control_mode(backbone=backbone, requested_mode=control_mode)
+        prepared_ctrl_list: List[torch.Tensor] = []
+        if control_latents:
+            for raw_c in control_latents:
+                if isinstance(raw_c, torch.Tensor) and raw_c.numel() > 0:
+                    prepared_ctrl_list.append(
+                        self._prepare_control_latent_for_extra_conds(
+                            raw_c,
+                            noisy_latents=noisy_latents,
+                            backbone=backbone,
+                            control_mode=resolved_ctrl_mode,
+                        )
+                    )
 
         spacial_ratio = (
             int(getattr(self.latent_format, "spacial_downscale_ratio", 8))
@@ -1410,12 +2057,19 @@ class ComfyModelAdapter(BaseModelAdapter):
                     elif actual_clip_pooled > expected_clip_pooled and actual_clip_pooled != expected_v:
                         cond_pooled = cond_pooled[..., :expected_clip_pooled]
 
+                cond_latent_image: torch.Tensor
+                if control_dropped and resolved_ctrl_mode == "concat_latent_image":
+                    # Never leak target `clean_latents` into `BaseModel.concat_cond` when control dropout is active
+                    cond_latent_image = torch.zeros_like(noisy_latents)
+                else:
+                    cond_latent_image = clean_latents if isinstance(clean_latents, torch.Tensor) else noisy_latents
+
                 cond_in: Dict[str, Any] = {
                     "cross_attn": prompt_embeds,
                     "c_crossattn": prompt_embeds,
                     "pooled_output": cond_pooled,
                     "noise": noisy_latents,
-                    "latent_image": clean_latents if isinstance(clean_latents, torch.Tensor) else noisy_latents,
+                    "latent_image": cond_latent_image,
                     "device": noisy_latents.device,
                     "width": spatial_w,
                     "height": spatial_h,
@@ -1432,6 +2086,19 @@ class ComfyModelAdapter(BaseModelAdapter):
                     "seed": 0,
                     "prompt_type": "positive",
                 }
+                if prepared_ctrl_list:
+                    if resolved_ctrl_mode == "concat_latent_image":
+                        cond_in["concat_latent_image"] = prepared_ctrl_list[0]
+                    else:
+                        cond_in["reference_latents"] = prepared_ctrl_list
+                        clean_ref_method = str(reference_latents_method or "auto").strip()
+                        if clean_ref_method and clean_ref_method.lower() != "auto":
+                            cond_in["reference_latents_method"] = clean_ref_method
+                        elif hasattr(backbone, "default_ref_method") and getattr(backbone, "default_ref_method", None) is None:
+                            # Some ComfyUI DiTs (e.g. Krea2 SingleStreamDiT) default `default_ref_method=None`
+                            # and guard `if ref_method is not None:` around reference concatenation.
+                            cond_in["reference_latents_method"] = "index"
+
                 if self.spec.requires_guidance_embed or hasattr(backbone, "guidance_in"):
                     cond_in["guidance"] = self.guidance_scale
                 if extra_cond_dict:
@@ -1470,14 +2137,88 @@ class ComfyModelAdapter(BaseModelAdapter):
                     except Exception:
                         pass
 
-                built_conds = self.inner_model.extra_conds(**cond_in)
+                has_preprocess_text = (
+                    hasattr(backbone, "preprocess_text_embeds")
+                    and callable(getattr(backbone, "preprocess_text_embeds", None))
+                )
+                override_infer_dtype = torch.is_grad_enabled() and has_preprocess_text
+                defer_minimax_text_preprocess = override_infer_dtype and self._is_minimax_h3_backbone(backbone)
+                had_inst_preprocess = False
+                orig_inst_preprocess = None
+                had_inst_infer_dtype = False
+                orig_inst_infer_dtype = None
+                if defer_minimax_text_preprocess:
+                    # Defer MiniMax H3 `condition_proj + token_refiner` out of `extra_conds` into
+                    # `_embed_and_pack` during training so `token_refiner` also receives
+                    # `transformer_options["optimized_attention_override"]` while `extra_conds` still
+                    # builds `minimax_payload` (`text_token_tags`, `layout`, `refs`, etc.).
+                    had_inst_preprocess = "preprocess_text_embeds" in backbone.__dict__
+                    orig_inst_preprocess = backbone.__dict__.get("preprocess_text_embeds")
+                    backbone.__dict__["preprocess_text_embeds"] = lambda text_states: text_states
+                if (
+                    override_infer_dtype
+                    and hasattr(self.inner_model, "get_dtype_inference")
+                    and hasattr(self.inner_model, "__dict__")
+                ):
+                    # Generalized FP8 / mixed-dtype protection for all models whose `extra_conds`
+                    # runs `backbone.preprocess_text_embeds(cross_attn.to(dtype=self.get_dtype_inference()))`
+                    # (e.g. LTXAV Embeddings1DConnector, Anima, MiniMaxH3, and future connector DiTs).
+                    had_inst_infer_dtype = "get_dtype_inference" in self.inner_model.__dict__
+                    orig_inst_infer_dtype = self.inner_model.__dict__.get("get_dtype_inference")
+                    self.inner_model.__dict__["get_dtype_inference"] = lambda: noisy_latents.dtype
+                single_stream_cond = cond_in.get("latent_shapes") is None
+                latent_shapes_ctx = (
+                    self._guard_single_stream_latent_shapes(self.inner_model)
+                    if single_stream_cond
+                    else contextlib.nullcontext()
+                )
+                # `comfy.model_base.Anima.extra_conds` unsqueezes `t5xxl_ids` to `[1, L]` and,
+                # when `torch.is_inference_mode_enabled()` is True, runs `preprocess_text_embeds`
+                # immediately — which mismatches `cross_attn` `[B, L, D]` whenever `B > 1`.
+                # Temporarily exiting `inference_mode` (under `no_grad`) defers `preprocess_text_embeds`
+                # to `Anima.forward` where full per-sample `[B, L]` `t5xxl_ids`/`t5xxl_weights` are supplied.
+                defer_anima_infer_conds = (
+                    torch.is_inference_mode_enabled()
+                    and bsz > 1
+                    and "t5xxl_ids" in cond_in
+                )
+                infer_exit_ctx = (
+                    torch.inference_mode(False)
+                    if defer_anima_infer_conds
+                    else contextlib.nullcontext()
+                )
+                no_grad_ctx = (
+                    torch.no_grad()
+                    if defer_anima_infer_conds
+                    else contextlib.nullcontext()
+                )
+                try:
+                    with latent_shapes_ctx, infer_exit_ctx, no_grad_ctx:
+                        built_conds = self.inner_model.extra_conds(**cond_in)
+                finally:
+                    if defer_minimax_text_preprocess:
+                        if had_inst_preprocess:
+                            backbone.__dict__["preprocess_text_embeds"] = orig_inst_preprocess
+                        else:
+                            backbone.__dict__.pop("preprocess_text_embeds", None)
+                    if override_infer_dtype and hasattr(self.inner_model, "__dict__"):
+                        if had_inst_infer_dtype:
+                            self.inner_model.__dict__["get_dtype_inference"] = orig_inst_infer_dtype
+                        else:
+                            self.inner_model.__dict__.pop("get_dtype_inference", None)
                 extra_conds_succeeded = isinstance(built_conds, dict)
                 for k, v in built_conds.items():
                     val = None
                     if hasattr(v, "process_cond") and callable(v.process_cond):
                         try:
-                            processed = v.process_cond(batch_size=bsz, device=noisy_latents.device)
+                            processed = v.process_cond(batch_size=bsz, device=noisy_latents.device, area=None)
                             val = getattr(processed, "cond", processed)
+                        except TypeError:
+                            try:
+                                processed = v.process_cond(batch_size=bsz, device=noisy_latents.device)
+                                val = getattr(processed, "cond", processed)
+                            except Exception:
+                                val = getattr(v, "cond", v)
                         except Exception:
                             val = getattr(v, "cond", v)
                     else:
@@ -1489,8 +2230,20 @@ class ComfyModelAdapter(BaseModelAdapter):
                             val = safe_to_device(val, device=noisy_latents.device, dtype=noisy_latents.dtype)
                         else:
                             val = safe_to_device(val, device=noisy_latents.device)
-                        if val.ndim >= 2 and val.shape[0] == 1 and bsz > 1 and k != "sample_sigmas":
+                        if val.ndim >= 1 and val.shape[0] == 1 and bsz > 1 and k not in ("sample_sigmas", "sigmas"):
                             val = val.repeat(bsz, *([1] * (val.ndim - 1)))
+                    elif isinstance(val, list) and val and all(isinstance(item, torch.Tensor) for item in val):
+                        unwrapped_list: List[torch.Tensor] = []
+                        for item_t in val:
+                            t_c = item_t.clone() if (torch.is_grad_enabled() and item_t.requires_grad) else item_t.detach().clone()
+                            if torch.is_floating_point(t_c):
+                                t_c = safe_to_device(t_c, device=noisy_latents.device, dtype=noisy_latents.dtype)
+                            else:
+                                t_c = safe_to_device(t_c, device=noisy_latents.device)
+                            if t_c.ndim >= 1 and t_c.shape[0] == 1 and bsz > 1:
+                                t_c = t_c.repeat(bsz, *([1] * (t_c.ndim - 1)))
+                            unwrapped_list.append(t_c)
+                        val = unwrapped_list
 
                     if k == "c_crossattn":
                         if "context" in param_names or accepts_var_kwargs:
@@ -1499,11 +2252,103 @@ class ComfyModelAdapter(BaseModelAdapter):
                         c_concat_tensor = val
                     elif k in param_names or accepts_var_kwargs:
                         kwargs[k] = val
-            except Exception:
-                pass
+
+                # Reconcile post-connector `attention_mask` length against transformed `context`
+                # sequence length (e.g. LTXAV `Embeddings1DConnector` appends learnable registers
+                # to pad `context` up to >= 1024 tokens while `extra_conds` keeps `attention_mask`
+                # at the pre-connector caption length when `batch_size > 1`).
+                ctx_t = kwargs.get("context")
+                mask_t = kwargs.get("attention_mask")
+                if (
+                    isinstance(ctx_t, torch.Tensor)
+                    and ctx_t.ndim >= 2
+                    and isinstance(mask_t, torch.Tensor)
+                    and mask_t.ndim >= 1
+                ):
+                    ctx_len = int(ctx_t.shape[1])
+                    mask_len = int(mask_t.shape[-1])
+                    if ctx_len > 0 and mask_len > 0 and mask_len != ctx_len:
+                        if mask_len < ctx_len:
+                            pad_val = 0.0 if torch.is_floating_point(mask_t) else 1
+                            kwargs["attention_mask"] = F.pad(mask_t, (0, ctx_len - mask_len), value=pad_val)
+                        else:
+                            kwargs["attention_mask"] = mask_t[..., :ctx_len]
+
+                # ComfyUI's `extra_conds` on Lumina2 / OmniGen2 / Boogu / GenmoMochi computes
+                # `num_tokens = int(torch.sum(attention_mask).item())` assuming a single prompt (`B=1`).
+                # With `batch_size > 1`, that sums valid tokens across ALL batch rows (`> ctx.shape[1]`),
+                # overflowing RoPE frequency buffers (`cap_freqs_cis[i, :num_tokens]`).
+                raw_num_tokens = kwargs.get("num_tokens")
+                if (
+                    isinstance(raw_num_tokens, int)
+                    and isinstance(ctx_t, torch.Tensor)
+                    and ctx_t.ndim >= 2
+                ):
+                    ctx_seq_len = int(ctx_t.shape[1])
+                    if ctx_seq_len > 0 and raw_num_tokens > ctx_seq_len:
+                        cur_mask = kwargs.get("attention_mask")
+                        if isinstance(cur_mask, torch.Tensor) and cur_mask.ndim >= 2:
+                            per_item_max = int(
+                                (cur_mask.reshape(cur_mask.shape[0], -1) != 0).sum(dim=-1).max().item()
+                            )
+                            kwargs["num_tokens"] = max(1, min(ctx_seq_len, per_item_max))
+                        else:
+                            kwargs["num_tokens"] = ctx_seq_len
+
+                # Ensure single-stream training never inherits a stale multi-stream `audio_scale != 1.0`
+                # inside `minimax_payload`.
+                if single_stream_cond and isinstance(kwargs.get("minimax_payload"), dict):
+                    mp_dict = kwargs["minimax_payload"]
+                    if mp_dict.get("audio_scale") not in (None, 1.0):
+                        mp_copy = dict(mp_dict)
+                        mp_copy["audio_scale"] = 1.0
+                        kwargs["minimax_payload"] = mp_copy
+            except Exception as _ec_exc:
+                _inner_cls_name = type(self.inner_model).__name__
+                _exc_cls_name = type(_ec_exc).__name__
+                _warn_key = (_inner_cls_name, _exc_cls_name)
+                _warned_keys = getattr(self, "_warned_extra_conds_keys", None)
+                if not isinstance(_warned_keys, set):
+                    _warned_keys = set()
+                    self._warned_extra_conds_keys = _warned_keys
+                if _warn_key not in _warned_keys:
+                    _warned_keys.add(_warn_key)
+                    logging.warning(
+                        "[OmniLoRA] `%s.extra_conds(...)` raised %s for '%s': %s — "
+                        "falling back to raw conditioning. If training a newly released ComfyUI "
+                        "architecture, verify the extra conditioning inputs expected by `extra_conds`.",
+                        _inner_cls_name,
+                        _exc_cls_name,
+                        self.spec.display_name,
+                        _ec_exc,
+                    )
 
         if c_concat_tensor is None and extra_cond_dict and isinstance(extra_cond_dict.get("c_concat"), torch.Tensor):
             c_concat_tensor = extra_cond_dict["c_concat"]
+
+        # Fallback routing for standalone backbones without ComfyUI `BaseModel.extra_conds`
+        if not extra_conds_succeeded and prepared_ctrl_list:
+            scaled_ctrls: List[torch.Tensor] = []
+            for ct in prepared_ctrl_list:
+                if self.latent_format is not None and hasattr(self.latent_format, "process_in"):
+                    try:
+                        ct = self.latent_format.process_in(ct)
+                    except Exception:
+                        pass
+                scaled_ctrls.append(ct)
+            if resolved_ctrl_mode == "concat_latent_image":
+                if "image_cond" in param_names and "image_cond" not in kwargs:
+                    kwargs["image_cond"] = scaled_ctrls[0]
+                elif c_concat_tensor is None:
+                    c_concat_tensor = scaled_ctrls[0]
+            elif "ref_latents" not in kwargs and ("ref_latents" in param_names or accepts_var_kwargs):
+                kwargs["ref_latents"] = scaled_ctrls
+                clean_ref_method = str(reference_latents_method or "auto").strip()
+                if "ref_latents_method" in param_names or accepts_var_kwargs:
+                    if clean_ref_method and clean_ref_method.lower() != "auto":
+                        kwargs["ref_latents_method"] = clean_ref_method
+                    elif hasattr(backbone, "default_ref_method") and getattr(backbone, "default_ref_method", None) is None:
+                        kwargs["ref_latents_method"] = "index"
 
         if extra_cond_dict:
             # When `BaseModel.extra_conds` succeeded, it has already authoritatively filtered, renamed,
@@ -1583,6 +2428,39 @@ class ComfyModelAdapter(BaseModelAdapter):
             elif accepts_var_kwargs:
                 kwargs["context"] = prompt_embeds
 
+        # Supply `attention_mask` / `num_tokens` if `backbone.forward` declares them as required
+        # parameters without a default (e.g. `LTXBaseModel`, `AsymmDiTJoint`, `OmniGen2`, `Boogu`).
+        try:
+            _cls_fwd = getattr(type(backbone), "forward", backbone.forward)
+            _fwd_sig_params = inspect.signature(_cls_fwd).parameters
+        except (ValueError, TypeError):
+            _fwd_sig_params = {}
+
+        if "attention_mask" in param_names and "attention_mask" not in kwargs:
+            am_param = _fwd_sig_params.get("attention_mask")
+            if am_param is not None and am_param.default is inspect.Parameter.empty:
+                ctx_ref = kwargs.get("context")
+                if hasattr(backbone, "t5_y_embedder") and isinstance(ctx_ref, torch.Tensor) and ctx_ref.ndim >= 2:
+                    kwargs["attention_mask"] = torch.ones(
+                        (bsz, int(ctx_ref.shape[1])),
+                        device=noisy_latents.device,
+                        dtype=torch.bool,
+                    )
+                else:
+                    kwargs["attention_mask"] = None
+
+        if "num_tokens" in param_names and "num_tokens" not in kwargs:
+            nt_param = _fwd_sig_params.get("num_tokens")
+            if nt_param is not None and nt_param.default is inspect.Parameter.empty:
+                am_t = kwargs.get("attention_mask")
+                ctx_ref = kwargs.get("context")
+                if isinstance(am_t, torch.Tensor) and am_t.numel() > 0:
+                    kwargs["num_tokens"] = max(1, int(am_t.sum().item()))
+                elif isinstance(ctx_ref, torch.Tensor) and ctx_ref.ndim >= 2:
+                    kwargs["num_tokens"] = max(1, int(ctx_ref.shape[1]))
+                else:
+                    kwargs["num_tokens"] = 1
+
         # 3. Supply pooled/ADM `y` if `extra_conds` did not already build it AND the model requires pooled conditioning
         has_vec_embedder = any(
             hasattr(backbone, attr) for attr in ("vector_in", "y_embedder", "p_embedder", "label_emb")
@@ -1624,9 +2502,13 @@ class ComfyModelAdapter(BaseModelAdapter):
                     spatial_w=spatial_w,
                 )
 
-        # 4. Supply guidance embedding if required by the model (e.g. Flux / Hunyuan / Wan guidance-distilled)
+        # 4. Supply guidance embedding if required by the model (e.g. Flux / Hunyuan / Wan / Chroma)
+        _guidance_param = _fwd_sig_params.get("guidance")
+        _guidance_required = (
+            _guidance_param is not None and _guidance_param.default is inspect.Parameter.empty
+        )
         if (
-            (self.spec.requires_guidance_embed or hasattr(backbone, "guidance_in"))
+            (self.spec.requires_guidance_embed or hasattr(backbone, "guidance_in") or _guidance_required)
             and "guidance" in param_names
             and "guidance" not in kwargs
         ):
@@ -1650,6 +2532,7 @@ class ComfyModelAdapter(BaseModelAdapter):
             backbone=backbone,
             c_concat=c_concat_tensor,
             clean_latents=clean_latents,
+            allow_clean_fallback=(not control_dropped),
         )
 
         # 6. Apply ComfyUI BaseModel.process_timestep if implemented on `self.inner_model`
@@ -1669,6 +2552,7 @@ class ComfyModelAdapter(BaseModelAdapter):
                 timesteps=timesteps,
                 sigma=sigma,
                 existing=kwargs.get("transformer_options"),
+                backbone=backbone,
             )
 
         # Remove positional argument names from kwargs to avoid TypeError: got multiple values for argument
@@ -1692,81 +2576,14 @@ class ComfyModelAdapter(BaseModelAdapter):
             for k, v in list(kwargs.items()):
                 if isinstance(v, torch.Tensor) and is_inference_tensor(v):
                     kwargs[k] = v.detach().clone()
+                elif isinstance(v, list) and any(isinstance(t, torch.Tensor) and is_inference_tensor(t) for t in v):
+                    kwargs[k] = [
+                        (t.detach().clone() if (isinstance(t, torch.Tensor) and is_inference_tensor(t)) else t)
+                        for t in v
+                    ]
 
-            mm_mod_for_train: Optional[Any] = None
-            prev_mm_in_training: Optional[bool] = None
-            if torch.is_grad_enabled():
-                if not noisy_latents.requires_grad:
-                    noisy_latents = noisy_latents.detach().requires_grad_(True)
-                mp_mod = sys.modules.get("comfy.model_prefetch")
-                attn_mod = sys.modules.get("comfy.ldm.modules.attention")
-                if (
-                    (mp_mod is not None and not getattr(getattr(mp_mod, "prefetch_queue_pop", None), "_omni_patched", False))
-                    or (attn_mod is not None and not getattr(attn_mod, "_omni_attn_hooks_installed", False))
-                ):
-                    install_comfy_runtime_hooks()
-                _rebind_comfy_attention_modules(backbone)
-                if hasattr(backbone, "reset_prefix_cache") and callable(backbone.reset_prefix_cache):
-                    try:
-                        backbone.reset_prefix_cache(False)
-                    except TypeError:
-                        try:
-                            backbone.reset_prefix_cache()
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-                mm_mod_for_train = sys.modules.get("comfy.model_management")
-                if mm_mod_for_train is not None:
-                    prev_mm_in_training = bool(getattr(mm_mod_for_train, "in_training", False))
-                    if not prev_mm_in_training:
-                        try:
-                            mm_mod_for_train.in_training = True
-                        except Exception:
-                            mm_mod_for_train = None
-                minimax_mod = sys.modules.get("comfy.ldm.minimax.model")
-                if minimax_mod is not None:
-                    try:
-                        ms_fn = getattr(minimax_mod, "_mod_scale_shift", None)
-                        if callable(ms_fn) and not getattr(ms_fn, "_omni_autograd_safe", False):
-                            def _omni_mod_scale_shift(h: Any, shift: Any, scale: Any, segments: Any) -> Any:
-                                if not torch.is_grad_enabled():
-                                    for a, b, row in segments:
-                                        h[a:b].mul_(1.0 + scale[row].to(h.dtype)).add_(shift[row].to(h.dtype))
-                                    return h
-                                pieces = []
-                                cur = 0
-                                for a, b, row in sorted(segments, key=lambda s: int(s[0])):
-                                    if a > cur:
-                                        pieces.append(h[cur:a])
-                                    pieces.append(h[a:b] * (1.0 + scale[row].to(h.dtype)) + shift[row].to(h.dtype))
-                                    cur = b
-                                if cur < h.shape[0]:
-                                    pieces.append(h[cur:])
-                                return torch.cat(pieces, dim=0) if pieces else h
-                            _omni_mod_scale_shift._omni_autograd_safe = True  # type: ignore[attr-defined]
-                            setattr(minimax_mod, "_mod_scale_shift", _omni_mod_scale_shift)
-                        mg_fn = getattr(minimax_mod, "_mod_gate", None)
-                        if callable(mg_fn) and not getattr(mg_fn, "_omni_autograd_safe", False):
-                            def _omni_mod_gate(x: Any, gate: Any, other: Any, segments: Any) -> Any:
-                                if not torch.is_grad_enabled():
-                                    for a, b, row in segments:
-                                        x[a:b].addcmul_(other[a:b], gate[row].to(x.dtype))
-                                    return x
-                                pieces = []
-                                cur = 0
-                                for a, b, row in sorted(segments, key=lambda s: int(s[0])):
-                                    if a > cur:
-                                        pieces.append(x[cur:a])
-                                    pieces.append(x[a:b] + other[a:b] * gate[row].to(x.dtype))
-                                    cur = b
-                                if cur < x.shape[0]:
-                                    pieces.append(x[cur:])
-                                return torch.cat(pieces, dim=0) if pieces else x
-                            _omni_mod_gate._omni_autograd_safe = True  # type: ignore[attr-defined]
-                            setattr(minimax_mod, "_mod_gate", _omni_mod_gate)
-                    except Exception:
-                        pass
+            if torch.is_grad_enabled() and not noisy_latents.requires_grad:
+                noisy_latents = noisy_latents.detach().requires_grad_(True)
 
             backbone_input: Any = noisy_latents
             latent_shapes = kwargs.pop("latent_shapes", None)
@@ -1778,47 +2595,77 @@ class ComfyModelAdapter(BaseModelAdapter):
                         backbone_input = _cu.unpack_latents(noisy_latents, latent_shapes)
                 except Exception:
                     backbone_input = noisy_latents
+            elif isinstance(backbone_input, torch.Tensor) and (
+                callable(getattr(backbone, "separate_audio_and_video_latents", None))
+                or (
+                    getattr(backbone, "audio_patchify_proj", None) is not None
+                    and getattr(backbone, "a_patchifier", None) is not None
+                )
+            ):
+                # Optional-audio dual-stream AV backbones (e.g. `LTXAVModel` for LTX 2.0 / 2.3 / 2.4 / 2.5)
+                # expect `x` as a sequence `[video_x]` or `[video_x, audio_x]` and index `vx = x[0]`
+                # inside `separate_audio_and_video_latents`. Passing a single-element list `[video_in]`
+                # preserves the 5D batch axis and activates the native video-only path (`ax.numel() == 0`).
+                video_in = backbone_input.unsqueeze(2) if backbone_input.ndim == 4 else backbone_input
+                backbone_input = [video_in]
             elif (
                 isinstance(backbone_input, torch.Tensor)
                 and isinstance(getattr(backbone, "audio_latents_dim", None), int)
                 and int(getattr(backbone, "audio_latents_dim", 0)) > 0
                 and getattr(backbone, "audio_patch_proj", None) is not None
             ):
-                # Dual-stream video+audio backbones (e.g. `MiniMaxH3Model`, whereas `MiniMaxH3ImageModel`
-                # sets `audio_latents_dim = None` and takes a single tensor) unpack `video_x, audio_x = x[0], x[1]`
-                # inside `forward`/`_forward`. When training on a single video/image latent stream without packed
-                # `latent_shapes`, synthesize the companion silent audio latent stream matching `MiniMaxH3AV`.
+                # Required-joint-audio dual-stream backbones (e.g. `MiniMaxH3Model`, whereas
+                # `MiniMaxH3ImageModel` sets `audio_latents_dim = None` and takes a single tensor)
+                # unpack `video_x, audio_x = x[0], x[1]` with `audio_t > 0`. Synthesize a companion
+                # flow-matched silent audio latent stream `sigma_a * randn(...)` using the model's
+                # `time_shift_sigma(sigma_v, shift_v, shift_a)` schedule so joint attention stays
+                # in-distribution across all timesteps.
                 video_in = backbone_input.unsqueeze(2) if backbone_input.ndim == 4 else backbone_input
                 audio_c = int(getattr(backbone, "audio_latents_dim", 32))
                 t_tokens = int(video_in.shape[2]) if video_in.ndim >= 5 else 1
                 frames_per_token = (1, 4, 4, 4, 4)
                 frame_count = sum(frames_per_token[i % len(frames_per_token)] for i in range(max(1, t_tokens)))
                 audio_t = max(1, int(round(frame_count * (5.0 / 3.0))))
-                dummy_audio = torch.zeros(
-                    (int(video_in.shape[0]), audio_c, 2, audio_t),
-                    device=video_in.device,
-                    dtype=video_in.dtype,
+                to_dict = kwargs.get("transformer_options") if isinstance(kwargs.get("transformer_options"), dict) else {}
+                shift_v = float(
+                    to_dict.get("minimax_h3_sigma_shift_video", getattr(backbone, "sigma_shift_video", 1.0)) or 1.0
                 )
+                shift_a = float(
+                    to_dict.get("minimax_h3_sigma_shift_audio", getattr(backbone, "sigma_shift_audio", 1.0)) or 1.0
+                )
+                if isinstance(sigma, torch.Tensor):
+                    sigma_v = sigma.detach().to(device=video_in.device, dtype=torch.float32).reshape(-1)
+                else:
+                    sigma_v = timesteps.detach().to(device=video_in.device, dtype=torch.float32).reshape(-1) / 1000.0
+                sigma_v = sigma_v.clamp(0.0, 1.0)
+                vid_bsz = int(video_in.shape[0])
+                if sigma_v.numel() == 1 and vid_bsz > 1:
+                    sigma_v = sigma_v.expand(vid_bsz)
+                elif sigma_v.numel() > vid_bsz:
+                    sigma_v = sigma_v[:vid_bsz]
+                base_s = sigma_v / (shift_v + sigma_v * (1.0 - shift_v)).clamp(min=1e-6)
+                sigma_a = (shift_a * base_s / (1.0 + (shift_a - 1.0) * base_s).clamp(min=1e-6)).clamp(0.0, 1.0)
+                dummy_audio = (
+                    torch.randn(
+                        (vid_bsz, audio_c, 2, audio_t),
+                        device=video_in.device,
+                        dtype=torch.float32,
+                    )
+                    * sigma_a.view(-1, 1, 1, 1)
+                ).to(dtype=video_in.dtype)
                 backbone_input = [video_in, dummy_audio]
 
-            try:
-                if kwargs:
-                    try:
-                        out = backbone(backbone_input, timesteps, **kwargs)
-                    except TypeError:
-                        if param_names:
-                            filtered_kw = {k: v for k, v in kwargs.items() if k in param_names}
-                            out = backbone(backbone_input, timesteps, **filtered_kw)
-                        else:
-                            raise
-                else:
-                    out = backbone(backbone_input, timesteps, prompt_embeds)
-            finally:
-                if mm_mod_for_train is not None and prev_mm_in_training is False:
-                    try:
-                        mm_mod_for_train.in_training = False
-                    except Exception:
-                        pass
+            if kwargs:
+                try:
+                    out = backbone(backbone_input, timesteps, **kwargs)
+                except TypeError:
+                    if param_names:
+                        filtered_kw = {k: v for k, v in kwargs.items() if k in param_names}
+                        out = backbone(backbone_input, timesteps, **filtered_kw)
+                    else:
+                        raise
+            else:
+                out = backbone(backbone_input, timesteps, prompt_embeds)
 
             if isinstance(out, (tuple, list)):
                 if (
@@ -1923,7 +2770,34 @@ class ComfyModelAdapter(BaseModelAdapter):
     ) -> torch.Tensor:
         if device.type in ("privateuseone", "dml") and dtype == torch.bfloat16:
             dtype = torch.float16
-        raw_latents = safe_to_device(batch["latents"], device=device, dtype=dtype)
+        raw_latents_in = batch["latents"]
+        if (
+            self._requires_batch_size_one_for_batch(backbone, batch)
+            and isinstance(raw_latents_in, torch.Tensor)
+            and raw_latents_in.ndim >= 1
+            and int(raw_latents_in.shape[0]) > 1
+        ):
+            # Strict single-item backbones (MiniMax H3 / H3-Image) and HunyuanVideo with multi-row
+            # `attention_mask` microbatch cleanly into single-item forwards so any dataset `batch_size > 1`
+            # works without altering batched execution for any other architecture.
+            micro_bsz = int(raw_latents_in.shape[0])
+            sub_losses: List[torch.Tensor] = []
+            sub_timesteps: List[float] = []
+            for m_idx in range(micro_bsz):
+                sub_batch = self._slice_single_item_batch(batch, m_idx, micro_bsz)
+                sub_losses.append(
+                    self.compute_training_loss(
+                        backbone=backbone,
+                        batch=sub_batch,
+                        device=device,
+                        dtype=dtype,
+                    )
+                )
+                sub_timesteps.append(float(getattr(self, "last_timestep", 0.5)))
+            self.last_timestep = float(sum(sub_timesteps) / max(1, len(sub_timesteps)))
+            return torch.stack(sub_losses).mean()
+
+        raw_latents = safe_to_device(raw_latents_in, device=device, dtype=dtype)
         latent_scaled = bool(batch.get("latent_scaled", True))
         latents = self._validate_and_prepare_latents(
             raw_latents,
@@ -1941,6 +2815,31 @@ class ComfyModelAdapter(BaseModelAdapter):
             pooled_output = None
 
         extra_cond_dict = batch.get("extra_conds")
+        raw_ctrl_in = batch.get("control_latents")
+        control_latents: Optional[List[torch.Tensor]] = None
+        if isinstance(raw_ctrl_in, torch.Tensor) and raw_ctrl_in.numel() > 0:
+            control_latents = [raw_ctrl_in]
+        elif isinstance(raw_ctrl_in, list):
+            valid_ctrls = [c for c in raw_ctrl_in if isinstance(c, torch.Tensor) and c.numel() > 0]
+            if valid_ctrls:
+                control_latents = (
+                    [torch.cat(valid_ctrls, dim=0)]
+                    if (
+                        len(valid_ctrls) == int(latents.shape[0])
+                        and len(valid_ctrls) > 1
+                        and all(c.shape == valid_ctrls[0].shape and int(c.shape[0]) == 1 for c in valid_ctrls)
+                        and str(batch.get("control_mode", getattr(self, "control_mode", "auto")) or "auto").strip().lower() == "concat_latent_image"
+                    )
+                    else valid_ctrls
+                )
+        ctrl_mode = str(batch.get("control_mode", getattr(self, "control_mode", "auto")) or "auto")
+        ref_method = str(batch.get("reference_latents_method", getattr(self, "reference_latents_method", "auto")) or "auto")
+        raw_ctrl_dropped = batch.get("control_dropped", False)
+        ctrl_dropped = (
+            all(bool(x) for x in raw_ctrl_dropped)
+            if isinstance(raw_ctrl_dropped, list) and len(raw_ctrl_dropped) > 0
+            else bool(raw_ctrl_dropped)
+        )
 
         bsz = latents.shape[0]
         broadcast_shape = [bsz] + [1] * (latents.ndim - 1)
@@ -1953,35 +2852,54 @@ class ComfyModelAdapter(BaseModelAdapter):
 
         if self.model_sampling is not None:
             sampling = self.model_sampling
-            sigmas_dev = self._get_device_sigmas(sampling, device=device)
-            if sigmas_dev is not None:
-                max_idx = sigmas_dev.numel() - 1
-                if is_flow_objective:
-                    # Logit-normal timestep sampling for Rectified Flow / Flow Matching,
-                    # mapped into [min_timestep, max_timestep] for single or split-stage models.
-                    u_base = torch.sigmoid(torch.randn(bsz, device=device, dtype=torch.float32))
-                    u_norm = t_lo + u_base * t_span
-                else:
-                    u_base = torch.rand(bsz, device=device, dtype=torch.float32)
-                    u_norm = t_lo + u_base * t_span
-                self.last_timestep = float(u_norm.mean().item())
-                pos = (u_norm * float(max_idx)).clamp(0.0, max(0.0, float(max_idx) - 1e-5))
-                idx0 = pos.long().clamp(0, max(0, max_idx - 1))
-                frac = pos - idx0.to(dtype=torch.float32)
-                s0 = sigmas_dev[idx0]
-                s1 = sigmas_dev[idx0 + 1]
-                sigma = (s0 + (s1 - s0) * frac).clamp(min=1e-5)
+            minimax_pdd_grid = self._get_minimax_pdd_grid(
+                backbone,
+                transformer_options=self._get_model_transformer_options(),
+            )
+            if minimax_pdd_grid is not None and len(minimax_pdd_grid) >= 2:
+                # Sample directly from the PDD grid's active step knots (`grid[:-1]`) so each PDD head
+                # is trained at its native inference sigma knot and `FinalLayer` selects `[k, k + 1)`.
+                active_knots = [s for s in minimax_pdd_grid[:-1] if s > 0.0]
+                if not active_knots:
+                    active_knots = [0.5]
+                in_range = [s for s in active_knots if (t_lo - 1e-6) <= s <= (t_hi + 1e-6)]
+                if not in_range:
+                    mid_t = 0.5 * (t_lo + t_hi)
+                    in_range = [min(active_knots, key=lambda s: abs(s - mid_t))]
+                knot_t = safe_to_device(torch.tensor(in_range, dtype=torch.float32), device=device, dtype=torch.float32)
+                k_idx = torch.randint(0, len(in_range), (bsz,), device=device)
+                sigma = knot_t[k_idx].clamp(min=1e-5)
+                self.last_timestep = float(sigma.mean().item())
             else:
-                if is_flow_objective:
-                    u_base = torch.sigmoid(torch.randn(bsz, device=device, dtype=torch.float32))
-                    flow_shift = float(getattr(sampling, "shift", 1.0) or 1.0)
-                    if flow_shift > 0.0 and abs(flow_shift - 1.0) > 1e-4:
-                        u_base = (flow_shift * u_base) / (1.0 + (flow_shift - 1.0) * u_base)
+                sigmas_dev = self._get_device_sigmas(sampling, device=device)
+                if sigmas_dev is not None:
+                    max_idx = sigmas_dev.numel() - 1
+                    if is_flow_objective:
+                        # Logit-normal timestep sampling for Rectified Flow / Flow Matching,
+                        # mapped into [min_timestep, max_timestep] for single or split-stage models.
+                        u_base = torch.sigmoid(torch.randn(bsz, device=device, dtype=torch.float32))
+                        u_norm = t_lo + u_base * t_span
+                    else:
+                        u_base = torch.rand(bsz, device=device, dtype=torch.float32)
+                        u_norm = t_lo + u_base * t_span
+                    self.last_timestep = float(u_norm.mean().item())
+                    pos = (u_norm * float(max_idx)).clamp(0.0, max(0.0, float(max_idx) - 1e-5))
+                    idx0 = pos.long().clamp(0, max(0, max_idx - 1))
+                    frac = pos - idx0.to(dtype=torch.float32)
+                    s0 = sigmas_dev[idx0]
+                    s1 = sigmas_dev[idx0 + 1]
+                    sigma = (s0 + (s1 - s0) * frac).clamp(min=1e-5)
                 else:
-                    u_base = torch.rand(bsz, device=device, dtype=torch.float32)
-                u_norm = (t_lo + u_base * t_span).clamp(1e-4, 0.999)
-                self.last_timestep = float(u_norm.mean().item())
-                sigma = u_norm
+                    if is_flow_objective:
+                        u_base = torch.sigmoid(torch.randn(bsz, device=device, dtype=torch.float32))
+                        flow_shift = float(getattr(sampling, "shift", 1.0) or 1.0)
+                        if flow_shift > 0.0 and abs(flow_shift - 1.0) > 1e-4:
+                            u_base = (flow_shift * u_base) / (1.0 + (flow_shift - 1.0) * u_base)
+                    else:
+                        u_base = torch.rand(bsz, device=device, dtype=torch.float32)
+                    u_norm = (t_lo + u_base * t_span).clamp(1e-4, 0.999)
+                    self.last_timestep = float(u_norm.mean().item())
+                    sigma = u_norm
 
             noise = torch.randn(latents.shape, device=latents.device, dtype=torch.float32).to(dtype=latents.dtype)
 
@@ -2043,6 +2961,10 @@ class ComfyModelAdapter(BaseModelAdapter):
                 extra_cond_dict=extra_cond_dict,
                 sigma=sigma,
                 clean_latents=latents,
+                control_latents=control_latents,
+                control_mode=ctrl_mode,
+                reference_latents_method=ref_method,
+                control_dropped=ctrl_dropped,
             )
         elif self.spec.objective_type == "ddpm_eps":
             # Fallback DDPM Epsilon-Prediction when model_sampling is not present
@@ -2073,6 +2995,10 @@ class ComfyModelAdapter(BaseModelAdapter):
                 extra_cond_dict=extra_cond_dict,
                 sigma=u.to(dtype=dtype),
                 clean_latents=latents,
+                control_latents=control_latents,
+                control_mode=ctrl_mode,
+                reference_latents_method=ref_method,
+                control_dropped=ctrl_dropped,
             )
         else:
             # Fallback Rectified Flow Velocity Matching when model_sampling is not present
@@ -2095,6 +3021,10 @@ class ComfyModelAdapter(BaseModelAdapter):
                 extra_cond_dict=extra_cond_dict,
                 sigma=timesteps,
                 clean_latents=latents,
+                control_latents=control_latents,
+                control_mode=ctrl_mode,
+                reference_latents_method=ref_method,
+                control_dropped=ctrl_dropped,
             )
 
         pred = self._align_prediction_to_target(pred, target)
@@ -2892,11 +3822,18 @@ def install_comfy_runtime_hooks() -> None:
                     dm = getattr(self, "diffusion_model", None)
                     mc = getattr(self, "model_config", None)
                     ucfg = getattr(mc, "unet_config", None) if mc is not None else None
-                    exp_dim = _infer_dm_expected_context_dim(dm, ucfg if isinstance(ucfg, dict) else None)
+                    ucfg_dict = ucfg if isinstance(ucfg, dict) else None
+                    valid_dims = ComfyModelAdapter._collect_valid_backbone_context_dims(dm, ucfg_dict)
+                    exp_dim = _infer_dm_expected_context_dim(dm, ucfg_dict)
                     if exp_dim is not None and exp_dim > 0:
                         for ck in ("cross_attn", "c_crossattn"):
                             ct = kwargs.get(ck)
-                            if isinstance(ct, torch.Tensor) and ct.ndim >= 2 and int(ct.shape[-1]) != exp_dim:
+                            if (
+                                isinstance(ct, torch.Tensor)
+                                and ct.ndim >= 2
+                                and int(ct.shape[-1]) != exp_dim
+                                and int(ct.shape[-1]) not in valid_dims
+                            ):
                                 kwargs = dict(kwargs)
                                 kwargs[ck] = _adapt_context_width(ct, exp_dim, model_name=type(dm).__name__ if dm is not None else None)
                 except Exception:
@@ -3373,14 +4310,14 @@ def install_comfy_runtime_hooks() -> None:
                         pe: torch.Tensor,
                         q_scale: Optional[torch.Tensor] = None,
                         k_scale: Optional[torch.Tensor] = None,
-                        eps: float = 1e-6,
                         *args: Any,
                         **kwargs: Any,
                     ) -> Tuple[torch.Tensor, torch.Tensor]:
                         if _is_omni_training_active():
-                            eff_eps = float(kwargs.get("epsilon", eps))
+                            pos_eps = args[0] if len(args) > 0 else 1e-6
+                            eff_eps = float(kwargs.get("epsilon", kwargs.get("eps", pos_eps)))
                             return _torch_rms_rope_interleaved(q, k, pe, q_scale, k_scale, eps=eff_eps)
-                        return orig_f(q, k, pe, q_scale, k_scale, eps, *args, **kwargs)
+                        return orig_f(q, k, pe, q_scale, k_scale, *args, **kwargs)
 
                     setattr(_safe_rms_rope, "_omni_train_safe", True)
                     return _safe_rms_rope
@@ -3396,14 +4333,14 @@ def install_comfy_runtime_hooks() -> None:
                         x: torch.Tensor,
                         pe: torch.Tensor,
                         scale: Optional[torch.Tensor] = None,
-                        eps: float = 1e-6,
                         *args: Any,
                         **kwargs: Any,
                     ) -> torch.Tensor:
                         if _is_omni_training_active():
-                            eff_eps = float(kwargs.get("epsilon", eps))
+                            pos_eps = args[0] if len(args) > 0 else 1e-6
+                            eff_eps = float(kwargs.get("epsilon", kwargs.get("eps", pos_eps)))
                             return _torch_apply_rope_interleaved1(_rms_norm_t(x, scale, eps=eff_eps), pe)
-                        return orig_f(x, pe, scale, eps, *args, **kwargs)
+                        return orig_f(x, pe, scale, *args, **kwargs)
 
                     setattr(_safe_rms_rope1, "_omni_train_safe", True)
                     return _safe_rms_rope1
@@ -3423,22 +4360,30 @@ def install_comfy_runtime_hooks() -> None:
                             pe: torch.Tensor,
                             q_scale: Optional[torch.Tensor] = None,
                             k_scale: Optional[torch.Tensor] = None,
-                            eps: float = 1e-6,
                             *args: Any,
                             **kwargs: Any,
                         ) -> Tuple[torch.Tensor, torch.Tensor]:
                             if _is_omni_training_active():
-                                eff_eps = float(kwargs.get("epsilon", eps))
-                                rot_dim = kwargs.get("rot_dim", args[0] if len(args) > 0 else None)
+                                pos_eps = args[0] if len(args) > 0 else 1e-6
+                                eff_eps = float(kwargs.get("epsilon", kwargs.get("eps", pos_eps)))
+                                pos_rot = args[1] if len(args) > 1 else None
+                                rot_dim = kwargs.get("rot_dim", pos_rot)
                                 rq, rk = _torch_rms_rope_split_half(
                                     q, k, pe, q_scale, k_scale, eps=eff_eps, rot_dim=rot_dim
                                 )
-                                if inplace_flag and not (q.requires_grad or k.requires_grad):
-                                    q.copy_(rq)
-                                    k.copy_(rk)
-                                    return q, k
+                                if (
+                                    inplace_flag
+                                    and not (q.is_leaf and q.requires_grad)
+                                    and not (k.is_leaf and k.requires_grad)
+                                ):
+                                    try:
+                                        q.copy_(rq)
+                                        k.copy_(rk)
+                                        return q, k
+                                    except RuntimeError:
+                                        return rq, rk
                                 return rq, rk
-                            return orig_f(q, k, pe, q_scale, k_scale, eps, *args, **kwargs)
+                            return orig_f(q, k, pe, q_scale, k_scale, *args, **kwargs)
 
                         setattr(_safe_rms_rope_split, "_omni_train_safe", True)
                         return _safe_rms_rope_split
@@ -3759,6 +4704,9 @@ _COMFY_SUPPORTED_MODEL_CANONICAL_MAP: Dict[str, str] = {
     "sensenovau15": "sensenova",
     "sensenova": "sensenova",
     "minimaxh3": "minimax",
+    "minimaxh3image": "minimax",
+    "minimax_h3": "minimax",
+    "minimax_h3_image": "minimax",
     "minimax": "minimax",
     "minimaxmusic3": "minimax_music",
     "minimax_music": "minimax_music",

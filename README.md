@@ -2,7 +2,7 @@
 
 **Universal in-graph LoRA training nodes for ComfyUI across CUDA, Intel Arc XPU, ROCm, TPU, MPS, DirectML & CPU. Supports any ComfyUI model, quantized backbones (FP8/INT8/GGUF), deterministic VRAM budgeting & CPU layer streaming.**
 
-Train LoRAs directly inside your ComfyUI workflow using the models, VAEs, and text encoders you already have on canvas. Works out of the box with **Flux (1 / 2 / 3 Klein), Qwen-Image (1.0 / 2.1), Wan (2.1 / 2.2 Video & Image), SDXL, SD 3.5, SD 1.5, Chroma, Bria FIBO 2.0, HiDream-I1, MOSS-Image, OmniGen2, HunyuanVideo, LTX-Video, Lumina 2 / Z-Image, AuraFlow / Sana**, and quantized **FP8 / INT8 / GGUF / bitsandbytes** checkpoints across **NVIDIA CUDA, Intel Arc XPU, AMD ROCm, Apple Silicon MPS, Windows DirectML, Cloud TPU, Ascend NPU, Gaudi HPU, and CPU**.
+Train LoRAs directly inside your ComfyUI workflow — for standard **text-to-image/video** or paired **image-editing / control-folder** datasets — using the models, VAEs, and text encoders you already have on canvas. Works out of the box with **Flux (1 / Kontext / 2 / 3 Klein), Qwen-Image (1.0 / 2.1), Wan (2.1 / 2.2 Video & Image), SDXL, SD 3.5, SD 1.5, Chroma, Bria FIBO 2.0, HiDream (I1 / E1), MOSS-Image, OmniGen2, HunyuanVideo, LTX-Video & LTX-AV (2.0 / 2.5), MiniMax H3 (Video & Image), Lumina 2 / Z-Image, AuraFlow / Sana**, and quantized **FP8 / INT8 / GGUF / bitsandbytes** checkpoints across **NVIDIA CUDA, Intel Arc XPU, AMD ROCm, Apple Silicon MPS, Windows DirectML, Cloud TPU, Ascend NPU, Gaudi HPU, and CPU**.
 
 ---
 
@@ -68,11 +68,12 @@ Create a folder anywhere on your drive (for example `C:/datasets/my_character` o
 
 ## Included Ready-to-Run Workflows
 
-All 5 workflow templates are located in [`example_workflows/`](./example_workflows/) — drag any `.json` file into ComfyUI:
+All 6 workflow templates are located in [`example_workflows/`](./example_workflows/) — drag any `.json` file into ComfyUI:
 
 | Workflow File | Use Case |
 | :--- | :--- |
 | **[`omni_lora_basic_workflow.json`](./example_workflows/omni_lora_basic_workflow.json)** | **Standard Folder Training (Start Here)**: Loads a folder of images + captions $\rightarrow$ Pre-caches VAE & CLIP $\rightarrow$ Trains for `1000` steps $\rightarrow$ Saves `.safetensors` + live `OmniLoRA Loss Tracker`. |
+| **[`omni_lora_image_edit_workflow.json`](./example_workflows/omni_lora_image_edit_workflow.json)** | **Image Editing / Control Folder Training**: Pairs target images (`dataset_path`) with source/control images (`control_path`) for any ComfyUI edit model (`reference_latents`, `concat_latent_image` / `image_cond`, and VLM vision-language text encoders). |
 | **[`omni_lora_staged_eval_workflow.json`](./example_workflows/omni_lora_staged_eval_workflow.json)** | **Staged Training + Mid-Run KSampler Preview**: Runs `Trainer 1 (500 steps)` $\rightarrow$ renders a test image with `KSampler` $\rightarrow$ continues into `Trainer 2 (steps 501–1000)` $\rightarrow$ `Save LoRA`. |
 | **[`omni_lora_masked_in_graph_workflow.json`](./example_workflows/omni_lora_masked_in_graph_workflow.json)** | **No-Folder Canvas Training (`IMAGE` + `MASK`)**: Connects ComfyUI `LoadImage` nodes (`IMAGE` and alpha `MASK`) directly into `OmniLoRA Dataset & Prompt Loader` for foreground-weighted training. |
 | **[`omni_lora_resume_checkpoint_workflow.json`](./example_workflows/omni_lora_resume_checkpoint_workflow.json)** | **Resume an Existing LoRA + Periodic Checkpoints**: Loads a saved `.safetensors` file via `OmniLoRA Load LoRA Network`, continues training with `grad_accum_steps=2`, and saves checkpoints every 100 steps. |
@@ -108,15 +109,18 @@ Loads training images and captions from a folder on disk, direct ComfyUI `IMAGE`
   - `center_crop = True`: Scales uniformly to cover the bucket and center-crops.
   - `center_crop = False`: Scales uniformly to fit inside the bucket, pads borders with neutral `0.5` gray, and automatically zeroes out loss on the padded border bars.
 - **Alpha & mask loss weighting (`use_alpha_mask = True`, `mask_unmasked_weight = 0.1`)**: Extracts foreground masks from connected `MASK` inputs, `<stem>.mask.<ext>` / `<stem>_mask.<ext>` sidecar files, a `masks/<stem>.<ext>` subfolder, or RGBA transparency channels (compositing RGB over neutral `0.5` gray before VAE encoding so transparent pixels never bleed dirty RGB halo artifacts into latents).
+- **Lazy header-only folder indexing**: Folder-based datasets read only lightweight image headers (dimensions, EXIF orientation, masks, and control pairing) at load time — zero full pixel buffers are held in CPU RAM until streamed one pair at a time during pre-caching.
+- **Control / source image folder (`control_path`, `control_resize_mode`, `control_images`)**: Point `control_path` to a folder of paired source/before images (matched 1-to-1 with targets in `dataset_path` by mirrored subfolder path or filename stem across any image extension, e.g. `001.png` $\leftrightarrow$ `001.jpg`), or wire a ComfyUI `IMAGE` batch into `control_images`. Supports `"match_target"` (exact target bucket framing) and `"preserve_aspect"` (independent control aspect ratio), plus mixed controlled/uncontrolled datasets.
 
 ### Node 2: `OmniLoRA VAE & CLIP Pre-Cache` (`OmniLoRAPrecomputeConditioning`)
 Encodes all dataset images with the connected `VAE` and all captions with the connected `CLIP` / text encoder.
-- **Sequential low-VRAM staging**: Encodes images one sample at a time through the `VAE`, immediately unloads the `VAE` from VRAM, then encodes deduplicated text prompts through `CLIP`, and finally unloads `CLIP` to CPU RAM (`offload_encoders_after_cache = True`).
-- **Dynamic per-step augmentations**: Pre-encodes horizontally flipped latents (`latents_flipped`) when `random_flip = True` and pre-encodes the unconditional empty prompt `""` once so `OmniLoRA Universal Trainer` can apply `random_flip` and CFG `caption_dropout` dynamically on every training step with zero encoder overhead.
+- **Sequential low-VRAM & `O(1)` host-RAM streaming**: Streams one image pair at a time from disk through the `VAE` (downsampling spatial masks to latent resolution immediately), immediately unloads the `VAE` from VRAM, then encodes deduplicated text prompts (and on-demand VLM control thumbnails when applicable) through `CLIP`, and finally unloads `CLIP` to CPU RAM (`offload_encoders_after_cache = True`).
+- **Dynamic per-step augmentations**: Pre-encodes horizontally flipped latents (`latents_flipped`, plus `control_latents_flipped` and flipped VLM prompt embeddings when control images are present) when `random_flip = True` and pre-encodes the unconditional empty prompt `""` once so `OmniLoRA Universal Trainer` can apply `random_flip` and CFG `caption_dropout` dynamically on every training step with zero encoder overhead.
+- **Control & VLM vision conditioning (`pass_control_to_clip`, `clip_vision_resolution`, `clip_prompt_template`)**: Caches raw unscaled VAE control latents (matching ComfyUI's native `ReferenceLatent` / `InstructPixToPixConditioning` nodes) and automatically detects VLM text encoders whose `clip.tokenize` accepts `images=[...]` (resizing control images to `clip_vision_resolution`, default `384`). Leave `clip_prompt_template` empty to use captions and ComfyUI's native tokenizer template as-is, or supply a custom `{prompt}` / `{}` template.
 - **Multi-modal & variable-length conditioning**: Preserves full ComfyUI conditioning dictionaries (`pooled_output`, `attention_mask`, `txt_mask`, `context_attention_bias`, `clip_l`, `guidance`, `ref_latents`, etc.), downsamples spatial `loss_mask` tensors to latent resolution, and expands `num_repeats` in CPU RAM without re-encoding.
 
 ### Node 3: `OmniLoRA Universal Trainer` (`OmniLoRATrainer`)
-Injects trainable LoRA layers into the connected `MODEL`, executes the training loop outside `torch.inference_mode()`, and returns:
+Injects trainable LoRA layers into the connected `MODEL`, executes the training loop outside `torch.inference_mode()` with scoped PyTorch op wrappers (restored cleanly upon exit so subsequent ComfyUI inference and `torch.compile` run with zero wrapper overhead), and returns:
 - **`model` (`MODEL`)**: A cloned ComfyUI `ModelPatcher` with the trained LoRA patches attached, ready to connect directly to `KSampler` or to a downstream `OmniLoRA Universal Trainer` node.
 - **`lora` (`OMNILORA_NETWORK`)**: Portable in-memory LoRA bundle containing the trained `diffusion_model.*` state dict and metadata (`rank`, `alpha`, `steps_trained`, `model_architecture`, `trigger_word`).
 - **`training_summary` (`STRING`)**: JSON report of resolved architecture, VRAM ledger breakdown, step timing, checkpoint paths, and loss metrics.
@@ -146,6 +150,9 @@ Injects trainable LoRA layers into the connected `MODEL`, executes the training 
 | `enable_target_module_filter` + `target_module_filter` | `False` / `""` | When enabled, restricts LoRA injection to comma-separated module path substrings (e.g. `"double_blocks"`, `"single_blocks"`, `"text_embedder.blocks"`, `"layers"`). |
 | `min_timestep` / `max_timestep` | `0.0` / `1.0` | Active normalized noise interval ($t \in [0, 1]$) for training split-schedule or High-Noise / Low-Noise expert models. |
 | `min_snr_gamma` | `0.0` | Min-SNR-$\gamma$ loss weighting (`0.0` = disabled; `5.0` optional for style training). |
+| `control_mode` | `"auto"` | Routes paired control latents via live ComfyUI model introspection: `"reference_latents"` (token-concatenated edit DiTs) or `"concat_latent_image"` (channel-concatenated / `image_cond` edit models). |
+| `reference_latents_method` | `"auto"` | Optional positional-encoding method for `reference_latents` models (`"auto"`, `"offset"`, `"index"`, `"index_timestep_zero"`, `"uxo"`). `"auto"` defers to ComfyUI's native model default (`"index_timestep_zero"` is for global-modulation DiTs such as Flux 2). |
+| `control_dropout` | `0.0` | Per-sample probability (`0.0 – 1.0`) of dropping the control image for CFG / unconditional fallback without leaking the clean target image. |
 
 ### Node 4: `OmniLoRA Load LoRA Network` (`OmniLoRALoader`)
 Loads an existing `.safetensors` or `.pt` LoRA file from `ComfyUI/models/loras/` (or `custom_lora_path`), inspects its tensors and metadata to detect `rank`, `alpha`, `use_rslora`, and `steps_trained`, and outputs an `OMNILORA_NETWORK` bundle for resuming training via `initial_lora`.
@@ -179,19 +186,26 @@ When `Trainer 2` receives a `MODEL` output from `Trainer 1` (even without `initi
 - **Sub-networks inside a single checkpoint** (e.g., MOSS-Image `text_embedder.blocks` + `layers`, or Flux / FIBO / HiDream `double_blocks` + `single_blocks`): Enable `enable_target_module_filter = True` on two chained `OmniLoRA Universal Trainer` nodes to give each sub-network its own learning rate or timestep range, and wire `Trainer 1 (lora) -> Trainer 2 (initial_lora)` to merge both into a single `.safetensors` file.
 - **Separate High-Noise & Low-Noise checkpoints** (e.g., Wan 2.2 high/low noise experts): Share one `OmniLoRA VAE & CLIP Pre-Cache` node across two `OmniLoRA Universal Trainer` nodes and set `min_timestep=0.5, max_timestep=1.0` on the High-Noise trainer and `min_timestep=0.0, max_timestep=0.5` on the Low-Noise trainer.
 
+### 3. Image Editing / Control Folder Training
+Train instruction-based or paired image-to-image editing LoRAs on **any** ComfyUI edit architecture — including token-concatenated `reference_latents` DiTs (**Flux.1 Kontext**, **Flux 2 / 3 Klein**, **Qwen-Image-Edit 1.0 / 2.1**, **OmniGen2**, **Boogu**, **MOSS-Image**, **FIBO 2.0**, **Krea 2**, **JoyImage**, **Mage-Flow**) and channel-concatenated / `image_cond` models (**HiDream-E1**, **SD1.5 / SDXL InstructPix2Pix**, **Flux Fill / Control**, **Wan I2V**) — without hardcoding model-specific prompts or checklists:
+1. **Prepare two paired folders**: Put edited **target ("after")** images and `.txt` edit instructions in `dataset_path`, and put matching **control ("before")** images in `control_path` with matching filename stems (any extension, e.g. `001.png` $\leftrightarrow$ `001.jpg`, or mirrored subfolders `sub/002.png` $\leftrightarrow$ `sub/002.webp`). `control_resize_mode = "preserve_aspect"` preserves native control aspect ratios on `reference_latents` DiTs and automatically aligns spatial dimensions on `concat_latent_image` models.
+2. **Pre-cache (`OmniLoRAPrecomputeConditioning`)**: Target and control images are encoded sequentially through the `VAE` (target scaled, control kept raw unscaled for ComfyUI's native `extra_conds`). If your connected `CLIP` is a VLM text encoder (such as Qwen-VL, Mistral/Flux 2, Boogu, or OmniGen2), `pass_control_to_clip = "auto"` automatically passes the resized control image (`clip_vision_resolution = 384`) into `clip.tokenize(..., images=[...])` — and synchronizes horizontal flips across target latent, control latent, and VLM tokens when `random_flip = True`.
+3. **Train (`OmniLoRATrainer`)**: Leave `control_mode = "auto"` and `reference_latents_method = "auto"` to defer to ComfyUI's native model structure (or override explicitly at any time), and optionally enable `control_dropout` (e.g. `0.05–0.10`) for stronger CFG behavior. The deterministic VRAM ledger automatically accounts for doubled visual sequence length on `reference_latents` DiTs.
+4. **Template**: Start immediately with [`example_workflows/omni_lora_image_edit_workflow.json`](./example_workflows/omni_lora_image_edit_workflow.json).
+
 ---
 
 ## Supported Model Architectures
 
 Because `ComfyModelAdapter` routes forward passes through ComfyUI's own `BaseModel._apply_model`, `model_sampling`, `latent_format`, and `extra_conds`, any checkpoint or GGUF/FP8 model supported by ComfyUI works with `model_architecture="auto"`.
 
-The standalone verification suite (`python -m omni_lora.tests.test_framework --cloud-verify`) tests **50 `comfy.ldm.*` architectures** (**21 core baseline architectures** in `ComfyModelZoo` + **29 extended architectures** in `ExtendedComfyLdmZoo`):
+The unmocked real-forward verification suite (`python -m omni_lora.tests.test_framework --cloud-verify`) tests **44 real `comfy.ldm.*` + `comfy.model_base.*` Image & Video architectures** directly on your active hardware backend alongside a 7-invariant FP32 + BF16 contract suite and a **14-architecture FP32 + BF16 unmocked image-editing suite** (layer targeting, zero dead layers, gradient-checkpointing parity, `batch_size > 1`, `preserve_aspect` control framing, ComfyUI `ModelPatcher` / `LoraLoader` parity, and clean base-weight restoration):
 
 | Family | Verified Architectures & Capabilities |
 | :--- | :--- |
-| **Flux & Rectified Flow MMDiTs** | **Flux.1 Dev/Schnell** (`flux_dev`), **Flux 2 / 3 Klein** (`flux3_klein` with flow-map `sample_sigmas` lookahead), **Chroma** (`chroma` with `distilled_guidance_layer`), **Chroma Radiance**, **Bria FIBO 2.0** (`fibo2` 32ch Flux.2 VAE + Qwen3-VL Perceiver blocks), **SD 3 / SD 3.5** (`sd3_5` `MMDiT` `joint_blocks`). |
-| **Multimodal, LLM-Conditioned & MoE DiTs** | **Qwen-Image 1.0 & 2.1** (`qwen_image_1_0` 16ch / `qwen_image_2_1` 64ch + `llm_cond_norm` + `ref_latents`), **MOSS-Image** (`moss_image` dual `text_embedder.blocks` + `layers`), **OmniGen2** (`omnigen2` `noise_refiner` + `context_refiner`), **HiDream-I1 & HiDream-O1** (`hidream_i1` 17B Sparse-MoE MMDiT with router-gate exclusion), **Ernie-Image**, **Krea 2**, **Ideogram v4**, **JoyImage**, **Mage-Flow**, **Boogu**, **Anima**, **PixelDiT**, **Lens**. |
-| **Video & Spatiotemporal 5D DiTs** | **Wan 2.1 T2V** (`wan_2_1_t2v` 16ch 5D), **Wan 2.1 I2V** (`wan_2_1_i2v` 36ch `c_concat`), **Wan 2.2 TI2V** (`wan_2_2_ti2v` 48ch 3D VAE), **Wan VACE / Animate / Camera / WanDancer**, **HunyuanVideo** (`hunyuan_video`), **LTX-Video & LTX-AV** (`ltx_video`, `ltxav_video` 128ch audio-video DiT), **NVIDIA Cosmos Predict2** (`cosmos_predict2`), **Genmo Mochi**, **CogVideoX**, **MiniMax Video**, **Kandinsky 5**, **SeedVR2**. |
+| **Flux & Rectified Flow MMDiTs** | **Flux.1 Dev/Schnell/Kontext** (`flux_dev`), **Flux 2** (`flux2` 128ch), **Flux 3 Klein** (`flux3_klein` with flow-map `sample_sigmas` lookahead), **Chroma** (`chroma` with `distilled_guidance_layer`), **Chroma Radiance**, **Bria FIBO 2.0** (`fibo2` 32ch Flux.2 VAE + Qwen3-VL Perceiver blocks), **SD 3 / SD 3.5** (`sd3_5` `MMDiT` `joint_blocks`). |
+| **Multimodal, LLM-Conditioned & MoE DiTs** | **Qwen-Image 1.0 & 2.1** (`qwen_image_1_0` 16ch / `qwen_image_2_1` 64ch + `llm_cond_norm` + `ref_latents`), **MOSS-Image** (`moss_image` dual `text_embedder.blocks` + `layers`), **OmniGen2** (`omnigen2` `noise_refiner` + `context_refiner`), **HiDream-I1 / E1 / O1** (`hidream_i1` 17B Sparse-MoE MMDiT with router-gate exclusion), **MiniMax H3 Image**, **Ernie-Image**, **Krea 2**, **Ideogram v4**, **JoyImage**, **Mage-Flow**, **Boogu**, **Anima**, **PixelDiT**, **Lens**. |
+| **Video & Spatiotemporal 5D DiTs** | **Wan 2.1 T2V** (`wan_2_1_t2v` 16ch 5D), **Wan 2.1 I2V** (`wan_2_1_i2v` 36ch `c_concat`), **Wan 2.2 TI2V** (`wan_2_2_ti2v` 48ch 3D VAE), **Wan VACE / Animate / Camera / WanDancer**, **HunyuanVideo** (`hunyuan_video`), **LTX-Video & LTX-AV 2.0 / 2.5** (`ltxv`, `ltxav_2_0`, `ltxav_2_5` 128ch audio-video DiT), **NVIDIA Cosmos Predict2** (`cosmos_predict2`), **Genmo Mochi**, **CogVideoX**, **MiniMax H3 Video**, **Kandinsky 5**, **SeedVR2**. |
 | **NextDiT, DC-AE & Linear DiTs** | **Lumina-Image 2.0 / Z-Image** (`lumina2_z_image` NextDiT SwiGLU), **AuraFlow / Sana** (`auraflow_sana` 32ch DC-AE), **PixArt-$\alpha$/$\Sigma$**, **HunyuanDiT**. |
 | **UNet & Audio / 3D Diffusion** | **SDXL** (`sdxl_base` with 2816-dim sinusoidal ADM synthesis), **SD 1.5 / SD 2.x** (`sd15` with chunked outer attention + optional LoCon convolutions), **Stable Cascade**, **ACE-Step 1.5 / Stable Audio / YuE2 / MiniMax Music**, **Hunyuan3D 2.1 / Trellis2 / TripoSplat**. |
 
@@ -248,20 +262,20 @@ Instead of relying on static percentage heuristics, `enforce_vram_budget` inspec
 
 ---
 
-## Running the Standalone Test & Verification Suite
+## Running the Unmocked Real-Forward Test & Verification Suite
 
-You can run the full offline unit test and 50-architecture verification suite from the repository root without starting the ComfyUI server:
+You can run the full unit, autograd-fidelity, and 44-architecture unmocked ComfyUI verification suite from the repository root without starting the ComfyUI server:
 
 ```bash
-# Run core unit tests (dataset loader, inference_mode escape, LoRA injection, 50 LDM architectures)
+# Run all unit tests + 7-invariant unmocked real-forward contract suites (44 architectures)
 python -m omni_lora.tests.test_framework
 
-# Run the 21-architecture ComfyModelZoo convergence & VRAM ledger benchmark
+# Run the live active-backend (CUDA / XPU / ROCm / MPS / CPU) 44-architecture sweep + full test suite
 python -m omni_lora.tests.test_framework --cloud-verify
 ```
 
 ---
 
-## 📄 License
+## License
 
 [Apache-2.0](./LICENSE)

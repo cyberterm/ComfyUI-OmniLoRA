@@ -1113,9 +1113,29 @@ def classify_block_structural_roles(model: nn.Module) -> Dict[str, str]:
         or 1x1 Conv2d) that adapt between outer feature maps and inner sequence tokens.
       - `"moe_router"`: MoE router gates (`ff_i.gate`, `moe.gate`) that are leaf `Linear` siblings
         of an `nn.ModuleList` of composite expert blocks (`experts`) projecting `D -> num_experts`.
+      - `"unused_auxiliary"`: Dead auxiliary projections inside a block that are never invoked by
+        dense forward passes (e.g. MiniMax H3 `Attention.to_gate_compress`).
+      - `"unused_secondary_modality"`: Secondary audio branches inside dual-branch audio-video
+        transformer blocks (e.g. LTXAV `audio_attn1`, `audio_attn2`, `audio_to_video_attn`,
+        `video_to_audio_attn`, `audio_ff`) and paired top-level `audio_*` repeating connectors
+        (e.g. `audio_embeddings_connector` paired with `video_embeddings_connector`) that receive
+        zero gradients during image/video-only training. Audio-only models (no paired visual branch)
+        and shared single-stream AV models (e.g. MiniMax H3) are never affected.
       - `"attention"`: Multi-linear self/cross/joint attention projections (`q/k/v/qkv/out`).
       - `"ffn"`: Multi-linear feed-forward / SwiGLU / GeGLU / MoE expert projections (`up/gate/down`).
     """
+    def _is_secondary_audio_attr(attr_name: str) -> bool:
+        low = attr_name.lower()
+        return (
+            low.startswith("audio_")
+            or low.endswith("_audio")
+            or "audio_to_video" in low
+            or "video_to_audio" in low
+            or "_audio_attn" in low
+            or "_audio_ff" in low
+            or "_audio_mlp" in low
+        )
+
     module_to_path: Dict[int, str] = {}
     all_linear_paths: Dict[str, nn.Module] = {}
     for full_name, sub in _iter_named_modules_skipping_lora(model):
@@ -1158,6 +1178,7 @@ def classify_block_structural_roles(model: nn.Module) -> Dict[str, str]:
 
     # 2. Inspect repeating block structures for AdaLN modulation vs Attention vs FFN
     visited_blocks: set[int] = set()
+    has_dual_branch_av_blocks = False
     for name, sub in _iter_named_modules_skipping_lora(model):
         if not name:
             continue
@@ -1193,6 +1214,7 @@ def classify_block_structural_roles(model: nn.Module) -> Dict[str, str]:
                     continue
 
                 direct_leaf_linears: List[nn.Module] = []
+                direct_leaf_linear_attrs: Dict[int, str] = {}
                 direct_leaf_pointwise_convs: List[nn.Module] = []
                 composite_branches: List[Tuple[str, nn.Module, List[Tuple[str, nn.Module]]]] = []
                 has_nested_block_list = False
@@ -1200,6 +1222,7 @@ def classify_block_structural_roles(model: nn.Module) -> Dict[str, str]:
                     base_child = _unwrap_lora_base(child_mod)
                     if _is_linear_like(base_child):
                         direct_leaf_linears.append(base_child)
+                        direct_leaf_linear_attrs[id(base_child)] = child_attr
                     elif _is_pointwise_conv(base_child):
                         direct_leaf_pointwise_convs.append(base_child)
                     elif isinstance(child_mod, nn.ModuleList) and any(
@@ -1257,8 +1280,39 @@ def classify_block_structural_roles(model: nn.Module) -> Dict[str, str]:
                                 if p:
                                     roles[p] = "modulation"
 
+                # Detect dual-branch audio-video blocks (e.g. LTXAV `BasicAVTransformerBlock`) that
+                # contain BOTH primary visual attention/FFN branches AND dedicated secondary audio /
+                # cross-modal-audio branches (`audio_attn1`, `audio_attn2`, `audio_to_video_attn`,
+                # `video_to_audio_attn`, `audio_ff`). Audio-only backbones (no paired visual branch)
+                # and shared single-stream AV backbones (e.g. MiniMax H3) never satisfy this predicate.
+                audio_branch_attrs = {
+                    child_attr
+                    for child_attr, _, _ in composite_branches
+                    if _is_secondary_audio_attr(child_attr)
+                }
+                has_primary_non_audio_compute = any(
+                    (not _is_secondary_audio_attr(child_attr))
+                    and (len(c_leaves) >= 2 or _has_attention_attributes(child_mod))
+                    for child_attr, child_mod, c_leaves in composite_branches
+                )
+                is_dual_branch_av_block = bool(audio_branch_attrs) and has_primary_non_audio_compute
+                if is_dual_branch_av_block:
+                    has_dual_branch_av_blocks = True
+                    for lin in direct_leaf_linears:
+                        d_attr = direct_leaf_linear_attrs.get(id(lin), "")
+                        if d_attr and _is_secondary_audio_attr(d_attr):
+                            p = module_to_path.get(id(lin))
+                            if p:
+                                roles[p] = "unused_secondary_modality"
+
                 # Analyze composite child sub-branches on the block
                 for child_attr, child_mod, c_leaves in composite_branches:
+                    if is_dual_branch_av_block and child_attr in audio_branch_attrs:
+                        for _, lin in c_leaves:
+                            p = module_to_path.get(id(lin))
+                            if p:
+                                roles[p] = "unused_secondary_modality"
+                        continue
                     is_mod_branch = False
                     if len(c_leaves) == 1 and not _has_attention_attributes(child_mod):
                         only_lin = c_leaves[0][1]
@@ -1286,10 +1340,42 @@ def classify_block_structural_roles(model: nn.Module) -> Dict[str, str]:
                             tok in child_attr.lower() for tok in ("attn", "attention")
                         )
                         branch_role = "attention" if is_attn else "ffn"
-                        for _, lin in c_leaves:
+                        is_minimax_attn = is_attn and getattr(child_mod.__class__, "__module__", "").startswith(
+                            "comfy.ldm.minimax."
+                        )
+                        for leaf_attr, lin in c_leaves:
                             p = module_to_path.get(id(lin))
-                            if p and roles.get(p) == "attention_or_ffn":
+                            if not p:
+                                continue
+                            # MiniMax H3 / H3-Image `Attention.to_gate_compress` is a VSA sparse-attention
+                            # gate never called by dense `Attention.forward`; exclude it so training never
+                            # allocates dead zero-gradient LoRA adapters.
+                            if is_minimax_attn and (
+                                leaf_attr == "to_gate_compress" or p.endswith(".to_gate_compress")
+                            ):
+                                roles[p] = "unused_auxiliary"
+                            elif roles.get(p) == "attention_or_ffn":
                                 roles[p] = branch_role
+
+    # 3. Exclude paired top-level secondary `audio_*` repeating towers/connectors (e.g. LTXAV
+    # `audio_embeddings_connector` paired with `video_embeddings_connector`) while leaving
+    # audio-only models (which have no paired `video_*`/`image_*` counterpart) completely untouched.
+    top_child_names = {child_name for child_name, _ in model.named_children()}
+    paired_audio_prefixes = {
+        attr
+        for attr in top_child_names
+        if attr.lower().startswith("audio_")
+        and (
+            ("video_" + attr[6:]) in top_child_names
+            or ("image_" + attr[6:]) in top_child_names
+            or (has_dual_branch_av_blocks and "connector" in attr.lower())
+        )
+    }
+    if paired_audio_prefixes:
+        for p in list(roles.keys()):
+            top_seg = p.split(".", 1)[0]
+            if top_seg in paired_audio_prefixes and roles.get(p) != "stem_or_head":
+                roles[p] = "unused_secondary_modality"
 
     for k in list(roles.keys()):
         if ".modCX." in k:
@@ -1300,7 +1386,14 @@ def classify_block_structural_roles(model: nn.Module) -> Dict[str, str]:
     # ensure corresponding modules across all repeating blocks of the same container inherit that role.
     canonical_non_target_roles: Dict[str, str] = {}
     for p, r in roles.items():
-        if r in ("modulation", "stem_or_head", "moe_router", "block_projection"):
+        if r in (
+            "modulation",
+            "stem_or_head",
+            "moe_router",
+            "block_projection",
+            "unused_auxiliary",
+            "unused_secondary_modality",
+        ):
             canonical_non_target_roles[_strip_numeric_segments(p)] = r
 
     for p in list(roles.keys()):
@@ -1357,7 +1450,13 @@ def trace_single_block_dataflow(
         has_sequence_tokens = any(in_ndim >= 3 for in_ndim, _ in observed_ranks.values())
         if has_sequence_tokens:
             for path, (in_ndim, out_ndim) in observed_ranks.items():
-                if in_ndim == 2 and out_ndim == 2 and roles.get(path) not in ("stem_or_head", "moe_router", "block_projection"):
+                if in_ndim == 2 and out_ndim == 2 and roles.get(path) not in (
+                    "stem_or_head",
+                    "moe_router",
+                    "block_projection",
+                    "unused_auxiliary",
+                    "unused_secondary_modality",
+                ):
                     roles[path] = "modulation"
 
     try:
@@ -1667,7 +1766,13 @@ class LoRAInjector:
         for mod_path, role in roles.items():
             if mod_path in injected_set or mod_path not in name_map:
                 continue
-            if role in ("stem_or_head", "modulation", "moe_router"):
+            if role in (
+                "stem_or_head",
+                "modulation",
+                "moe_router",
+                "unused_auxiliary",
+                "unused_secondary_modality",
+            ):
                 collapsed = _collapse_numeric_segments(mod_path.replace("__", ".")) or mod_path
                 excluded_totals[role] = excluded_totals.get(role, 0) + 1
                 ebucket = excluded_counts.setdefault(role, {})
@@ -1688,7 +1793,13 @@ class LoRAInjector:
 
         if excluded_totals:
             excl_parts: List[str] = []
-            for r in ("stem_or_head", "modulation", "moe_router"):
+            for r in (
+                "stem_or_head",
+                "modulation",
+                "moe_router",
+                "unused_auxiliary",
+                "unused_secondary_modality",
+            ):
                 if r not in excluded_totals:
                     continue
                 top_pats = sorted(excluded_counts[r].items(), key=lambda kv: (-kv[1], kv[0]))
@@ -1972,6 +2083,8 @@ class LoRAInjector:
         """
         Query ComfyUI's native `comfy.lora.model_lora_keys_unet` for `comfy_model` (while
         uninjected) and cache the resulting `key_map` on `backbone._omni_native_lora_key_map`.
+        If called after `LoRAInjector.inject(...)` has already wrapped layers with `.base_layer`,
+        automatically normalizes `.base_layer` out of key names and weight targets.
         """
         cached = getattr(backbone, "_omni_native_lora_key_map", None)
         if isinstance(cached, dict) and cached:
@@ -1980,6 +2093,8 @@ class LoRAInjector:
         target_obj = getattr(comfy_model, "model", comfy_model) if comfy_model is not None else None
         if target_obj is None:
             return None
+
+        has_injected = any(isinstance(m, LoRALinear) for m in backbone.modules())
 
         try:
             import comfy.lora  # type: ignore
@@ -1992,8 +2107,29 @@ class LoRAInjector:
             if callable(orig_fn):
                 raw_map = dict(orig_fn(target_obj, {}))
                 if raw_map:
-                    setattr(backbone, "_omni_native_lora_key_map", raw_map)
-                    return raw_map
+                    if has_injected:
+                        clean_map: Dict[str, Any] = {}
+                        for k, v in raw_map.items():
+                            if ".lora_A" in k or ".lora_B" in k or "_lora_A" in k or "_lora_B" in k:
+                                continue
+                            ck = k.replace(".base_layer.", ".")
+                            if ck.endswith(".base_layer"):
+                                ck = ck[: -len(".base_layer")]
+                            if isinstance(v, str):
+                                if ".lora_A." in v or ".lora_B." in v:
+                                    continue
+                                cv: Any = v.replace(".base_layer.weight", ".weight").replace(".base_layer.", ".")
+                            elif isinstance(v, tuple) and len(v) >= 2 and isinstance(v[0], str):
+                                if ".lora_A." in v[0] or ".lora_B." in v[0]:
+                                    continue
+                                cv = (v[0].replace(".base_layer.weight", ".weight").replace(".base_layer.", "."),) + v[1:]
+                            else:
+                                cv = v
+                            clean_map[ck] = cv
+                        raw_map = clean_map
+                    if raw_map:
+                        setattr(backbone, "_omni_native_lora_key_map", raw_map)
+                        return raw_map
         except Exception:
             pass
         return None

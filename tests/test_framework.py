@@ -7,6 +7,7 @@ import copy
 import json
 import math
 import tempfile
+import types
 import unittest
 from enum import Enum
 from pathlib import Path
@@ -524,6 +525,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
         expected_workflows = (
             "omni_lora_basic_workflow.json",
             "omni_lora_dual_network_workflow.json",
+            "omni_lora_image_edit_workflow.json",
             "omni_lora_masked_in_graph_workflow.json",
             "omni_lora_resume_checkpoint_workflow.json",
             "omni_lora_staged_eval_workflow.json",
@@ -531,7 +533,11 @@ class TestOmniLoRAFramework(unittest.TestCase):
         # Verify alphabetical sorting places omni_lora_basic_workflow.json first
         actual_sorted = tuple(sorted(p.name for p in wf_dir.glob("*.json")))
         self.assertEqual(actual_sorted[0], "omni_lora_basic_workflow.json")
-        self.assertNotIn("optional", OmniLoRAPrecomputeConditioning.INPUT_TYPES())
+        pre_in_types = OmniLoRAPrecomputeConditioning.INPUT_TYPES()
+        self.assertNotIn("model", pre_in_types.get("required", {}))
+        self.assertNotIn("model", pre_in_types.get("optional", {}))
+        for opt_k in ("pass_control_to_clip", "clip_vision_resolution", "clip_prompt_template"):
+            self.assertIn(opt_k, pre_in_types.get("optional", {}))
 
         # Verify every INT and FLOAT widget across all nodes has (default - min) and (max - min) aligned to `step`
         # so ComfyUI's frontend never snaps values like 1000 to 1001 (`min + k * step`).
@@ -567,16 +573,29 @@ class TestOmniLoRAFramework(unittest.TestCase):
                     for out_slot, expected_type in zip(node["outputs"], cls.RETURN_TYPES):
                         self.assertEqual(out_slot["type"], expected_type)
 
+                    if ntype == "OmniLoRADatasetLoader":
+                        if wf_name == "omni_lora_image_edit_workflow.json":
+                            self.assertEqual(len(node["widgets_values"]), 15, f"Expected 15 widgets on OmniLoRADatasetLoader in {wf_name}")
+                        else:
+                            self.assertIn(len(node["widgets_values"]), (13, 15), f"Unexpected widget count on OmniLoRADatasetLoader in {wf_name}")
+
                     if ntype == "OmniLoRAPrecomputeConditioning":
                         input_names = [inp["name"] for inp in node.get("inputs", [])]
                         self.assertNotIn("model", input_names, f"OmniLoRAPrecomputeConditioning should not have a 'model' plug in {wf_name}")
+                        if wf_name == "omni_lora_image_edit_workflow.json":
+                            self.assertEqual(len(node["widgets_values"]), 4, f"Expected 4 widgets on OmniLoRAPrecomputeConditioning in {wf_name}")
+                        else:
+                            self.assertIn(len(node["widgets_values"]), (1, 4), f"Unexpected widget count on OmniLoRAPrecomputeConditioning in {wf_name}")
 
                     if ntype == "OmniLoRATrainer":
                         self.assertEqual(node["inputs"][0]["name"], "model")
                         self.assertEqual(node["inputs"][0]["type"], "MODEL")
                         self.assertEqual(node["inputs"][1]["name"], "cached_data")
                         self.assertEqual(node["inputs"][1]["type"], "OMNILORA_CACHED_DATA")
-                        self.assertEqual(len(node["widgets_values"]), 28, f"Expected 28 widgets on OmniLoRATrainer in {wf_name}")
+                        if wf_name == "omni_lora_image_edit_workflow.json":
+                            self.assertEqual(len(node["widgets_values"]), 31, f"Expected 31 widgets on OmniLoRATrainer in {wf_name}")
+                        else:
+                            self.assertIn(len(node["widgets_values"]), (28, 31), f"Unexpected widget count on OmniLoRATrainer in {wf_name}")
 
     def test_comfy_moss_image_lora_keys_and_uninject(self) -> None:
         """
@@ -1785,201 +1804,6 @@ class TestOmniLoRAFramework(unittest.TestCase):
             self.assertTrue(math.isfinite(float(loss_left.item())))
         finally:
             adapter._forward_backbone = orig_fwd  # type: ignore[method-assign]
-
-    def test_emulated_comfy_14_model_zoo_end_to_end_training_and_ksampler(self) -> None:
-        """
-        Comprehensive 20-architecture end-to-end test inside `EmulatedComfyEnvironment` and
-        `torch.inference_mode()` (replicating ComfyUI's execution engine without installing ComfyUI):
-        - Tests all 20 architectures in `ComfyModelZoo` (including `fibo2`, `hidream_i1`, `chroma`,
-          `wan_2_2_ti2v`, `omnigen2`, `cosmos_predict2`, `flux_dev`, `flux3_klein`, `moss_image`,
-          `qwen_image_1_0`, `qwen_image_2_1`, `sdxl_base`, `sd15`, `sd3_5`, `wan_2_1_t2v`,
-          `wan_2_1_i2v`, `hunyuan_video`, `ltx_video`, `lumina2_z_image`, and `auraflow_sana`).
-        - For every architecture, verifies:
-          * Architecture & objective auto-detection
-          * `OmniLoRADatasetLoader` -> `OmniLoRAPrecomputeConditioning` -> `OmniLoRATrainer`
-          * `OmniLoRASave` -> `OmniLoRALoader` -> `comfy.sd.load_lora_for_models` (0 unloaded keys!)
-          * `EmulatedKSampler.sample` before training, immediately after training (clean uninject),
-            and with the trained LoRA patched onto `ModelPatcher` via ComfyUI's native `LoraLoader`!
-        """
-        from omni_lora.lora import LoRALinear
-        from omni_lora.tests.comfy_emulator import (
-            ComfyModelZoo,
-            EmulatedComfyEnvironment,
-            EmulatedKSampler,
-        )
-
-        active_plan = detect_and_configure(preferred_backend="auto", requested_dtype="auto", allow_fallback=True)
-        active_dev = active_plan.backend.get_device()
-        model_dtype = torch.bfloat16 if active_plan.backend.get_capabilities().supports_bf16 else torch.float16
-
-        with EmulatedComfyEnvironment(torch_device=active_dev, simulated_vram_mb=16384.0) as env:
-            import comfy.sd  # type: ignore
-
-            self.assertEqual(len(ComfyModelZoo.ARCH_IDS), 21)
-
-            dataset_node = OmniLoRADatasetLoader()
-            precache_node = OmniLoRAPrecomputeConditioning()
-            trainer_node = OmniLoRATrainer()
-            save_node = OmniLoRASave()
-            loader_node = OmniLoRALoader()
-
-            # Build a 2-image RGBA dataset (with alpha mask + aspect ratio bucketing + flip + dropout)
-            rgba_images = torch.rand(2, 64, 64, 4, dtype=torch.float32)
-            rgba_images[:, :, :32, 3] = 1.0
-            rgba_images[:, :, 32:, 3] = 0.2
-
-            with torch.inference_mode():
-                dataset, _ = dataset_node.load_dataset(
-                    dataset_path="",
-                    trigger_word="ohwx_zoo",
-                    default_caption="detailed subject",
-                    resolution=64,
-                    batch_size=1,
-                    num_repeats=1,
-                    center_crop=True,
-                    aspect_ratio_bucketing=True,
-                    random_flip=True,
-                    caption_dropout=0.25,
-                    images=rgba_images,
-                    custom_prompts="first training prompt with long description\nsecond short prompt",
-                    use_alpha_mask=True,
-                    mask_unmasked_weight=0.1,
-                )
-
-                for arch_id in ComfyModelZoo.ARCH_IDS:
-                    with self.subTest(architecture=arch_id):
-                        entry = ComfyModelZoo.build(arch_id, dtype=model_dtype)
-                        env.unloaded_lora_keys.clear()
-                        adapter = resolve_model_adapter("auto", comfy_model=entry.patcher)
-                        self.assertEqual(adapter.spec.objective_type, entry.expected_objective)
-                        self.assertEqual(adapter.spec.latent_channels, entry.expected_latent_channels)
-                        self.assertEqual(adapter.spec.supports_video_5d, entry.is_video_5d)
-
-                        # 1. Baseline KSampler pass BEFORE training
-                        pre_sample = EmulatedKSampler.sample(
-                            entry.patcher,
-                            entry.clip,
-                            resolution=64,
-                            steps=2,
-                            seed=101,
-                            device=active_dev,
-                        )
-                        self.assertTrue(torch.isfinite(pre_sample).all(), f"{entry.arch_id} pre_sample non-finite")
-
-                        # 2. Precompute latents + text conditioning + flipped latents + uncond_prompt_embeds
-                        (cached_bundle,) = precache_node.precompute(
-                            dataset=dataset,
-                            offload_encoders_after_cache=True,
-                            vae=entry.vae,
-                            clip=entry.clip,
-                            model=entry.patcher,
-                        )
-                        self.assertGreaterEqual(cached_bundle.total_batches, 2)
-                        self.assertIsNotNone(cached_bundle.uncond_prompt_embeds)
-
-                        # 3. Train LoRA for 2 steps with gradient checkpointing, rsLoRA, LoRA+, warmup=1
-                        model_out, lora_bundle, summary_json = trainer_node.train_lora(
-                            cached_data=cached_bundle,
-                            model=entry.patcher,
-                            model_architecture="auto",
-                            backend=active_plan.backend.backend_id,
-                            vram_mode="auto",
-                            reserve_vram_gb=1.0,
-                            optimizer="adamw",
-                            rank=4,
-                            alpha=4.0,
-                            learning_rate=1e-2,
-                            lr_scheduler="cosine",
-                            warmup_steps=0,
-                            steps=2,
-                            grad_accum_steps=1,
-                            gradient_checkpointing=True,
-                            lora_dtype="bf16",
-                            lora_plus_lr_ratio=2.0,
-                            use_rslora=True,
-                            seed=42,
-                        )
-                        summary = json.loads(summary_json)
-                        self.assertTrue(summary["fp64_free_verified"])
-                        self.assertGreater(summary["injected_layers"], 0)
-                        self.assertGreater(len(lora_bundle.state_dict), 0)
-
-                        # Verify zero residual LoRALinear wrappers on diffusion_model after training
-                        dm = entry.patcher.model.diffusion_model
-                        for mod in dm.modules():
-                            self.assertNotIsInstance(mod, LoRALinear)
-
-                        # 4. Verify KSampler on clean base `entry.patcher` matches `pre_sample` (100% clean uninject)
-                        post_unpatched_sample = EmulatedKSampler.sample(
-                            entry.patcher,
-                            entry.clip,
-                            resolution=64,
-                            steps=2,
-                            seed=101,
-                            device=active_dev,
-                        )
-                        self.assertTrue(torch.isfinite(post_unpatched_sample).all())
-                        self.assertTrue(
-                            torch.allclose(pre_sample, post_unpatched_sample, atol=1e-4),
-                            f"{entry.arch_id} base model weights drifted after uninject!",
-                        )
-
-                        # 5. Save via OmniLoRASave into emulated `folder_paths` `loras` dir and reload via OmniLoRALoader
-                        _, saved_filename, saved_path = save_node.save_lora(
-                            lora=lora_bundle,
-                            output_lora_name=f"zoo_{entry.arch_id}",
-                            append_step_count=True,
-                        )
-                        reloaded_bundle, _ = loader_node.load_lora(lora_name=saved_filename)
-                        self.assertEqual(reloaded_bundle.rank, 4)
-                        self.assertAlmostEqual(reloaded_bundle.alpha, 4.0, places=4)
-
-                        # 6. Load into ComfyUI's native `comfy.sd.load_lora_for_models` and verify 0 missing keys!
-                        patched_model, _ = comfy.sd.load_lora_for_models(
-                            entry.patcher,
-                            entry.clip,
-                            reloaded_bundle.state_dict,
-                            strength_model=1.0,
-                            strength_clip=1.0,
-                        )
-                        self.assertEqual(
-                            env.unloaded_lora_keys,
-                            [],
-                            f"{entry.arch_id} had unloaded LoRA keys in ComfyUI LoraLoader: {env.unloaded_lora_keys}",
-                        )
-                        assert patched_model is not None
-                        self.assertGreater(len(patched_model.patches), 0)
-
-                        # 7. Run KSampler with the LoRA applied via ComfyUI's ModelPatcher and verify parity with `model_out`
-                        lora_sample = EmulatedKSampler.sample(
-                            patched_model,
-                            entry.clip,
-                            resolution=64,
-                            steps=2,
-                            seed=101,
-                            device=active_dev,
-                        )
-                        direct_trainer_model_sample = EmulatedKSampler.sample(
-                            model_out,
-                            entry.clip,
-                            resolution=64,
-                            steps=2,
-                            seed=101,
-                            device=active_dev,
-                        )
-                        self.assertTrue(torch.isfinite(lora_sample).all())
-                        tol = 2e-3 if model_dtype == torch.float16 else 1e-4
-                        self.assertTrue(
-                            torch.allclose(lora_sample, direct_trainer_model_sample, atol=tol),
-                            f"{entry.arch_id} OmniLoRATrainer MODEL output differed from ComfyUI LoraLoader!",
-                        )
-                        self.assertFalse(
-                            torch.allclose(pre_sample, lora_sample, atol=1e-7),
-                            f"{entry.arch_id} trained LoRA had zero effect on KSampler output",
-                        )
-                        del pre_sample, post_unpatched_sample, lora_sample, direct_trainer_model_sample
-                        del patched_model, model_out, lora_bundle, reloaded_bundle, cached_bundle, entry
-                        active_plan.backend.empty_cache()
 
     def test_directml_privateuseone_storageless_tensor_and_fp16_master_optimizer(self) -> None:
         """
@@ -4504,6 +4328,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
         finally:
             if pipe.backbone is not None:
                 LoRAInjector.uninject(pipe.backbone)
+            pipe.cleanup()
 
     def test_tracker_store_idle_recovery_and_cursors(self) -> None:
         """
@@ -5084,6 +4909,8 @@ class TestOmniLoRAFramework(unittest.TestCase):
             device=torch.device("cpu"),
             operations=ops,
         )
+        from omni_lora.tests.real_model_harness import _initialize_real_comfy_module
+        _initialize_real_comfy_module(h3_dm, seed=1234)
         h3_dm.rope.inv_freq.fill_(0.01)
 
         class DummyInnerH3:
@@ -5145,6 +4972,182 @@ class TestOmniLoRAFramework(unittest.TestCase):
         self.assertGreater(grad_count, 0)
         LoRAInjector.uninject(h3_dm)
 
+    def test_minimax_h3_image_pdd_curves_gate_compress_and_batch_gt_1(self) -> None:
+        """
+        Regression test for `MiniMaxH3ImageModel` (`MiniMax-H3-Image`):
+          1. Excludes unused VSA `blocks.*.attn.to_gate_compress` from LoRA targeting so no dead
+             zero-gradient LoRA adapters are allocated.
+          2. Supplies the exact `[1.0, ..., 0.0]` `pdd_sigmas` in `transformer_options["sample_sigmas"]`
+             and samples from `pdd_sigmas[:-1]` so `FinalLayer` selects a single PDD head interval
+             `[start, start + 1)` instead of collapsing `sigma_next` to `0.0`.
+          3. Defers `preprocess_text_embeds` out of `extra_conds` during training so `minimax_payload`
+             (`text_token_tags`, `layout`) is preserved even when `get_dtype_inference()` differs and
+             `token_refiner` runs inside `_embed_and_pack` with `transformer_options`.
+          4. Preserves FP32 precision islands (`final_layer.video_out`, `video_patch_proj`, curve-form
+             `adaln_proj.linear`) inside `enforce_vram_budget`.
+          5. Supports `batch_size > 1` via single-item microbatching with prompt-pad trimming.
+        """
+        import comfy.ops as comfy_ops  # type: ignore
+        import comfy.latent_formats as comfy_lf  # type: ignore
+        import comfy.ldm.minimax.model as mm_model  # type: ignore
+        import comfy.model_base as comfy_mb  # type: ignore
+        try:
+            import comfy.ldm.minimax.sampling as mm_sampling  # type: ignore
+        except ImportError as exc:
+            self.skipTest(f"Installed ComfyUI checkout predates comfy.ldm.minimax.sampling: {exc}")
+        if not hasattr(mm_model, "MiniMaxH3ImageModel") or not hasattr(comfy_mb, "MiniMaxH3Image"):
+            self.skipTest("Installed ComfyUI checkout predates MiniMaxH3ImageModel")
+        from omni_lora.backends.cpu import CPUBackend
+        from omni_lora.lora.layers import LoRAConfig, LoRAInjector, LoRALinear
+        from omni_lora.models.adapters import ComfyModelAdapter
+
+        pdd_sigmas = [1.0, 0.85, 0.60, 0.30, 0.0]
+        ops = comfy_ops.manual_cast
+        h3_img_dm = mm_model.MiniMaxH3ImageModel(
+            pdd_sigmas=pdd_sigmas,
+            pdd_steps=4,
+            hidden_size=64,
+            num_layers=1,
+            token_refiner_num_layers=1,
+            num_attention_heads=4,
+            attention_head_dim=16,
+            ffn_hidden_size=128,
+            latents_dim=24,
+            patch_size=(1, 2, 2),
+            text_dim=32,
+            time_embed_dim=16,
+            adaln_curve_grid=8,
+            gate_compress=True,
+            rope_inv_freq_len=2,
+            dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            operations=ops,
+        )
+        from omni_lora.tests.real_model_harness import _initialize_real_comfy_module
+        _initialize_real_comfy_module(h3_img_dm, seed=1235)
+        h3_img_dm.rope.inv_freq.fill_(0.01)
+        h3_img_dm.adaln_t_table.normal_(std=0.05)
+
+        class DummyCfgH3Img:
+            unet_config = {
+                "image_model": "minimax_h3_image",
+                "latents_dim": 24,
+                "pdd_steps": 4,
+                "pdd_sigmas": pdd_sigmas,
+                "gate_compress": True,
+                "adaln_curve_grid": 8,
+            }
+            sampling_settings = {"pdd_sigmas": pdd_sigmas}
+
+        class DummyInnerH3Img(comfy_mb.MiniMaxH3Image):
+            def __init__(self, dm: nn.Module) -> None:
+                nn.Module.__init__(self)
+                self.diffusion_model = dm
+                self.latent_format = comfy_lf.MiniMaxH3Video()
+                self.model_config = DummyCfgH3Img()
+                self.model_sampling = mm_sampling.MiniMaxH3ImageModelSampling(self.model_config)
+                self.latent_shapes = None
+                self.concat_keys = ()
+                self.adm_channels = 0
+                self.manual_cast_dtype = None
+
+            def get_dtype_inference(self) -> torch.dtype:
+                return torch.float16
+
+        class DummyPatcherH3Img:
+            def __init__(self, dm: nn.Module) -> None:
+                self.model = DummyInnerH3Img(dm)
+
+            def get_model_object(self, name: str) -> Any:
+                return getattr(self.model, name, None)
+
+        patcher = DummyPatcherH3Img(h3_img_dm)
+        adapter = ComfyModelAdapter(comfy_model=patcher, model_id="auto")
+        self.assertEqual(adapter.spec.latent_channels, 24)
+        self.assertTrue(adapter.spec.supports_video_5d)
+        self.assertEqual(adapter._get_minimax_pdd_grid(h3_img_dm), pdd_sigmas)
+
+        # 1. Verify unused `to_gate_compress` is excluded from LoRA injection
+        injected = LoRAInjector.inject(
+            h3_img_dm,
+            LoRAConfig(rank=4, alpha=4.0, target_modules=adapter.spec.default_target_modules),
+            lora_dtype=torch.float32,
+        )
+        self.assertGreater(len(injected), 0)
+        self.assertFalse(any(p.endswith("to_gate_compress") for p in injected))
+        self.assertTrue(any(p.endswith("qkv_proj") for p in injected))
+        self.assertTrue(any(p.endswith("fc2") for p in injected))
+
+        lora_mods = [m for m in h3_img_dm.modules() if isinstance(m, LoRALinear)]
+        for mod in lora_mods:
+            nn.init.normal_(mod.lora_B.weight, std=0.02)
+
+        # 2. Verify FP32 islands remain float32 under `enforce_vram_budget`
+        cpu_backend = CPUBackend(dtype="bf16")
+        cpu_backend.enforce_vram_budget(h3_img_dm)
+        self.assertEqual(h3_img_dm.final_layer.video_out.weight.dtype, torch.float32)
+        self.assertEqual(h3_img_dm.video_patch_proj.weight.dtype, torch.float32)
+        self.assertEqual(h3_img_dm.blocks[0].adaln_proj.linear.weight.dtype, torch.float32)
+        self.assertEqual(h3_img_dm.final_layer.adaln_proj.linear.weight.dtype, torch.float32)
+
+        # 3. Verify PDD head intervals are single-step `[start, start + 1)`, `minimax_payload`
+        #    preserves `text_token_tags`, and `batch_size=2` trims padded tokens cleanly
+        recorded_pdd_spans: List[Tuple[int, int]] = []
+        recorded_text_lens: List[int] = []
+        recorded_has_tags: List[bool] = []
+        orig_pdd_head = mm_model._pdd_head
+        orig_embed_and_pack = h3_img_dm._embed_and_pack
+
+        def _spy_pdd_head(head: Any, h: Any, grid: Any, start: int, stop: int) -> Any:
+            recorded_pdd_spans.append((int(start), int(stop)))
+            return orig_pdd_head(head, h, grid, start, stop)
+
+        def _spy_embed_and_pack(video_x: Any, audio_x: Any, context: Any, layout: Any, payload: Any, transformer_options: Any) -> Any:
+            recorded_text_lens.append(int(context.shape[1]))
+            recorded_has_tags.append(isinstance(payload, dict) and payload.get("text_token_tags") is not None)
+            return orig_embed_and_pack(video_x, audio_x, context, layout, payload, transformer_options)
+
+        mm_model._pdd_head = _spy_pdd_head
+        h3_img_dm._embed_and_pack = _spy_embed_and_pack  # type: ignore[method-assign]
+        try:
+            latents_b2 = torch.randn(2, 24, 1, 8, 8, dtype=torch.bfloat16)
+            prompt_b2 = torch.randn(2, 6, 32, dtype=torch.bfloat16)
+            attn_mask_b2 = torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1]], dtype=torch.long)
+            token_tags_b2 = torch.tensor([[1, 1, 1, 1, 1, 1], [1, 1, 0, 0, 1, 1]], dtype=torch.long)
+
+            loss = adapter.compute_training_loss(
+                backbone=h3_img_dm,
+                batch={
+                    "latents": latents_b2,
+                    "prompt_embeds": prompt_b2,
+                    "extra_conds": {
+                        "attention_mask": attn_mask_b2,
+                        "minimax_token_tags": token_tags_b2,
+                    },
+                },
+                device=torch.device("cpu"),
+                dtype=torch.bfloat16,
+            )
+            self.assertTrue(torch.isfinite(loss))
+            self.assertEqual(len(recorded_pdd_spans), 2)
+            self.assertEqual(recorded_text_lens, [4, 6])
+            self.assertEqual(recorded_has_tags, [True, True])
+            for st, sp in recorded_pdd_spans:
+                self.assertEqual(sp, st + 1)
+
+            loss.backward()
+            # Every injected LoRA adapter must receive non-zero gradients (no dead layers)
+            for mod in lora_mods:
+                has_grad = (
+                    (mod.lora_A.weight.grad is not None and float(mod.lora_A.weight.grad.abs().sum().item()) > 0.0)
+                    or (mod.lora_B.weight.grad is not None and float(mod.lora_B.weight.grad.abs().sum().item()) > 0.0)
+                )
+                self.assertTrue(has_grad)
+        finally:
+            mm_model._pdd_head = orig_pdd_head
+            h3_img_dm._embed_and_pack = orig_embed_and_pack  # type: ignore[method-assign]
+            LoRAInjector.uninject(h3_img_dm)
+
     def test_flux_attention_mask_not_leaked_and_sdpa_int_mask_normalized(self) -> None:
         """
         Regression test for `RuntimeError: Expected attn_mask dtype to be bool or float or to match
@@ -5164,7 +5167,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
         import comfy.supported_models
         from comfy.ldm.flux.model import Flux
         from omni_lora.models.adapters import _normalize_sdpa_attn_mask
-        from omni_lora.pipelines.lora_trainer import _install_chunked_sdpa_wrapper
+        from omni_lora.pipelines.lora_trainer import _scoped_training_op_wrappers
 
         ops = comfy.ops.manual_cast
         flux_dm = Flux(
@@ -5287,125 +5290,701 @@ class TestOmniLoRAFramework(unittest.TestCase):
         self.assertEqual(captured_mask_aware["attention_mask"].dtype, torch.int64)
 
         # 4. Direct SDPA integer mask normalization and 2D batched key-mask reshaping
-        _install_chunked_sdpa_wrapper()
-        q = torch.randn(2, 4, 12, 16, dtype=torch.bfloat16)
-        k = torch.randn(2, 4, 12, 16, dtype=torch.bfloat16)
-        v = torch.randn(2, 4, 12, 16, dtype=torch.bfloat16)
-        norm_mask = _normalize_sdpa_attn_mask(int64_text_mask, q, k, skip_reshape=True)
-        self.assertIsNotNone(norm_mask)
-        assert norm_mask is not None
-        self.assertEqual(norm_mask.dtype, torch.bool)
-        self.assertEqual(tuple(norm_mask.shape), (2, 1, 1, 12))
+        with _scoped_training_op_wrappers():
+            q = torch.randn(2, 4, 12, 16, dtype=torch.bfloat16)
+            k = torch.randn(2, 4, 12, 16, dtype=torch.bfloat16)
+            v = torch.randn(2, 4, 12, 16, dtype=torch.bfloat16)
+            norm_mask = _normalize_sdpa_attn_mask(int64_text_mask, q, k, skip_reshape=True)
+            self.assertIsNotNone(norm_mask)
+            assert norm_mask is not None
+            self.assertEqual(norm_mask.dtype, torch.bool)
+            self.assertEqual(tuple(norm_mask.shape), (2, 1, 1, 12))
 
-        sdpa_out = F.scaled_dot_product_attention(q, k, v, attn_mask=int64_text_mask[:, None, None, :])
-        self.assertEqual(tuple(sdpa_out.shape), (2, 4, 12, 16))
-        self.assertTrue(torch.isfinite(sdpa_out.float()).all())
+            sdpa_out = F.scaled_dot_product_attention(q, k, v, attn_mask=int64_text_mask[:, None, None, :])
+            self.assertEqual(tuple(sdpa_out.shape), (2, 4, 12, 16))
+            self.assertTrue(torch.isfinite(sdpa_out.float()).all())
+
+    def test_control_folder_dataset_precompute_vlm_and_dropout(self) -> None:
+        """
+        Verify universal Image Editing / Control Folder support end-to-end:
+          1. Folder pairing across different extensions (`001.png` <-> `001.jpg`), mirrored subfolders
+             (`sub/002.png` <-> `sub/002.webp`), and mixed controlled + uncontrolled datasets, plus
+             fail-fast validation on missing or 0-match `control_path`.
+          2. `control_resize_mode="match_target"` vs `"preserve_aspect"` and direct `control_images` tensor input.
+          3. `OmniLoRAPrecomputeConditioning` caches control latents RAW UNSCALED (no `process_latent_in`)
+             while scaling target latents, auto-detects VLM CLIP `images` kwarg support, resizes control
+             images to `clip_vision_resolution`, separates cache keys for identical captions with different
+             controls, supports `clip_prompt_template` (`{prompt}` and `llama_template`), and caches
+             aligned `control_latents_flipped` + `prompt_embeds_flipped` when `random_flip=True`.
+          4. `compute_vram_budget(..., has_control_latents=True)` accounts for doubled sequence activations.
+          5. `OmniLoRATrainer` executes with `control_mode="auto"`, `reference_latents_method="index"`,
+             `control_dropout=0.5`, `batch_size=2`, `random_flip=True`, and records control telemetry in
+             `training_summary`.
+        """
+        import unittest.mock
+        from PIL import Image
+
+        from omni_lora.backends.xpu import XPUBackend
+        from omni_lora.tests.comfy_emulator import EmulatedComfyEnvironment
+        from omni_lora.tests.real_model_harness import RealForwardModelRegistry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            tgt_dir = root / "targets"
+            ctrl_dir = root / "controls"
+            (tgt_dir / "sub").mkdir(parents=True)
+            (ctrl_dir / "sub").mkdir(parents=True)
+
+            # Target 1 (landscape 160x96) paired with control 1 (different ext .jpg, portrait 96x160)
+            Image.new("RGB", (160, 96), (220, 40, 40)).save(tgt_dir / "001.png")
+            (tgt_dir / "001.txt").write_text("make it watercolor", encoding="utf-8")
+            Image.new("RGB", (96, 160), (20, 200, 30)).save(ctrl_dir / "001.jpg")
+
+            # Target 2 in mirrored subfolder `sub/` paired with control 2 (.bmp) — identical caption to test cache keying!
+            Image.new("RGB", (160, 96), (40, 40, 220)).save(tgt_dir / "sub" / "002.png")
+            (tgt_dir / "sub" / "002.txt").write_text("make it watercolor", encoding="utf-8")
+            Image.new("RGB", (160, 96), (240, 220, 10)).save(ctrl_dir / "sub" / "002.bmp")
+
+            # Target 3 intentionally has NO control image (mixed controlled + uncontrolled dataset)
+            Image.new("RGB", (160, 96), (120, 120, 120)).save(tgt_dir / "003_uncontrolled.png")
+            (tgt_dir / "003_uncontrolled.txt").write_text("plain text to image sample", encoding="utf-8")
+
+            loader_node = OmniLoRADatasetLoader()
+
+            # Fail-fast on non-existent control_path
+            with self.assertRaises(ValueError):
+                loader_node.load_dataset(
+                    dataset_path=str(tgt_dir),
+                    trigger_word="",
+                    default_caption="edit",
+                    resolution=256,
+                    batch_size=1,
+                    num_repeats=1,
+                    center_crop=True,
+                    aspect_ratio_bucketing=True,
+                    random_flip=True,
+                    caption_dropout=0.0,
+                    control_path=str(root / "does_not_exist"),
+                )
+
+            # Fail-fast on 0 matched control images
+            empty_ctrl = root / "empty_ctrl"
+            empty_ctrl.mkdir()
+            Image.new("RGB", (64, 64), (0, 0, 0)).save(empty_ctrl / "unrelated_name.png")
+            with self.assertRaises(ValueError):
+                loader_node.load_dataset(
+                    dataset_path=str(tgt_dir),
+                    trigger_word="",
+                    default_caption="edit",
+                    resolution=256,
+                    batch_size=1,
+                    num_repeats=1,
+                    center_crop=True,
+                    aspect_ratio_bucketing=True,
+                    random_flip=True,
+                    caption_dropout=0.0,
+                    control_path=str(empty_ctrl),
+                )
+
+            # 1a. `control_resize_mode="match_target"` -> control matches target exact bucket HxW
+            ds_match, info_match_str = loader_node.load_dataset(
+                dataset_path=str(tgt_dir),
+                trigger_word="",
+                default_caption="edit",
+                resolution=256,
+                batch_size=2,
+                num_repeats=1,
+                center_crop=True,
+                aspect_ratio_bucketing=True,
+                random_flip=True,
+                caption_dropout=0.0,
+                control_path=str(ctrl_dir),
+                control_resize_mode="match_target",
+            )
+            info_match = json.loads(info_match_str)
+            self.assertEqual(info_match["unique_images"], 3)
+            self.assertEqual(info_match["controlled_images"], 2)
+            self.assertEqual(info_match["control_resize_mode"], "match_target")
+            s1 = [s for s in ds_match.samples if s.source_name == "001.png"][0]
+            s2 = [s for s in ds_match.samples if s.source_name.endswith("002.png")][0]
+            s3 = [s for s in ds_match.samples if s.source_name == "003_uncontrolled.png"][0]
+            # Verify lazy header-only disk scan: zero full pixel buffers materialized in RAM on load!
+            self.assertIsNone(s1._pixel_values)
+            self.assertIsNone(s1._control_pixel_values)
+            self.assertTrue(s1.has_control)
+            self.assertTrue(s2.has_control)
+            self.assertFalse(s3.has_control)
+            # Accessing `.pixel_values` / `.control_pixel_values` lazily decodes on demand
+            self.assertIsNotNone(s1.control_pixel_values)
+            self.assertIsNotNone(s2.control_pixel_values)
+            self.assertIsNone(s3.control_pixel_values)
+            self.assertEqual(tuple(s1.control_pixel_values.shape), tuple(s1.pixel_values.shape))
+            self.assertEqual(tuple(s2.control_pixel_values.shape), tuple(s2.pixel_values.shape))
+
+            # 1b. `control_resize_mode="preserve_aspect"` -> portrait control 001.jpg preserves portrait H > W
+            ds_preserve, _ = loader_node.load_dataset(
+                dataset_path=str(tgt_dir),
+                trigger_word="",
+                default_caption="edit",
+                resolution=256,
+                batch_size=1,
+                num_repeats=1,
+                center_crop=True,
+                aspect_ratio_bucketing=True,
+                random_flip=False,
+                caption_dropout=0.0,
+                control_path=str(ctrl_dir),
+                control_resize_mode="preserve_aspect",
+            )
+            s1_pres = [s for s in ds_preserve.samples if s.source_name == "001.png"][0]
+            self.assertIsNotNone(s1_pres.control_pixel_values)
+            # Target 001.png is landscape (W > H); control 001.jpg is portrait (H > W)
+            self.assertGreater(int(s1_pres.pixel_values.shape[-1]), int(s1_pres.pixel_values.shape[-2]))
+            self.assertGreater(int(s1_pres.control_pixel_values.shape[-2]), int(s1_pres.control_pixel_values.shape[-1]))
+
+            # 1c. Direct in-graph `control_images` tensor input
+            in_imgs = torch.rand(2, 64, 64, 3, dtype=torch.float32)
+            in_ctrls = torch.rand(2, 64, 64, 3, dtype=torch.float32)
+            ds_direct, info_direct_str = loader_node.load_dataset(
+                dataset_path="",
+                trigger_word="",
+                default_caption="edit",
+                resolution=64,
+                batch_size=2,
+                num_repeats=1,
+                center_crop=True,
+                aspect_ratio_bucketing=False,
+                random_flip=True,
+                caption_dropout=0.0,
+                images=in_imgs,
+                custom_prompts="same edit caption\nsame edit caption",
+                control_images=in_ctrls,
+            )
+            self.assertEqual(json.loads(info_direct_str)["controlled_images"], 2)
+
+            # 2. Precompute: verify raw unscaled control latents, VLM CLIP auto-detection, vision resize,
+            #    distinct cache entries for identical captions with different controls, prompt template,
+            #    and flipped VLM embeddings + control latents when `random_flip=True`.
+            class _SpyScalingVAE:
+                def encode(self, pixels_bhwc: torch.Tensor) -> torch.Tensor:
+                    # Deterministic spatial downsampling (8x) to 16 channels so pixel differences remain visible
+                    b, h, w, _ = pixels_bhwc.shape
+                    mean_rgb = pixels_bhwc.mean(dim=(1, 2))  # [B, 3]
+                    # Include left-vs-right asymmetry so horizontal flip produces a distinct latent
+                    left_mean = pixels_bhwc[:, :, : max(1, w // 2), 0].mean(dim=(1, 2))
+                    out = torch.zeros((b, 16, max(2, h // 8), max(2, w // 8)), dtype=torch.float32)
+                    out[:, 0] = mean_rgb[:, 0].view(b, 1, 1) + 1.0
+                    out[:, 1] = mean_rgb[:, 1].view(b, 1, 1) + 2.0
+                    out[:, 2] = left_mean.view(b, 1, 1)
+                    return out
+
+            class _SpyVLMCLIP:
+                def __init__(self) -> None:
+                    self.calls: List[Dict[str, Any]] = []
+                    self.tokenizer = types.SimpleNamespace(llama_template_images="img:{}")
+
+                def tokenize(
+                    self,
+                    text: str,
+                    images: Optional[List[torch.Tensor]] = None,
+                    llama_template: Optional[str] = None,
+                    **kwargs: Any,
+                ) -> Dict[str, Any]:
+                    img_sig = 0.0
+                    img_hw: Optional[Tuple[int, int]] = None
+                    if images and len(images) > 0:
+                        t_img = images[0]
+                        img_hw = (int(t_img.shape[1]), int(t_img.shape[2]))
+                        # Encode spatial left/right asymmetry so flipped control images yield different VLM embeds
+                        w_half = max(1, int(t_img.shape[2]) // 2)
+                        img_sig = float(t_img.mean().item()) + 3.0 * float(t_img[:, :, :w_half, 0].mean().item())
+                    self.calls.append(
+                        {
+                            "text": text,
+                            "has_images": bool(images),
+                            "img_hw": img_hw,
+                            "llama_template": llama_template,
+                        }
+                    )
+                    return {"text": text, "img_sig": img_sig}
+
+                def encode_from_tokens_scheduled(self, tokens: Dict[str, Any]) -> List[List[Any]]:
+                    text_val = float(sum(ord(c) for c in tokens["text"]) % 97) / 97.0
+                    sig = float(tokens["img_sig"])
+                    cond = torch.full((1, 8, 64), text_val + sig, dtype=torch.float32)
+                    pooled = torch.full((1, 64), text_val - sig, dtype=torch.float32)
+                    return [[cond, {"pooled_output": pooled}]]
+
+            class _SpyScalerModel:
+                def process_latent_in(self, lat: torch.Tensor) -> torch.Tensor:
+                    # Distinct 10x scale so scaled target vs raw unscaled control is unmistakable
+                    return lat * 10.0
+
+            pre_node = OmniLoRAPrecomputeConditioning()
+            self.assertTrue(OmniLoRAPrecomputeConditioning._clip_supports_images_kwarg(_SpyVLMCLIP()))
+
+            # Build asymmetric direct images/controls so horizontal flip changes both latent and VLM embedding
+            asym_imgs = torch.zeros(2, 64, 64, 3, dtype=torch.float32)
+            asym_imgs[0, :, :32, 0] = 0.9
+            asym_imgs[1, :, 32:, 1] = 0.8
+            asym_ctrls = torch.zeros(2, 64, 64, 3, dtype=torch.float32)
+            asym_ctrls[0, :, :32, 0] = 0.95  # Bright on LEFT half
+            asym_ctrls[1, :, 32:, 0] = 0.25  # Dim on RIGHT half
+            ds_vlm, _ = loader_node.load_dataset(
+                dataset_path="",
+                trigger_word="",
+                default_caption="edit",
+                resolution=64,
+                batch_size=2,
+                num_repeats=1,
+                center_crop=True,
+                aspect_ratio_bucketing=False,
+                random_flip=True,
+                caption_dropout=0.0,
+                images=asym_imgs,
+                custom_prompts="identical caption\nidentical caption",
+                control_images=asym_ctrls,
+            )
+
+            spy_clip = _SpyVLMCLIP()
+            spy_vae = _SpyScalingVAE()
+            (cached_vlm,) = pre_node.precompute(
+                dataset=ds_vlm,
+                offload_encoders_after_cache=False,
+                vae=spy_vae,
+                clip=spy_clip,
+                model=_SpyScalerModel(),
+                pass_control_to_clip="auto",
+                clip_vision_resolution=32,
+                clip_prompt_template="Instruction: {prompt}",
+            )
+            self.assertTrue(cached_vlm.has_control_latents)
+            self.assertTrue(cached_vlm.clip_used_control_images)
+            self.assertEqual(cached_vlm.num_controlled_images, 2)
+            self.assertTrue(cached_vlm.latent_scaled)
+
+            batch0 = cached_vlm.batches[0]
+            # Target latents WERE scaled by 10x (>= 10.0 in ch 0), whereas control latents remain RAW UNSCALED (< 5.0)!
+            self.assertGreater(float(batch0["latents"][:, 0].mean().item()), 8.0)
+            self.assertIsNotNone(batch0.get("control_latents"))
+            self.assertEqual(len(batch0["control_latents"]), 2)
+            self.assertLess(float(batch0["control_latents"][0][:, 0].mean().item()), 5.0)
+            self.assertIsNotNone(batch0.get("control_latents_flipped"))
+            # Identical captions with different controls MUST produce distinct VLM prompt embeddings!
+            self.assertFalse(
+                torch.allclose(batch0["prompt_embeds"][0], batch0["prompt_embeds"][1]),
+                "Identical captions with distinct control images collided in VLM prompt cache!",
+            )
+            # Flipped VLM prompt embeddings MUST be cached and distinct from unflipped embeddings!
+            self.assertIsNotNone(batch0.get("prompt_embeds_flipped"))
+            self.assertFalse(
+                torch.allclose(batch0["prompt_embeds"][0], batch0["prompt_embeds_flipped"][0]),
+                "Flipped VLM prompt embedding failed to reflect horizontally flipped control image!",
+            )
+            # Verify `{prompt}` substitution and `clip_vision_resolution=32` resize
+            img_calls = [c for c in spy_clip.calls if c["has_images"]]
+            self.assertGreaterEqual(len(img_calls), 4)  # 2 normal + 2 flipped
+            self.assertTrue(all(c["text"] == "Instruction: identical caption" for c in img_calls))
+            self.assertTrue(all(c["img_hw"] == (32, 32) for c in img_calls))
+
+            # Verify `{}` llama_template kwarg forwarding when `clip_prompt_template` uses `{}`
+            spy_clip_tpl = _SpyVLMCLIP()
+            ds_tpl, _ = loader_node.load_dataset(
+                dataset_path="",
+                trigger_word="",
+                default_caption="edit",
+                resolution=64,
+                batch_size=1,
+                num_repeats=1,
+                center_crop=True,
+                aspect_ratio_bucketing=False,
+                random_flip=False,
+                caption_dropout=0.0,
+                images=asym_imgs[:1],
+                custom_prompts="swap background",
+                control_images=asym_ctrls[:1],
+            )
+            _ = pre_node.precompute(
+                dataset=ds_tpl,
+                offload_encoders_after_cache=False,
+                vae=spy_vae,
+                clip=spy_clip_tpl,
+                pass_control_to_clip="enabled",
+                clip_vision_resolution=0,
+                clip_prompt_template="<|sys|>Edit: {}<|end|>",
+            )
+            self.assertTrue(
+                any(c["llama_template"] == "<|sys|>Edit: {}<|end|>" and c["text"] == "swap background" for c in spy_clip_tpl.calls)
+            )
+            self.assertTrue(any(c["img_hw"] == (64, 64) for c in spy_clip_tpl.calls if c["has_images"]))
+
+            # 2b. Verify lazy disk streaming inside `precompute()`: disk-backed samples stay
+            #     unmaterialized (`_pixel_values is None` and `_control_pixel_values is None`)
+            #     both before AND after streaming through VAE + VLM CLIP!
+            ds_stream, _ = loader_node.load_dataset(
+                dataset_path=str(tgt_dir),
+                trigger_word="",
+                default_caption="edit",
+                resolution=64,
+                batch_size=2,
+                num_repeats=1,
+                center_crop=True,
+                aspect_ratio_bucketing=False,
+                random_flip=True,
+                caption_dropout=0.0,
+                control_path=str(ctrl_dir),
+                control_resize_mode="match_target",
+            )
+            self.assertTrue(all(s._pixel_values is None and s._control_pixel_values is None for s in ds_stream.samples))
+            spy_clip_stream = _SpyVLMCLIP()
+            (cached_stream,) = pre_node.precompute(
+                dataset=ds_stream,
+                offload_encoders_after_cache=False,
+                vae=spy_vae,
+                clip=spy_clip_stream,
+                model=_SpyScalerModel(),
+                pass_control_to_clip="auto",
+                clip_vision_resolution=32,
+            )
+            self.assertTrue(cached_stream.has_control_latents)
+            self.assertTrue(cached_stream.clip_used_control_images)
+            self.assertEqual(cached_stream.num_controlled_images, 2)
+            self.assertTrue(all(s._pixel_values is None and s._control_pixel_values is None for s in ds_stream.samples))
+
+            # 3. VRAM Ledger: `has_control_latents=True` reserves larger activation headroom than False
+            xpu_sim = XPUBackend(device_index=0, dtype="bf16")
+            dummy_model = nn.Sequential(nn.Linear(64, 64), nn.Linear(64, 64))
+            with (
+                unittest.mock.patch.object(xpu_sim, "is_available", return_value=False),
+                unittest.mock.patch.object(
+                    xpu_sim,
+                    "get_capabilities",
+                    return_value=unittest.mock.MagicMock(
+                        total_vram_mb=15933.0,
+                        supports_bf16=True,
+                        supports_fp16=True,
+                        supports_fp8=False,
+                    ),
+                ),
+                unittest.mock.patch.object(xpu_sim, "get_free_vram_mb", return_value=14413.6),
+            ):
+                b_no_ctrl = xpu_sim.compute_vram_budget(
+                    vram_mode="auto",
+                    resolution=1024,
+                    batch_size=1,
+                    module=dummy_model,
+                    has_control_latents=False,
+                )
+                b_with_ctrl = xpu_sim.compute_vram_budget(
+                    vram_mode="auto",
+                    resolution=1024,
+                    batch_size=1,
+                    module=dummy_model,
+                    has_control_latents=True,
+                )
+            self.assertGreater(b_with_ctrl["activation_allowance_mb"], b_no_ctrl["activation_allowance_mb"])
+
+            # 4. End-to-end OmniLoRATrainer run on a real unmocked Flux model with control latents,
+            #    batch_size=2, random_flip=True, reference_latents_method="index", and control_dropout=0.5
+            with EmulatedComfyEnvironment():
+                flux_spec = RealForwardModelRegistry.build("flux_dev", dtype=torch.float32)
+                ds_train, _ = loader_node.load_dataset(
+                    dataset_path="",
+                    trigger_word="",
+                    default_caption="edit",
+                    resolution=flux_spec.resolution,
+                    batch_size=2,
+                    num_repeats=1,
+                    center_crop=True,
+                    aspect_ratio_bucketing=False,
+                    random_flip=True,
+                    caption_dropout=0.0,
+                    images=asym_imgs,
+                    custom_prompts="change lighting to sunset\nchange lighting to midnight",
+                    control_images=asym_ctrls,
+                )
+                (cached_train,) = pre_node.precompute(
+                    dataset=ds_train,
+                    offload_encoders_after_cache=False,
+                    vae=flux_spec.vae,
+                    clip=flux_spec.clip,
+                    model=flux_spec.patcher,
+                )
+                self.assertTrue(cached_train.has_control_latents)
+
+                trainer_node = OmniLoRATrainer()
+                _, lora_bundle, summary_str = trainer_node.train_lora(
+                    model=flux_spec.patcher,
+                    cached_data=cached_train,
+                    model_architecture="auto",
+                    backend="cpu",
+                    reserve_vram_gb=0.0,
+                    optimizer="radamw",
+                    rank=4,
+                    alpha=4.0,
+                    learning_rate=1e-4,
+                    lr_scheduler="constant",
+                    warmup_steps=0,
+                    steps=4,
+                    grad_accum_steps=1,
+                    gradient_checkpointing=True,
+                    checkpoint_every_n_steps=0,
+                    lora_dtype="fp32",
+                    seed=123,
+                    control_mode="auto",
+                    reference_latents_method="index",
+                    control_dropout=0.5,
+                )
+                summary = json.loads(summary_str)
+                self.assertTrue(summary["has_control_latents"])
+                self.assertEqual(summary["control_mode_resolved"], "reference_latents")
+                self.assertEqual(summary["reference_latents_method"], "index")
+                self.assertAlmostEqual(float(summary["control_dropout"]), 0.5, places=4)
+                self.assertGreater(len(lora_bundle.state_dict), 0)
+                self.assertTrue(math.isfinite(float(summary["final_loss"])))
+
+    def test_scoped_training_op_wrappers_and_extra_conds_warning(self) -> None:
+        """
+        Verify two production hardening invariants:
+          1. Scoped PyTorch op wrappers (`_scoped_training_op_wrappers`, `_inplace_safe_outer_autograd_context`,
+             `LoRATrainingPipeline.setup()/cleanup()`, and `ComfyModelAdapter._forward_backbone()`) cleanly
+             restore native `torch.*` and `torch.nn.functional.*` callables once training exits — including
+             on exceptions and nested re-entrant scopes — so post-training ComfyUI inference has zero overhead.
+          2. Any `inner_model.extra_conds(...)` failure emits a clear rate-limited `logging.warning`
+             (once per `(model_class, exc_type)`) across ALL models instead of failing silently.
+        """
+        import gc
+        import logging
+        from omni_lora.backends import detect_and_configure
+        from omni_lora.lora import LoRAConfig
+        from omni_lora.pipelines import LoRATrainingPipeline, TrainingConfig
+        from omni_lora.pipelines.lora_trainer import (
+            _inplace_safe_outer_autograd_context,
+            _scoped_training_op_wrappers,
+        )
+
+        # Ensure any prior test's local pipelines are collected before snapshotting baseline ops
+        gc.collect()
+        orig_cat = torch.cat
+        orig_lerp = torch.lerp
+        orig_sdpa = F.scaled_dot_product_attention
+        orig_linear = F.linear
+        orig_conv2d = F.conv2d
+        orig_layer_norm = F.layer_norm
+
+        # 1a. Normal enter/exit + re-entrant nesting
+        with _scoped_training_op_wrappers():
+            self.assertTrue(getattr(torch.cat, "_omni_out_kwarg_safe", False))
+            self.assertTrue(getattr(torch.lerp, "_omni_out_kwarg_safe", False))
+            self.assertTrue(getattr(F.scaled_dot_product_attention, "_omni_chunked_sdpa_safe", False))
+            self.assertTrue(getattr(F.linear, "_omni_dml_safe", False))
+            self.assertTrue(getattr(F.conv2d, "_omni_dml_safe", False))
+            self.assertTrue(getattr(F.layer_norm, "_omni_dml_safe", False))
+            with _inplace_safe_outer_autograd_context(gradient_checkpointing=False):
+                self.assertTrue(getattr(torch.cat, "_omni_out_kwarg_safe", False))
+            # Outer scope still holds the lease -> wrappers remain active
+            self.assertTrue(getattr(torch.cat, "_omni_out_kwarg_safe", False))
+            self.assertTrue(getattr(F.linear, "_omni_dml_safe", False))
+
+        # Outermost scope exited -> exact pre-scope callables restored!
+        self.assertIs(torch.cat, orig_cat)
+        self.assertIs(torch.lerp, orig_lerp)
+        self.assertIs(F.scaled_dot_product_attention, orig_sdpa)
+        self.assertIs(F.linear, orig_linear)
+        self.assertIs(F.conv2d, orig_conv2d)
+        self.assertIs(F.layer_norm, orig_layer_norm)
+
+        # 1b. Exception inside `_inplace_safe_outer_autograd_context` STILL restores all ops
+        with self.assertRaises(RuntimeError):
+            with _inplace_safe_outer_autograd_context(gradient_checkpointing=False):
+                self.assertTrue(getattr(torch.lerp, "_omni_out_kwarg_safe", False))
+                raise RuntimeError("simulated mid-step failure")
+        self.assertIs(torch.cat, orig_cat)
+        self.assertIs(torch.lerp, orig_lerp)
+        self.assertIs(F.scaled_dot_product_attention, orig_sdpa)
+
+        # 1c. `LoRATrainingPipeline.setup()` -> `cleanup()` restores all ops
+        plan = detect_and_configure(preferred_backend="cpu", requested_dtype="fp32", allow_fallback=True)
+        tiny_mod = nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 16))
+        tiny_adapter = ComfyModelAdapter(model_id="flux_dev", comfy_model=tiny_mod)
+        pipe = LoRATrainingPipeline(
+            backend=plan.backend,
+            model_adapter=tiny_adapter,
+            config=TrainingConfig(
+                backend="cpu",
+                dtype="fp32",
+                max_train_steps=1,
+                lora=LoRAConfig(rank=4, alpha=4.0, target_modules=("0", "1")),
+            ),
+        )
+        pipe.setup(external_backbone=tiny_mod)
+        self.assertTrue(getattr(torch.cat, "_omni_out_kwarg_safe", False))
+        self.assertTrue(getattr(F.linear, "_omni_dml_safe", False))
+        if pipe.backbone is not None:
+            LoRAInjector.uninject(pipe.backbone)
+        pipe.cleanup()
+        self.assertIs(torch.cat, orig_cat)
+        self.assertIs(torch.lerp, orig_lerp)
+        self.assertIs(F.scaled_dot_product_attention, orig_sdpa)
+        self.assertIs(F.linear, orig_linear)
+
+        # 2. Loud, rate-limited `logging.warning` when `inner_model.extra_conds(...)` fails
+        class _BrokenExtraCondsBackbone(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.proj = nn.Conv2d(4, 4, kernel_size=1)
+
+            def forward(self, x: torch.Tensor, timestep: torch.Tensor, context: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+                return self.proj(x)
+
+        class _BrokenExtraCondsInnerModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.diffusion_model = _BrokenExtraCondsBackbone()
+
+            def extra_conds(self, **kwargs: Any) -> Dict[str, Any]:
+                raise KeyError("simulated_missing_comfy_cond_key")
+
+        broken_inner = _BrokenExtraCondsInnerModel()
+        broken_adapter = ComfyModelAdapter(comfy_model=broken_inner, model_id="sd15")
+        lat = torch.randn(1, 4, 8, 8)
+        t_step = torch.tensor([0.5])
+        pe = torch.randn(1, 4, 16)
+
+        with self.assertLogs(level=logging.WARNING) as log_cm:
+            out1 = broken_adapter._forward_backbone(
+                backbone=broken_inner.diffusion_model,
+                noisy_latents=lat,
+                timesteps=t_step,
+                prompt_embeds=pe,
+            )
+            # Second call with the same `(model_class, exc_type)` should be rate-limited (no duplicate spam)
+            out2 = broken_adapter._forward_backbone(
+                backbone=broken_inner.diffusion_model,
+                noisy_latents=lat,
+                timesteps=t_step,
+                prompt_embeds=pe,
+            )
+        self.assertEqual(tuple(out1.shape), tuple(lat.shape))
+        self.assertEqual(tuple(out2.shape), tuple(lat.shape))
+        matching_warns = [m for m in log_cm.output if "_BrokenExtraCondsInnerModel.extra_conds" in m and "KeyError" in m]
+        self.assertEqual(len(matching_warns), 1, f"Expected exactly 1 rate-limited extra_conds warning; got {log_cm.output}")
+        # Standalone `_forward_backbone` also restored native PyTorch ops on exit!
+        self.assertIs(torch.lerp, orig_lerp)
+        self.assertIs(torch.cat, orig_cat)
 
 
 def run_cloud_verification_suite(preferred_backend: str = "auto") -> int:
     """
-    Standalone cloud/backend verification runner:
+    Unmocked Real-Forward Multi-Backend Verification Runner:
     1. Detects and prints the active hardware accelerator (`xpu`, `cuda`, `rocm`, `dml`, `mps`, `npu`, `hpu`, `cpu`),
        VRAM capacity, precision support (`bf16` / `fp16` / `fp32`), and recommended VRAM tier.
-    2. Benchmarks all 21 architectures in `ComfyModelZoo` on the selected backend inside
-       `EmulatedComfyEnvironment` and prints a summary table.
-    3. Executes the complete `unittest` suite and returns `0` on 100% pass.
+    2. Executes ALL 44 genuine, UNMOCKED ComfyUI Image & Video architectures in `RealForwardModelRegistry`
+       directly on the active hardware backend in its native precision (`bf16` / `fp16` / `fp32`) —
+       zero forward mocks — verifying real forward, backward, gradient checkpointing, `StrictComfySpy`,
+       `comfy.sd.load_lora_for_models` (0 unloaded keys), and real post-LoRA output drift.
+    3. Executes the complete `unittest` + 7-invariant FP32 real-forward contract suite and returns `0` on 100% pass.
     """
-    import time
-    from omni_lora.tests.comfy_emulator import (
-        ComfyModelZoo,
-        EmulatedComfyEnvironment,
-        EmulatedKSampler,
+    from omni_lora.tests.comfy_emulator import EmulatedComfyEnvironment
+    from omni_lora.tests.real_model_harness import (
+        RealForwardModelRegistry,
+        verify_real_model_on_backend,
     )
 
     plan = detect_and_configure(preferred_backend=preferred_backend, requested_dtype="auto", allow_fallback=True)
     dev = plan.backend.get_device()
     caps = plan.backend.get_capabilities()
-    dtype = torch.bfloat16 if caps.supports_bf16 else torch.float16
+    dtype = (
+        torch.bfloat16
+        if caps.supports_bf16
+        else (torch.float16 if caps.supports_fp16 and dev.type != "cpu" else torch.float32)
+    )
 
-    print("=" * 92)
-    print(" OmniLoRA Standalone Cloud & Multi-Backend Verification Suite (Zero-ComfyUI Dependency)")
-    print("=" * 92)
+    print("=" * 102)
+    print(f" OmniLoRA Unmocked Real-Forward Multi-Backend Verification Suite ({len(RealForwardModelRegistry.MODEL_IDS)} ComfyUI Architectures)")
+    print("=" * 102)
     print(f" Active Backend   : {plan.backend.backend_id.upper()} ({caps.device_name}) -> device={dev}")
     print(f" VRAM State       : {plan.vram_state.value} (Total: {caps.total_vram_mb:.0f} MB, Recommended Res: {plan.recommended_resolution}px)")
     print(f" Compute DType    : {plan.resolved_dtype} (BF16={caps.supports_bf16}, FP16={caps.supports_fp16}, GradScaler={plan.requires_grad_scaler})")
-    print("-" * 92)
-    print(f" {'#':<2} | {'Architecture':<16} | {'Obj':<14} | {'Ch':<4} | {'Layers':<6} | {'Loss':<8} | {'KSampler':<8} | {'Time':<7}")
-    print("-" * 92)
+    print("-" * 102)
+    print(f" {'#':<2} | {'Architecture':<22} | {'Obj':<14} | {'Ch':<4} | {'Layers':<6} | {'Loss':<8} | {'RealFwd':<7} | {'Time':<7}")
+    print("-" * 102)
 
+    backend_failures: List[str] = []
     with EmulatedComfyEnvironment(torch_device=dev, simulated_vram_mb=max(8192.0, caps.total_vram_mb)) as env:
-        import comfy.sd as c_sd  # type: ignore
-
-        dataset_node = OmniLoRADatasetLoader()
-        precache_node = OmniLoRAPrecomputeConditioning()
-        trainer_node = OmniLoRATrainer()
-
-        with torch.inference_mode():
-            imgs = torch.rand(1, 64, 64, 4, dtype=torch.float32)
-            ds, _ = dataset_node.load_dataset(
-                dataset_path="",
-                trigger_word="ohwx",
-                default_caption="subject",
-                resolution=64,
-                batch_size=1,
-                num_repeats=1,
-                center_crop=True,
-                aspect_ratio_bucketing=True,
-                random_flip=True,
-                caption_dropout=0.2,
-                images=imgs,
-                custom_prompts="a detailed photo of ohwx subject",
-                use_alpha_mask=True,
-            )
-
-            for idx, arch_id in enumerate(ComfyModelZoo.ARCH_IDS, start=1):
-                t0 = time.perf_counter()
-                entry = ComfyModelZoo.build(arch_id, dtype=dtype)
-                env.unloaded_lora_keys.clear()
-                (cached_bundle,) = precache_node.precompute(
-                    dataset=ds,
-                    offload_encoders_after_cache=True,
-                    vae=entry.vae,
-                    clip=entry.clip,
-                    model=entry.patcher,
-                )
-                _, lora_bundle, summary_json = trainer_node.train_lora(
-                    cached_data=cached_bundle,
-                    model=entry.patcher,
-                    model_architecture="auto",
-                    backend=plan.backend.backend_id,
-                    optimizer="radamw",
-                    rank=4,
-                    alpha=4.0,
-                    learning_rate=1e-3,
-                    lr_scheduler="cosine",
-                    warmup_steps=1,
-                    steps=2,
-                    grad_accum_steps=1,
-                    gradient_checkpointing=True,
-                    use_rslora=True,
-                )
-                summary = json.loads(summary_json)
-                patched, _ = c_sd.load_lora_for_models(entry.patcher, entry.clip, lora_bundle.state_dict, 1.0, 1.0)
-                assert patched is not None and len(env.unloaded_lora_keys) == 0
-                ks_out = EmulatedKSampler.sample(patched, entry.clip, resolution=64, steps=1, device=dev)
-                ks_ok = "PASS" if bool(torch.isfinite(ks_out).all()) else "FAIL"
-                dt_ms = (time.perf_counter() - t0) * 1000.0
+        for idx, model_id in enumerate(RealForwardModelRegistry.MODEL_IDS, start=1):
+            try:
+                spec = RealForwardModelRegistry.build(model_id, dtype=dtype, device=dev)
+            except (ImportError, AttributeError) as skip_exc:
                 print(
-                    f" {idx:>2} | {entry.arch_id:<16} | {summary['training_objective']:<14} | "
-                    f"{entry.expected_latent_channels:>3}c | {summary['injected_layers']:>6} | "
-                    f"{summary['final_loss']:>8.4f} | {ks_ok:<8} | {dt_ms:>5.0f}ms"
+                    f" {idx:>2} | {model_id:<22} | {'SKIP (older ComfyUI)':<37} | {'SKIP':<7} |    0ms"
                 )
-                del ks_out, patched, lora_bundle, cached_bundle, entry
+                continue
+            except Exception as build_exc:
+                backend_failures.append(f"[{model_id}] build {type(build_exc).__name__}: {build_exc}")
+                print(
+                    f" {idx:>2} | {model_id:<22} | {'BUILD_ERR':<14} | {'-':>4} | {'-':>6} | {'-':>8} | {'FAIL':<7} |      -"
+                )
+                import traceback
+                traceback.print_exc()
+                continue
+
+            try:
+                res = verify_real_model_on_backend(
+                    spec=spec,
+                    env=env,
+                    backend_id=plan.backend.backend_id,
+                    device=dev,
+                    dtype=dtype,
+                )
+                print(
+                    f" {idx:>2} | {res['model_id']:<22} | {res['objective']:<14} | "
+                    f"{res['latent_channels']:>3}c | {res['injected_layers']:>6} | "
+                    f"{res['final_loss']:>8.4f} | {'PASS':<7} | {res['elapsed_ms']:>5.0f}ms"
+                )
+            except Exception as run_exc:
+                backend_failures.append(f"[{model_id}] {type(run_exc).__name__}: {run_exc}")
+                print(
+                    f" {idx:>2} | {model_id:<22} | {'ERROR':<14} | "
+                    f"{spec.expected_latent_channels:>3}c | {'-':>6} | "
+                    f"{'-':>8} | {'FAIL':<7} |      -"
+                )
+                import traceback
+                traceback.print_exc()
+            finally:
+                del spec
                 plan.backend.empty_cache()
 
-    print("-" * 92)
-    print(" Running Full Unit & Edge-Case Test Suite...")
-    print("-" * 92)
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestOmniLoRAFramework)
+    if backend_failures:
+        print("-" * 102)
+        print(f" ACTIVE-BACKEND REAL-FORWARD FAILURES ({len(backend_failures)}):")
+        for msg in backend_failures:
+            print(f"   - {msg}")
+
+    print("-" * 102)
+    print(" Running Full Unit, Edge-Case & 7-Invariant Unmocked Real-Forward Contract Suites...")
+    print("-" * 102)
+    loader = unittest.defaultTestLoader
+    suite = unittest.TestSuite()
+    suite.addTests(loader.loadTestsFromTestCase(TestOmniLoRAFramework))
+    from omni_lora.tests.test_real_model_contracts import (
+        TestAutogradInPlaceFidelity,
+        TestComfyUIUpstreamDriftGuard,
+        TestMultimodalAndConnectorStress,
+        TestRealForwardEditModels,
+        TestRealForwardModelContracts,
+    )
+    for contract_cls in (
+        TestRealForwardModelContracts,
+        TestAutogradInPlaceFidelity,
+        TestMultimodalAndConnectorStress,
+        TestComfyUIUpstreamDriftGuard,
+        TestRealForwardEditModels,
+    ):
+        suite.addTests(loader.loadTestsFromTestCase(contract_cls))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
-    return 0 if result.wasSuccessful() else 1
+    return 0 if (result.wasSuccessful() and not backend_failures) else 1
 
 
 if __name__ == "__main__":
@@ -5413,13 +5992,20 @@ if __name__ == "__main__":
     import sys
 
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--backend", type=str, default=None, help="Run cloud verification table on specified backend (auto, xpu, cuda, rocm, dml, mps, cpu)")
-    parser.add_argument("--cloud-verify", action="store_true", help="Run formatted 21-model benchmark table before unit tests")
+    parser.add_argument("--backend", type=str, default=None, help="Run unmocked real-forward table on specified backend (auto, xpu, cuda, rocm, dml, mps, cpu)")
+    parser.add_argument("--cloud-verify", action="store_true", help="Run formatted 44-model unmocked real-forward table before unit tests")
     known_args, remaining_argv = parser.parse_known_args()
 
     if known_args.backend is not None or known_args.cloud_verify:
         sys.exit(run_cloud_verification_suite(preferred_backend=known_args.backend or "auto"))
     else:
+        from omni_lora.tests.test_real_model_contracts import (  # noqa: F401
+            TestAutogradInPlaceFidelity,
+            TestComfyUIUpstreamDriftGuard,
+            TestMultimodalAndConnectorStress,
+            TestRealForwardEditModels,
+            TestRealForwardModelContracts,
+        )
         unittest.main(argv=[sys.argv[0]] + remaining_argv)
 
 

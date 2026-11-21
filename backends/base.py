@@ -1396,6 +1396,7 @@ class HardwareBackend(abc.ABC):
         reserve_vram_gb: float = 0.0,
         optimizer_type: str = "radamw",
         gradient_checkpointing: bool = True,
+        has_control_latents: bool = False,
     ) -> Dict[str, float]:
         """
         Compute a deterministic, graph-inspected VRAM budget across any GPU size (6 GB to 80 GB+)
@@ -1482,7 +1483,10 @@ class HardwareBackend(abc.ABC):
         # 3. Exact Single-Block Peak Recomputed Activation + Outer Stem Footprint for Sequence Length `S`
         eff_batch = max(1, int(batch_size))
         img_tokens = max(256, int(math.ceil(float(resolution) / 16.0)) ** 2)
-        seq_tokens = float(eff_batch * (img_tokens + 256))
+        # Paired image-editing models (`reference_latents`) concatenate reference tokens alongside
+        # target image tokens, roughly doubling visual sequence length through joint attention blocks.
+        ctrl_tok_mult = 2.0 if bool(has_control_latents) else 1.0
+        seq_tokens = float(eff_batch * (img_tokens * ctrl_tok_mult + 256))
         compute_elem_bytes = 4.0 if self.torch_dtype == torch.float32 else 2.0
         max_hidden_dim = float(profile.get("max_hidden_dim", 3072.0) or 3072.0)
         model_dim = float(profile.get("model_dim", 0.0) or min(3072.0, max_hidden_dim))
@@ -1608,6 +1612,7 @@ class HardwareBackend(abc.ABC):
         reserve_vram_gb: float = 0.0,
         optimizer_type: str = "radamw",
         gradient_checkpointing: bool = True,
+        has_control_latents: bool = False,
     ) -> Dict[str, float]:
         """
         Enforce a safe VRAM resident weight ceiling across `module`:
@@ -1636,6 +1641,7 @@ class HardwareBackend(abc.ABC):
             reserve_vram_gb=reserve_vram_gb,
             optimizer_type=optimizer_type,
             gradient_checkpointing=gradient_checkpointing,
+            has_control_latents=has_control_latents,
         )
         max_resident_bytes = int(budget["max_resident_model_mb"] * (1024**2))
 
@@ -1664,6 +1670,34 @@ class HardwareBackend(abc.ABC):
                     break
         if not hasattr(module, "_omni_initial_device"):
             module._omni_initial_device = initial_dev or torch.device("cpu")  # type: ignore[attr-defined]
+
+        # MiniMax H3 / H3-Image checkpoints intentionally keep output heads (especially PDD offset
+        # banks), patchifiers, time_embedder, and curve-form AdaLN basis projections in float32.
+        # Keep those small islands in float32 so training matches inference numerically without
+        # affecting VRAM placement for any other architecture.
+        fp32_preserve_sub_ids: set[int] = set()
+        if getattr(module.__class__, "__module__", "").startswith("comfy.ldm.minimax."):
+            for attr_name in ("video_patch_proj", "audio_patch_proj"):
+                sub_m = getattr(module, attr_name, None)
+                if isinstance(sub_m, nn.Module):
+                    fp32_preserve_sub_ids.add(id(sub_m))
+            t_emb_mod = getattr(module, "time_embedder", None)
+            if isinstance(t_emb_mod, nn.Module):
+                for desc in t_emb_mod.modules():
+                    fp32_preserve_sub_ids.add(id(desc))
+            fl_mod = getattr(module, "final_layer", None)
+            if isinstance(fl_mod, nn.Module):
+                for head_attr in ("video_out", "audio_out"):
+                    head_m = getattr(fl_mod, head_attr, None)
+                    if isinstance(head_m, nn.Module):
+                        fp32_preserve_sub_ids.add(id(head_m))
+            if bool(getattr(module, "use_adaln_curves", False)):
+                for desc in module.modules():
+                    adaln_m = getattr(desc, "adaln_proj", None)
+                    if isinstance(adaln_m, nn.Module):
+                        lin_m = getattr(adaln_m, "linear", None)
+                        if isinstance(lin_m, nn.Module):
+                            fp32_preserve_sub_ids.add(id(lin_m))
 
         # 1. Move all non-base_layer parameters & buffers (including lora_A, lora_B, norms, embeddings) to device
         with torch.inference_mode(False):
@@ -1732,6 +1766,8 @@ class HardwareBackend(abc.ABC):
                     else:
                         if param.dtype == torch.bfloat16 and not caps.supports_bf16:
                             dt = target_dtype
+                        elif param.dtype == torch.float32 and id(sub) in fp32_preserve_sub_ids:
+                            dt = torch.float32
                         elif (
                             not param.requires_grad
                             and param.dtype in (torch.float32, torch.float16, torch.bfloat16)

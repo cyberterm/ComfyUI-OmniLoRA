@@ -149,15 +149,155 @@ def _open_pil_image_any_format(img_path: Path):
     raise RuntimeError(f"[OmniLoRA] Failed to load image file: {img_path}")
 
 
-@dataclass
-class DatasetSample:
-    """A single normalized `[3, H, W]` image tensor (`[-1, 1]`) paired with its formatted caption and optional spatial loss mask."""
+def _probe_image_header(img_path: Path) -> Tuple[int, int, bool]:
+    """
+    Read only the image header `(orig_h, orig_w, has_alpha)` from disk with EXIF
+    orientation applied — without decoding full pixel buffers into CPU RAM.
+    Falls back to `_open_pil_image_any_format` only for formats PIL cannot open
+    natively (e.g. `.avif`/`.heic` needing `imageio`/`cv2`), closing immediately.
+    """
+    from PIL import Image
 
-    pixel_values: torch.Tensor  # [3, H, W] in [-1, 1], float32
-    caption: str
-    source_name: str
-    bucket_size: Tuple[int, int] = (1024, 1024)  # (height, width)
-    loss_mask: Optional[torch.Tensor] = None  # [1, H, W] in [0, 1], float32
+    _ensure_image_format_plugins_registered()
+    try:
+        with Image.open(img_path) as raw_img:
+            w, h = raw_img.size
+            try:
+                exif = raw_img.getexif()
+                orientation = int(exif.get(274, 1)) if exif is not None else 1
+                if orientation in (5, 6, 7, 8):
+                    h, w = w, h
+            except Exception:
+                pass
+            has_alpha = raw_img.mode in ("RGBA", "LA", "PA") or (
+                raw_img.mode == "P" and "transparency" in raw_img.info
+            )
+            return int(h), int(w), bool(has_alpha)
+    except Exception:
+        pil_img = _open_pil_image_any_format(img_path)
+        try:
+            w, h = pil_img.size
+            has_alpha = pil_img.mode in ("RGBA", "LA", "PA") or (
+                pil_img.mode == "P" and "transparency" in pil_img.info
+            )
+            return int(h), int(w), bool(has_alpha)
+        finally:
+            try:
+                pil_img.close()
+            except Exception:
+                pass
+
+
+class DatasetSample:
+    """
+    A single normalized `[3, H, W]` image sample (`[-1, 1]`) paired with its formatted caption,
+    bucket geometry, optional spatial loss mask, and optional control/source image.
+
+    For folder-backed datasets, pixel tensors are lazily decoded on demand (or streamed one
+    sample at a time inside `OmniLoRAPrecomputeConditioning`) so large paired datasets never
+    hold gigabytes of uncompressed float32 pixels in CPU RAM simultaneously.
+    """
+
+    def __init__(
+        self,
+        pixel_values: Optional[torch.Tensor] = None,
+        caption: str = "",
+        source_name: str = "",
+        bucket_size: Tuple[int, int] = (1024, 1024),
+        loss_mask: Optional[torch.Tensor] = None,
+        control_pixel_values: Optional[torch.Tensor] = None,
+        control_source_name: Optional[str] = None,
+        image_path: Optional[Path] = None,
+        control_file_path: Optional[Path] = None,
+        orig_hw: Optional[Tuple[int, int]] = None,
+        has_potential_mask: bool = False,
+        _loader: Optional[object] = None,
+    ) -> None:
+        self._pixel_values: Optional[torch.Tensor] = pixel_values
+        self._loss_mask: Optional[torch.Tensor] = loss_mask
+        self._control_pixel_values: Optional[torch.Tensor] = control_pixel_values
+        self._decoded_target: bool = pixel_values is not None
+        self._decoded_control: bool = (control_pixel_values is not None) or (control_file_path is None)
+        self._released: bool = False
+        self.caption: str = caption
+        self.source_name: str = source_name
+        self.bucket_size: Tuple[int, int] = bucket_size
+        self.control_source_name: Optional[str] = control_source_name
+        self.image_path: Optional[Path] = image_path
+        self.control_file_path: Optional[Path] = control_file_path
+        self.orig_hw: Optional[Tuple[int, int]] = orig_hw
+        self.has_potential_mask: bool = bool(has_potential_mask or (loss_mask is not None))
+        self._loader: Optional[object] = _loader
+
+    @property
+    def has_control(self) -> bool:
+        return (
+            isinstance(self._control_pixel_values, torch.Tensor)
+            and self._control_pixel_values.ndim >= 3
+            and self._control_pixel_values.numel() > 0
+        ) or (self.control_file_path is not None)
+
+    def _lazy_load_target(self) -> None:
+        if self._decoded_target or self._released:
+            return
+        if self._loader is not None and self.image_path is not None:
+            px, mask_t = self._loader._decode_target_from_disk(self)  # type: ignore[attr-defined]
+            self._pixel_values = px
+            self._loss_mask = mask_t
+            self._decoded_target = True
+
+    def _lazy_load_control(self) -> None:
+        if self._decoded_control or self._released:
+            return
+        if self._loader is not None and self.control_file_path is not None:
+            self._control_pixel_values = self._loader._decode_control_from_disk(self)  # type: ignore[attr-defined]
+            self._decoded_control = True
+
+    @property
+    def pixel_values(self) -> torch.Tensor:
+        self._lazy_load_target()
+        if self._pixel_values is None:
+            return torch.empty((0,), dtype=torch.float32, device="cpu")
+        return self._pixel_values
+
+    @pixel_values.setter
+    def pixel_values(self, value: Optional[torch.Tensor]) -> None:
+        self._pixel_values = value
+        if isinstance(value, torch.Tensor) and value.ndim >= 3 and value.numel() > 0:
+            self._decoded_target = True
+            self._released = False
+        else:
+            self._decoded_target = False
+            self._released = True
+
+    @property
+    def loss_mask(self) -> Optional[torch.Tensor]:
+        self._lazy_load_target()
+        return self._loss_mask
+
+    @loss_mask.setter
+    def loss_mask(self, value: Optional[torch.Tensor]) -> None:
+        self._loss_mask = value
+
+    @property
+    def control_pixel_values(self) -> Optional[torch.Tensor]:
+        self._lazy_load_control()
+        return self._control_pixel_values
+
+    @control_pixel_values.setter
+    def control_pixel_values(self, value: Optional[torch.Tensor]) -> None:
+        self._control_pixel_values = value
+        if isinstance(value, torch.Tensor) and value.ndim >= 3 and value.numel() > 0:
+            self._decoded_control = True
+        else:
+            self._decoded_control = self.control_file_path is None
+
+    def __repr__(self) -> str:
+        return (
+            f"DatasetSample(source_name={self.source_name!r}, bucket_size={self.bucket_size}, "
+            f"lazy={self.image_path is not None and self._pixel_values is None}, "
+            f"has_control={self.has_control})"
+        )
 
 
 @dataclass
@@ -177,6 +317,8 @@ class OmniLoRADatasetConfig:
     use_alpha_mask: bool = True
     mask_unmasked_weight: float = 0.1
     seed: int = 42
+    control_path: str = ""
+    control_resize_mode: str = "match_target"
 
 
 def resolve_aspect_ratio_bucket(
@@ -279,11 +421,14 @@ def preprocess_comfy_image_tensor(
     center_crop: bool = True,
     do_flip: bool = False,
     aspect_ratio_bucketing: bool = False,
+    target_size: Optional[Tuple[int, int]] = None,
 ) -> torch.Tensor:
     """
     Convert a single ComfyUI image tensor `[H, W, C]` (or `[1, H, W, C]`) in `[0, 1]`
     into a normalized PyTorch `[3, target_h, target_w]` tensor in `[-1, 1]` (`torch.float32`).
 
+    - When `target_size` is provided (`(target_h, target_w)`), resizes/crops/pads to that exact bucket
+      (used e.g. for `control_resize_mode="match_target"` so control and target share identical framing).
     - When `aspect_ratio_bucketing=True`:
       * `center_crop=True`: scales uniformly to cover `(target_h, target_w)` and center-crops any remainder.
       * `center_crop=False`: scales uniformly to fit inside `(target_h, target_w)` and center-pads with neutral `0.5` gray.
@@ -321,7 +466,9 @@ def preprocess_comfy_image_tensor(
             img = img.repeat(3, 1, 1)
 
         _, h, w = img.shape
-        if aspect_ratio_bucketing:
+        if target_size is not None:
+            target_h, target_w = max(1, int(target_size[0])), max(1, int(target_size[1]))
+        elif aspect_ratio_bucketing:
             target_h, target_w = resolve_aspect_ratio_bucket(h, w, resolution)
         else:
             target_h, target_w = (resolution, resolution)
@@ -592,19 +739,23 @@ class OmniLoRADataset:
         comfy_images: Optional[torch.Tensor] = None,
         custom_prompts: Optional[str] = None,
         comfy_masks: Optional[torch.Tensor] = None,
+        comfy_control_images: Optional[torch.Tensor] = None,
     ) -> None:
         self.config = config
         self._comfy_images = comfy_images
         self._custom_prompts = custom_prompts
         self._comfy_masks = comfy_masks
+        self._comfy_control_images = comfy_control_images
         self.rng = random.Random(config.seed)
         self.samples: List[DatasetSample] = []
         self.bucket_counts: Dict[str, int] = {}
         self._masked_sample_count: int = 0
+        self._controlled_sample_count: int = 0
         self._load_samples(
             comfy_images=comfy_images,
             custom_prompts=custom_prompts,
             comfy_masks=comfy_masks,
+            comfy_control_images=comfy_control_images,
         )
 
     def _ensure_pixel_values_loaded(self) -> None:
@@ -612,19 +763,29 @@ class OmniLoRADataset:
         Reload pixel tensors on demand if ComfyUI re-executes `OmniLoRAPrecomputeConditioning`
         (e.g. after the user changes `Load Diffusion Model`, `CLIPLoader`, or `VAELoader`)
         using a cached `OmniLoRADataset` instance whose `pixel_values` were freed after the previous run.
+        Disk-backed samples stream directly from `sample.image_path` without eager reloads.
         """
-        if not self.samples or any(
-            s.pixel_values.ndim < 3 or s.pixel_values.numel() == 0 for s in self.samples
-        ):
+        needs_reload = not self.samples or any(
+            s.image_path is None
+            and (s._pixel_values is None or s._pixel_values.ndim < 3 or s._pixel_values.numel() == 0)
+            for s in self.samples
+        )
+        if needs_reload:
             self.rng = random.Random(self.config.seed)
             self.samples.clear()
             self.bucket_counts.clear()
             self._masked_sample_count = 0
+            self._controlled_sample_count = 0
             self._load_samples(
                 comfy_images=self._comfy_images,
                 custom_prompts=self._custom_prompts,
                 comfy_masks=self._comfy_masks,
+                comfy_control_images=self._comfy_control_images,
             )
+        else:
+            for s in self.samples:
+                if s.image_path is not None and s._released:
+                    s._released = False
 
     def _read_sidecar_caption(
         self,
@@ -747,12 +908,199 @@ class OmniLoRADataset:
         _walk_dir(folder)
         return discovered
 
+    @classmethod
+    def _index_control_folder(cls, control_dir: Path) -> Tuple[Dict[str, Path], Dict[str, Path]]:
+        """
+        Build lookup maps for a control image folder:
+          - `by_rel_stem`: normalized lowercase relative path without extension (e.g. `"sub/001"`) -> `Path`
+          - `by_stem`: lowercase filename stem (e.g. `"001"`) -> `Path`
+        Allows matching target & control images across different extensions (e.g. `.png` <-> `.jpg`)
+        and mirrored subfolder layouts (`dataset/sub/001.png` <-> `control/sub/001.webp`) with flat fallback.
+        """
+        by_rel_stem: Dict[str, Path] = {}
+        by_stem: Dict[str, Path] = {}
+        for ctrl_path in cls._discover_dataset_image_files(control_dir):
+            try:
+                rel_no_ext = str(ctrl_path.relative_to(control_dir).with_suffix("")).replace("\\", "/").lower()
+            except ValueError:
+                rel_no_ext = ctrl_path.stem.lower()
+            by_rel_stem.setdefault(rel_no_ext, ctrl_path)
+            by_stem.setdefault(ctrl_path.stem.lower(), ctrl_path)
+        return by_rel_stem, by_stem
+
+    @staticmethod
+    def _match_control_file(
+        img_path: Path,
+        dataset_root: Path,
+        by_rel_stem: Dict[str, Path],
+        by_stem: Dict[str, Path],
+    ) -> Optional[Path]:
+        """Locate the matching control image for `img_path` by mirrored relative path, then by filename stem."""
+        try:
+            rel_no_ext = str(img_path.relative_to(dataset_root).with_suffix("")).replace("\\", "/").lower()
+            if rel_no_ext in by_rel_stem:
+                return by_rel_stem[rel_no_ext]
+        except ValueError:
+            pass
+        return by_stem.get(img_path.stem.lower())
+
+    def _preprocess_control_tensor(
+        self,
+        ctrl_img: torch.Tensor,
+        target_hw: Tuple[int, int],
+    ) -> torch.Tensor:
+        """
+        Preprocess a control image tensor according to `self.config.control_resize_mode`:
+          - `"match_target"` (default): resize/crop/pad to the exact `(target_h, target_w)` bucket.
+          - `"preserve_aspect"`: resize into the control image's own aspect-ratio bucket.
+        """
+        mode = str(self.config.control_resize_mode or "match_target").strip().lower()
+        if mode == "preserve_aspect":
+            return preprocess_comfy_image_tensor(
+                ctrl_img,
+                resolution=self.config.resolution,
+                center_crop=self.config.center_crop,
+                do_flip=False,
+                aspect_ratio_bucketing=self.config.aspect_ratio_bucketing,
+            )
+        return preprocess_comfy_image_tensor(
+            ctrl_img,
+            resolution=self.config.resolution,
+            center_crop=self.config.center_crop,
+            do_flip=False,
+            aspect_ratio_bucketing=self.config.aspect_ratio_bucketing,
+            target_size=target_hw,
+        )
+
+    def _decode_target_from_disk(
+        self,
+        sample: DatasetSample,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Decode and preprocess a single disk-backed sample's target image and optional spatial loss mask."""
+        assert sample.image_path is not None
+        comfy_t, raw_mask = _load_image_and_mask_from_file(
+            sample.image_path,
+            use_alpha_mask=bool(self.config.use_alpha_mask),
+        )
+        orig_h, orig_w = int(comfy_t.shape[0]), int(comfy_t.shape[1])
+        pixel_values = preprocess_comfy_image_tensor(
+            comfy_t,
+            resolution=self.config.resolution,
+            center_crop=self.config.center_crop,
+            do_flip=False,
+            aspect_ratio_bucketing=self.config.aspect_ratio_bucketing,
+            target_size=sample.bucket_size,
+        )
+        target_hw = (int(pixel_values.shape[1]), int(pixel_values.shape[2]))
+        loss_mask: Optional[torch.Tensor] = None
+        if raw_mask is not None and self.config.use_alpha_mask:
+            loss_mask = preprocess_comfy_mask_tensor(
+                raw_mask,
+                resolution=self.config.resolution,
+                orig_h=orig_h,
+                orig_w=orig_w,
+                center_crop=self.config.center_crop,
+                do_flip=False,
+                aspect_ratio_bucketing=self.config.aspect_ratio_bucketing,
+                unmasked_weight=self.config.mask_unmasked_weight,
+            )
+        elif (
+            not self.config.center_crop
+            and self.config.aspect_ratio_bucketing
+            and (orig_h != target_hw[0] or orig_w != target_hw[1])
+        ):
+            ones_mask = torch.ones((orig_h, orig_w), dtype=torch.float32)
+            loss_mask = preprocess_comfy_mask_tensor(
+                ones_mask,
+                resolution=self.config.resolution,
+                orig_h=orig_h,
+                orig_w=orig_w,
+                center_crop=False,
+                do_flip=False,
+                aspect_ratio_bucketing=True,
+                unmasked_weight=1.0,
+            )
+            if float(loss_mask.min().item()) >= 0.999:
+                loss_mask = None
+        return pixel_values, loss_mask
+
+    def _decode_control_from_disk(self, sample: DatasetSample) -> Optional[torch.Tensor]:
+        """Decode and preprocess a single disk-backed sample's paired control image."""
+        if sample.control_file_path is None:
+            return None
+        ctrl_raw = _load_image_file_as_comfy_tensor(sample.control_file_path)
+        return self._preprocess_control_tensor(ctrl_raw, target_hw=sample.bucket_size)
+
+    def decode_sample_tensors(
+        self,
+        sample: DatasetSample,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Stream-decode `(pixel_values, loss_mask, control_pixel_values)` for a single sample.
+        For lazy disk-backed samples that have not been eagerly cached on `sample`, tensors are
+        decoded fresh and returned WITHOUT pinning them onto `sample` so peak host RAM remains
+        O(1 image pair) during `OmniLoRAPrecomputeConditioning`.
+        """
+        if sample.image_path is not None and sample._pixel_values is None:
+            px, mask_t = self._decode_target_from_disk(sample)
+        else:
+            px = sample.pixel_values
+            mask_t = sample.loss_mask
+
+        if sample.control_file_path is not None and sample._control_pixel_values is None:
+            ctrl_px = self._decode_control_from_disk(sample)
+        else:
+            ctrl_px = sample.control_pixel_values
+        return px, mask_t, ctrl_px
+
+    def decode_sample_control_tensor(self, sample: DatasetSample) -> Optional[torch.Tensor]:
+        """Stream-decode only a single sample's control tensor without caching full pixels on `sample`."""
+        if sample.control_file_path is not None and sample._control_pixel_values is None:
+            return self._decode_control_from_disk(sample)
+        return sample.control_pixel_values
+
+    def _record_lazy_disk_sample(
+        self,
+        img_file: Path,
+        orig_hw: Tuple[int, int],
+        target_hw: Tuple[int, int],
+        caption: str,
+        has_mask: bool = False,
+        control_file_path: Optional[Path] = None,
+        control_source_name: Optional[str] = None,
+    ) -> None:
+        bh, bw = int(target_hw[0]), int(target_hw[1])
+        bucket_key = f"{bw}x{bh}"
+        self.bucket_counts[bucket_key] = self.bucket_counts.get(bucket_key, 0) + 1
+        if has_mask:
+            self._masked_sample_count += 1
+        if control_file_path is not None:
+            self._controlled_sample_count += 1
+        self.samples.append(
+            DatasetSample(
+                pixel_values=None,
+                caption=caption,
+                source_name=img_file.name,
+                bucket_size=(bh, bw),
+                loss_mask=None,
+                control_pixel_values=None,
+                control_source_name=control_source_name,
+                image_path=img_file,
+                control_file_path=control_file_path,
+                orig_hw=orig_hw,
+                has_potential_mask=has_mask,
+                _loader=self,
+            )
+        )
+
     def _record_sample(
         self,
         pixel_values: torch.Tensor,
         caption: str,
         source_name: str,
         loss_mask: Optional[torch.Tensor] = None,
+        control_pixel_values: Optional[torch.Tensor] = None,
+        control_source_name: Optional[str] = None,
     ) -> None:
         bh = int(pixel_values.shape[1])
         bw = int(pixel_values.shape[2])
@@ -760,6 +1108,8 @@ class OmniLoRADataset:
         self.bucket_counts[bucket_key] = self.bucket_counts.get(bucket_key, 0) + 1
         if loss_mask is not None:
             self._masked_sample_count += 1
+        if control_pixel_values is not None:
+            self._controlled_sample_count += 1
         self.samples.append(
             DatasetSample(
                 pixel_values=pixel_values,
@@ -767,6 +1117,8 @@ class OmniLoRADataset:
                 source_name=source_name,
                 bucket_size=(bh, bw),
                 loss_mask=loss_mask,
+                control_pixel_values=control_pixel_values,
+                control_source_name=control_source_name,
             )
         )
 
@@ -799,64 +1151,86 @@ class OmniLoRADataset:
         comfy_images: Optional[torch.Tensor],
         custom_prompts: Optional[str],
         comfy_masks: Optional[torch.Tensor] = None,
+        comfy_control_images: Optional[torch.Tensor] = None,
     ) -> None:
-        # 1. Load from local dataset folder if provided and exists on disk
+        # 0. Optional control image folder index for paired image-editing datasets
+        control_folder_str = (self.config.control_path or "").strip().strip("\"'")
+        control_dir: Optional[Path] = None
+        ctrl_by_rel: Dict[str, Path] = {}
+        ctrl_by_stem: Dict[str, Path] = {}
+        if control_folder_str:
+            control_dir = Path(control_folder_str).expanduser()
+            if not control_dir.is_dir():
+                raise ValueError(
+                    f"[OmniLoRA] control_path directory not found: '{control_dir}'. "
+                    f"Leave `control_path` empty for standard text-to-image training, or provide a valid folder "
+                    f"containing control/source images with matching filenames."
+                )
+            ctrl_by_rel, ctrl_by_stem = self._index_control_folder(control_dir)
+
+        # 1. Index local dataset folder lazily via image headers (zero full pixel decode in RAM)
         folder_str = (self.config.dataset_path or "").strip().strip("\"'")
+        folder_image_count = 0
+        folder_control_matches = 0
+        first_target_stem = ""
         if folder_str:
             folder = Path(folder_str).expanduser()
             if folder.is_dir():
                 manifest_captions = self._load_manifest_captions(folder)
                 image_files = self._discover_dataset_image_files(folder)
                 for img_file in image_files:
+                    folder_image_count += 1
+                    if not first_target_stem:
+                        first_target_stem = img_file.stem
                     raw_cap = self._read_sidecar_caption(
                         img_file,
                         manifest_captions=manifest_captions,
                         root_folder=folder,
                     )
-                    comfy_t, raw_mask = _load_image_and_mask_from_file(
-                        img_file,
-                        use_alpha_mask=bool(self.config.use_alpha_mask),
+                    orig_h, orig_w, has_alpha = _probe_image_header(img_file)
+                    if self.config.aspect_ratio_bucketing:
+                        target_hw = resolve_aspect_ratio_bucket(orig_h, orig_w, self.config.resolution)
+                    else:
+                        target_hw = (self.config.resolution, self.config.resolution)
+
+                    has_sidecar_mask = bool(
+                        self.config.use_alpha_mask and _find_sidecar_mask_file(img_file) is not None
                     )
-                    orig_h, orig_w = int(comfy_t.shape[0]), int(comfy_t.shape[1])
-                    pixel_values = preprocess_comfy_image_tensor(
-                        comfy_t,
-                        resolution=self.config.resolution,
-                        center_crop=self.config.center_crop,
-                        do_flip=False,
-                        aspect_ratio_bucketing=self.config.aspect_ratio_bucketing,
-                    )
-                    loss_mask: Optional[torch.Tensor] = None
-                    if raw_mask is not None and self.config.use_alpha_mask:
-                        loss_mask = preprocess_comfy_mask_tensor(
-                            raw_mask,
-                            resolution=self.config.resolution,
-                            orig_h=orig_h,
-                            orig_w=orig_w,
-                            center_crop=self.config.center_crop,
-                            do_flip=False,
-                            aspect_ratio_bucketing=self.config.aspect_ratio_bucketing,
-                            unmasked_weight=self.config.mask_unmasked_weight,
-                        )
-                    elif (
+                    has_letterbox_mask = False
+                    if (
                         not self.config.center_crop
                         and self.config.aspect_ratio_bucketing
-                        and (orig_h != int(pixel_values.shape[1]) or orig_w != int(pixel_values.shape[2]))
+                        and (orig_h != target_hw[0] or orig_w != target_hw[1])
                     ):
-                        # When letterbox-padding (`center_crop=False` + `aspect_ratio_bucketing=True`),
-                        # zero out any padded border bars so the model only trains on valid image pixels.
-                        ones_mask = torch.ones((orig_h, orig_w), dtype=torch.float32)
-                        loss_mask = preprocess_comfy_mask_tensor(
-                            ones_mask,
-                            resolution=self.config.resolution,
-                            orig_h=orig_h,
-                            orig_w=orig_w,
-                            center_crop=False,
-                            do_flip=False,
-                            aspect_ratio_bucketing=True,
-                            unmasked_weight=1.0,
+                        scale = min(
+                            float(target_hw[0]) / float(max(1, orig_h)),
+                            float(target_hw[1]) / float(max(1, orig_w)),
                         )
-                        if float(loss_mask.min().item()) >= 0.999:
-                            loss_mask = None
+                        scaled_h = max(1, min(target_hw[0], int(round(float(orig_h) * scale))))
+                        scaled_w = max(1, min(target_hw[1], int(round(float(orig_w) * scale))))
+                        has_letterbox_mask = (scaled_h != target_hw[0]) or (scaled_w != target_hw[1])
+
+                    has_mask = bool(
+                        has_sidecar_mask
+                        or (self.config.use_alpha_mask and has_alpha)
+                        or has_letterbox_mask
+                    )
+
+                    matched_ctrl: Optional[Path] = None
+                    control_source_name: Optional[str] = None
+                    if control_dir is not None:
+                        matched_ctrl = self._match_control_file(
+                            img_file,
+                            dataset_root=folder,
+                            by_rel_stem=ctrl_by_rel,
+                            by_stem=ctrl_by_stem,
+                        )
+                        if matched_ctrl is not None:
+                            try:
+                                control_source_name = str(matched_ctrl.relative_to(control_dir)).replace("\\", "/")
+                            except ValueError:
+                                control_source_name = matched_ctrl.name
+                            folder_control_matches += 1
 
                     caption = format_caption_with_trigger(
                         raw_caption=raw_cap,
@@ -865,18 +1239,36 @@ class OmniLoRADataset:
                         caption_dropout=0.0,
                         rng=self.rng,
                     )
-                    self._record_sample(
-                        pixel_values=pixel_values,
+                    self._record_lazy_disk_sample(
+                        img_file=img_file,
+                        orig_hw=(orig_h, orig_w),
+                        target_hw=target_hw,
                         caption=caption,
-                        source_name=img_file.name,
-                        loss_mask=loss_mask,
+                        has_mask=has_mask,
+                        control_file_path=matched_ctrl,
+                        control_source_name=control_source_name,
                     )
+
+        if control_dir is not None and folder_image_count > 0 and folder_control_matches == 0:
+            sample_ctrl_stem = next(iter(ctrl_by_stem.keys()), "(no images found)")
+            raise ValueError(
+                f"[OmniLoRA] control_path='{control_dir}' matched 0 of {folder_image_count} target images "
+                f"in '{folder_str}'. Target and control images must share matching filename stems "
+                f"(e.g. target '{first_target_stem}.png' <-> control '{first_target_stem}.jpg'; "
+                f"found example control stem '{sample_ctrl_stem}')."
+            )
 
         # 2. Load from direct ComfyUI IMAGE batch input if connected
         if comfy_images is not None:
             imgs = comfy_images.detach()
             if imgs.ndim == 3:
                 imgs = imgs.unsqueeze(0)
+            ctrl_imgs: Optional[torch.Tensor] = None
+            if isinstance(comfy_control_images, torch.Tensor) and comfy_control_images.numel() > 0:
+                ctrl_imgs = comfy_control_images.detach()
+                if ctrl_imgs.ndim == 3:
+                    ctrl_imgs = ctrl_imgs.unsqueeze(0)
+
             prompt_lines = [
                 line.strip()
                 for line in (custom_prompts or "").splitlines()
@@ -912,6 +1304,7 @@ class OmniLoRADataset:
                     do_flip=False,
                     aspect_ratio_bucketing=self.config.aspect_ratio_bucketing,
                 )
+                target_hw = (int(pixel_values.shape[1]), int(pixel_values.shape[2]))
                 loss_mask = None
                 if raw_mask is not None and (comfy_masks is not None or self.config.use_alpha_mask):
                     loss_mask = preprocess_comfy_mask_tensor(
@@ -927,7 +1320,7 @@ class OmniLoRADataset:
                 elif (
                     not self.config.center_crop
                     and self.config.aspect_ratio_bucketing
-                    and (orig_h != int(pixel_values.shape[1]) or orig_w != int(pixel_values.shape[2]))
+                    and (orig_h != target_hw[0] or orig_w != target_hw[1])
                 ):
                     ones_mask = torch.ones((orig_h, orig_w), dtype=torch.float32)
                     loss_mask = preprocess_comfy_mask_tensor(
@@ -943,6 +1336,17 @@ class OmniLoRADataset:
                     if float(loss_mask.min().item()) >= 0.999:
                         loss_mask = None
 
+                control_pixel_values = None
+                control_source_name = None
+                if ctrl_imgs is not None:
+                    ctrl_idx = idx if idx < int(ctrl_imgs.shape[0]) else (0 if int(ctrl_imgs.shape[0]) == 1 else -1)
+                    if ctrl_idx >= 0:
+                        control_pixel_values = self._preprocess_control_tensor(
+                            ctrl_imgs[ctrl_idx],
+                            target_hw=target_hw,
+                        )
+                        control_source_name = f"comfy_control_{ctrl_idx:03d}"
+
                 caption = format_caption_with_trigger(
                     raw_caption=raw_cap,
                     trigger_word=self.config.trigger_word,
@@ -955,6 +1359,8 @@ class OmniLoRADataset:
                     caption=caption,
                     source_name=f"comfy_image_{idx:03d}",
                     loss_mask=loss_mask,
+                    control_pixel_values=control_pixel_values,
+                    control_source_name=control_source_name,
                 )
 
         if not self.samples:
@@ -969,17 +1375,19 @@ class OmniLoRADataset:
         return len(self.samples)
 
     @property
+    def num_controlled_images(self) -> int:
+        return self._controlled_sample_count
+
+    @property
     def total_effective_samples(self) -> int:
         return len(self.samples) * max(1, self.config.num_repeats)
 
-    def build_batches_with_masks(
-        self,
-    ) -> Tuple[List[torch.Tensor], List[List[str]], List[Optional[torch.Tensor]]]:
+    def build_streaming_batch_plans(self) -> List[List[DatasetSample]]:
         """
-        Group repeated dataset samples by aspect ratio bucket `(bucket_h, bucket_w)` and
-        slice into mini-batches of `(pixel_batch, prompt_batch, mask_batch)` where:
-          - `pixel_batch` has shape `[B, 3, bucket_h, bucket_w]` (`torch.float32`, `[-1, 1]`)
-          - `mask_batch` has shape `[B, 1, bucket_h, bucket_w]` (`torch.float32`, `[0, 1]`) or `None`.
+        Group repeated dataset samples by target aspect ratio bucket `(bucket_h, bucket_w)` and
+        slice into lightweight `List[DatasetSample]` mini-batch plans WITHOUT decoding any pixel
+        buffers from disk. Used by `OmniLoRAPrecomputeConditioning` to stream-encode one image
+        pair at a time in O(1) host RAM.
         """
         self._ensure_pixel_values_loaded()
 
@@ -990,36 +1398,81 @@ class OmniLoRADataset:
         bsz = max(1, self.config.batch_size)
         bucket_groups: Dict[Tuple[int, int], List[DatasetSample]] = {}
         for sample in expanded:
-            b_key = (int(sample.pixel_values.shape[1]), int(sample.pixel_values.shape[2]))
+            b_key = (int(sample.bucket_size[0]), int(sample.bucket_size[1]))
             bucket_groups.setdefault(b_key, []).append(sample)
+
+        plans: List[List[DatasetSample]] = []
+        for group_samples in bucket_groups.values():
+            for i in range(0, len(group_samples), bsz):
+                plans.append(group_samples[i : i + bsz])
+        return plans
+
+    def build_batches_full(
+        self,
+    ) -> Tuple[
+        List[torch.Tensor],
+        List[List[str]],
+        List[Optional[torch.Tensor]],
+        List[List[Optional[torch.Tensor]]],
+        List[List[Optional[str]]],
+    ]:
+        """
+        Group repeated dataset samples by target aspect ratio bucket `(bucket_h, bucket_w)` and
+        slice into mini-batches of `(pixel_batch, prompt_batch, mask_batch, control_batch, control_sources)` where:
+          - `pixel_batch` has shape `[B, 3, bucket_h, bucket_w]` (`torch.float32`, `[-1, 1]`)
+          - `mask_batch` has shape `[B, 1, bucket_h, bucket_w]` (`torch.float32`, `[0, 1]`) or `None`
+          - `control_batch` is a per-sample `List[Optional[torch.Tensor]]` (each `[3, H_c, W_c]` in `[-1, 1]` or `None`),
+            allowing mixed controlled/uncontrolled samples and independent control aspect ratios (`preserve_aspect`).
+          - `control_sources` is a per-sample `List[Optional[str]]` identifying each control image for CLIP cache keying.
+        """
+        plans = self.build_streaming_batch_plans()
 
         pixel_batches: List[torch.Tensor] = []
         prompt_batches: List[List[str]] = []
         mask_batches: List[Optional[torch.Tensor]] = []
+        control_batches: List[List[Optional[torch.Tensor]]] = []
+        control_source_batches: List[List[Optional[str]]] = []
 
-        for (bh, bw), group_samples in bucket_groups.items():
-            for i in range(0, len(group_samples), bsz):
-                chunk = group_samples[i : i + bsz]
-                pixels = torch.stack([s.pixel_values for s in chunk], dim=0).to(dtype=torch.float32)
-                prompts = [s.caption for s in chunk]
-                if any(s.loss_mask is not None for s in chunk):
-                    full_ones: Optional[torch.Tensor] = None
-                    chunk_masks: List[torch.Tensor] = []
-                    for s in chunk:
-                        if s.loss_mask is not None and s.loss_mask.shape[-2:] == (bh, bw):
-                            chunk_masks.append(s.loss_mask)
-                        else:
-                            if full_ones is None:
-                                full_ones = torch.ones((1, bh, bw), dtype=torch.float32, device="cpu")
-                            chunk_masks.append(full_ones)
-                    mask_batch: Optional[torch.Tensor] = torch.stack(chunk_masks, dim=0).to(dtype=torch.float32)
-                else:
-                    mask_batch = None
+        for chunk in plans:
+            bh, bw = int(chunk[0].bucket_size[0]), int(chunk[0].bucket_size[1])
+            decoded_chunk = [self.decode_sample_tensors(s) for s in chunk]
+            pixels = torch.stack([t[0] for t in decoded_chunk], dim=0).to(dtype=torch.float32)
+            prompts = [s.caption for s in chunk]
+            if any(t[1] is not None for t in decoded_chunk):
+                full_ones: Optional[torch.Tensor] = None
+                chunk_masks: List[torch.Tensor] = []
+                for _, m_t, _ in decoded_chunk:
+                    if m_t is not None and m_t.shape[-2:] == (bh, bw):
+                        chunk_masks.append(m_t)
+                    else:
+                        if full_ones is None:
+                            full_ones = torch.ones((1, bh, bw), dtype=torch.float32, device="cpu")
+                        chunk_masks.append(full_ones)
+                mask_batch: Optional[torch.Tensor] = torch.stack(chunk_masks, dim=0).to(dtype=torch.float32)
+            else:
+                mask_batch = None
 
-                pixel_batches.append(pixels)
-                prompt_batches.append(prompts)
-                mask_batches.append(mask_batch)
+            ctrl_chunk = [t[2] for t in decoded_chunk]
+            ctrl_src_chunk = [s.control_source_name for s in chunk]
 
+            pixel_batches.append(pixels)
+            prompt_batches.append(prompts)
+            mask_batches.append(mask_batch)
+            control_batches.append(ctrl_chunk)
+            control_source_batches.append(ctrl_src_chunk)
+
+        return pixel_batches, prompt_batches, mask_batches, control_batches, control_source_batches
+
+    def build_batches_with_masks(
+        self,
+    ) -> Tuple[List[torch.Tensor], List[List[str]], List[Optional[torch.Tensor]]]:
+        """
+        Group repeated dataset samples by aspect ratio bucket `(bucket_h, bucket_w)` and
+        slice into mini-batches of `(pixel_batch, prompt_batch, mask_batch)` where:
+          - `pixel_batch` has shape `[B, 3, bucket_h, bucket_w]` (`torch.float32`, `[-1, 1]`)
+          - `mask_batch` has shape `[B, 1, bucket_h, bucket_w]` (`torch.float32`, `[0, 1]`) or `None`.
+        """
+        pixel_batches, prompt_batches, mask_batches, _, _ = self.build_batches_full()
         return pixel_batches, prompt_batches, mask_batches
 
     def build_batches(self) -> Tuple[List[torch.Tensor], List[List[str]]]:
@@ -1028,19 +1481,28 @@ class OmniLoRADataset:
         slice into mini-batches of `(pixel_batch, prompt_batch)` where `pixel_batch` has
         shape `[B, 3, bucket_h, bucket_w]` (`torch.float32`, `[-1, 1]`).
         """
-        pixel_batches, prompt_batches, _ = self.build_batches_with_masks()
+        pixel_batches, prompt_batches, _, _, _ = self.build_batches_full()
         return pixel_batches, prompt_batches
 
     def release_pixel_memory(self) -> None:
         """
-        Replace in-memory `[3, H, W]` pixel tensors and `[1, H, W]` mask tensors with tiny
-        empty placeholders after `OmniLoRAPrecomputeConditioning` has encoded all samples
-        into latents, freeing host RAM.
+        Release any in-memory `[3, H, W]` pixel tensors, control image tensors, and `[1, H, W]` mask
+        tensors after `OmniLoRAPrecomputeConditioning` has encoded all samples into latents,
+        freeing host RAM. Disk-backed samples remain streamable for future re-runs.
         """
         placeholder = torch.empty((0,), dtype=torch.float32, device="cpu")
         for sample in self.samples:
-            sample.pixel_values = placeholder
-            sample.loss_mask = None
+            if sample.image_path is not None:
+                sample._pixel_values = None
+                sample._loss_mask = None
+                sample._control_pixel_values = None
+                sample._decoded_target = False
+                sample._decoded_control = sample.control_file_path is None
+                sample._released = False
+            else:
+                sample.pixel_values = placeholder
+                sample.loss_mask = None
+                sample.control_pixel_values = None
 
     def summary_dict(self) -> Dict[str, object]:
         return {
@@ -1055,6 +1517,9 @@ class OmniLoRADataset:
             "use_alpha_mask": self.config.use_alpha_mask,
             "mask_unmasked_weight": self.config.mask_unmasked_weight,
             "masked_images": self._masked_sample_count,
+            "control_path": self.config.control_path,
+            "control_resize_mode": self.config.control_resize_mode,
+            "controlled_images": self._controlled_sample_count,
             "batch_size": self.config.batch_size,
             "trigger_word": self.config.trigger_word,
             "sample_captions": [s.caption for s in self.samples[:3]],

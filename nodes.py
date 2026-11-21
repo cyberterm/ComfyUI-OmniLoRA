@@ -26,8 +26,10 @@ Provides 6 modular ComfyUI nodes under category `OmniLoRA/Training`:
 from __future__ import annotations
 
 import gc
+import inspect
 import json
 import logging
+import math
 import random
 import time
 from dataclasses import dataclass, field
@@ -54,7 +56,7 @@ from .tracker_store import TRACKER_STORE, register_omni_lora_routes
 
 @dataclass
 class CachedConditioningBundle:
-    """CPU-pinned, autograd-ready pre-cached latents and text embeddings."""
+    """CPU-pinned, autograd-ready pre-cached latents, optional control latents, and text embeddings."""
 
     batches: List[Dict[str, Any]]
     resolution: int
@@ -68,6 +70,9 @@ class CachedConditioningBundle:
     uncond_prompt_embeds: Optional[torch.Tensor] = None
     uncond_pooled_output: Optional[torch.Tensor] = None
     uncond_extra_conds: Dict[str, Any] = field(default_factory=dict)
+    has_control_latents: bool = False
+    clip_used_control_images: bool = False
+    num_controlled_images: int = 0
 
 
 @dataclass
@@ -487,6 +492,27 @@ class OmniLoRADatasetLoader:
                         "tooltip": "Minimum loss weight applied to unmasked background (mask=0) regions so the model preserves clean context without overfitting background (0.0 = strictly mask-only).",
                     },
                 ),
+                "control_path": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "tooltip": "Optional folder path containing paired control/source images for image-editing models (matched by filename stem or mirrored subfolder path, any image extension). Leave empty for standard text-to-image training.",
+                    },
+                ),
+                "control_resize_mode": (
+                    ["match_target", "preserve_aspect"],
+                    {
+                        "default": "match_target",
+                        "tooltip": "How control images are resized: 'match_target' matches each target image's exact bucket & crop framing; 'preserve_aspect' preserves each control image's own aspect ratio bucket.",
+                    },
+                ),
+                "control_images": (
+                    "IMAGE",
+                    {
+                        "tooltip": "Optional direct ComfyUI IMAGE batch of paired control/source images corresponding to connected `images`.",
+                    },
+                ),
             },
         }
 
@@ -512,6 +538,9 @@ class OmniLoRADatasetLoader:
         masks: Optional[torch.Tensor] = None,
         use_alpha_mask: bool = True,
         mask_unmasked_weight: float = 0.1,
+        control_path: str = "",
+        control_resize_mode: str = "match_target",
+        control_images: Optional[torch.Tensor] = None,
     ) -> Tuple[OmniLoRADataset, str]:
         with torch.inference_mode(False):
             cfg = OmniLoRADatasetConfig(
@@ -527,12 +556,15 @@ class OmniLoRADatasetLoader:
                 caption_dropout=caption_dropout,
                 use_alpha_mask=bool(use_alpha_mask),
                 mask_unmasked_weight=min(1.0, max(0.0, float(mask_unmasked_weight))),
+                control_path=(control_path or "").strip().strip("\"'"),
+                control_resize_mode=str(control_resize_mode or "match_target"),
             )
             dataset = OmniLoRADataset(
                 config=cfg,
                 comfy_images=images,
                 custom_prompts=custom_prompts,
                 comfy_masks=masks,
+                comfy_control_images=control_images,
             )
             info_json = json.dumps(dataset.summary_dict(), indent=2)
             return (dataset, info_json)
@@ -559,6 +591,33 @@ class OmniLoRAPrecomputeConditioning:
                     },
                 ),
             },
+            "optional": {
+                "pass_control_to_clip": (
+                    ["auto", "enabled", "disabled"],
+                    {
+                        "default": "auto",
+                        "tooltip": "Pass paired control images into vision-language text encoders (VLM CLIPs that accept `images` in `clip.tokenize`). 'auto' detects support from the connected CLIP; 'disabled' skips passing images to CLIP.",
+                    },
+                ),
+                "clip_vision_resolution": (
+                    "INT",
+                    {
+                        "default": 384,
+                        "min": 0,
+                        "max": 2048,
+                        "step": 32,
+                        "tooltip": "Target square-area side length when resizing control images for vision-language text encoders (0 = keep control image resolution as-is). Preserves aspect ratio.",
+                    },
+                ),
+                "clip_prompt_template": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": True,
+                        "tooltip": "Optional user-defined prompt wrapper template applied before CLIP encoding (supports `{prompt}` substitution, or `{}` as a ComfyUI `llama_template` override on LLM/VLM tokenizers). Leave empty to use captions and ComfyUI's native tokenizer template as-is.",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("OMNILORA_CACHED_DATA",)
@@ -567,14 +626,167 @@ class OmniLoRAPrecomputeConditioning:
     CATEGORY = "OmniLoRA/Training"
 
     @staticmethod
-    def _encode_single_prompt(clip: Any, text: str) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+    def _clip_supports_images_kwarg(clip: Any) -> bool:
+        """
+        Inspect a live ComfyUI `CLIP` and its underlying tokenizer(s) to determine whether
+        `clip.tokenize(..., images=[...])` is natively supported (e.g. VLM text encoders
+        such as Qwen-VL, Boogu, OmniGen2) without hardcoding any model or tokenizer names.
+        """
+        if clip is None:
+            return False
+
+        def _fn_accepts_param(fn: Any, param_name: str) -> bool:
+            if not callable(fn):
+                return False
+            try:
+                return param_name in inspect.signature(fn).parameters
+            except (ValueError, TypeError):
+                return False
+
+        tokenizer = getattr(clip, "tokenizer", None)
+        if tokenizer is None:
+            return _fn_accepts_param(getattr(clip, "tokenize", None), "images")
+
+        to_visit: List[Any] = [tokenizer]
+        visited_ids: set[int] = set()
+        while to_visit:
+            cur = to_visit.pop()
+            if cur is None or id(cur) in visited_ids:
+                continue
+            visited_ids.add(id(cur))
+            if getattr(cur, "llama_template_images", None):
+                return True
+            if _fn_accepts_param(getattr(cur, "tokenize_with_weights", None), "images"):
+                return True
+            cur_dict = getattr(cur, "__dict__", None)
+            if isinstance(cur_dict, dict):
+                for sub_val in cur_dict.values():
+                    if sub_val is not None and not isinstance(sub_val, (str, bytes, int, float, bool, list, tuple, dict, set, torch.Tensor)):
+                        if hasattr(sub_val, "tokenize_with_weights") or getattr(sub_val, "llama_template_images", None):
+                            to_visit.append(sub_val)
+        return False
+
+    @staticmethod
+    def _clip_supports_llama_template_kwarg(clip: Any) -> bool:
+        """Return True if the connected ComfyUI CLIP/tokenizer accepts `llama_template` in `tokenize`."""
+        if clip is None:
+            return False
+        tok_fn = getattr(clip, "tokenize", None)
+        if callable(tok_fn):
+            try:
+                if "llama_template" in inspect.signature(tok_fn).parameters:
+                    return True
+            except (ValueError, TypeError):
+                pass
+        tokenizer = getattr(clip, "tokenizer", None)
+        if tokenizer is None:
+            return False
+        candidates: List[Any] = [tokenizer]
+        cur_dict = getattr(tokenizer, "__dict__", None)
+        if isinstance(cur_dict, dict):
+            for v in cur_dict.values():
+                if (
+                    hasattr(v, "tokenize_with_weights")
+                    or getattr(v, "llama_template", None)
+                    or getattr(v, "llama_template_images", None)
+                ):
+                    candidates.append(v)
+        for cand in candidates:
+            if getattr(cand, "llama_template", None) or getattr(cand, "llama_template_images", None):
+                return True
+            fn = getattr(cand, "tokenize_with_weights", None)
+            if callable(fn):
+                try:
+                    if "llama_template" in inspect.signature(fn).parameters:
+                        return True
+                except (ValueError, TypeError):
+                    pass
+        return False
+
+    @staticmethod
+    def _resize_control_for_clip_vision(ctrl_chw: torch.Tensor, vision_res: int) -> torch.Tensor:
+        """
+        Convert a normalized `[-1, 1]` `[3, H, W]` control tensor into a `[1, H', W', 3]` `[0, 1]`
+        ComfyUI `IMAGE` tensor resized to approximately `vision_res * vision_res` area (preserving
+        aspect ratio, rounded to multiples of 16) for vision-language text encoders.
+        """
+        with torch.inference_mode(False):
+            img_01 = ((ctrl_chw.detach().to(device="cpu", dtype=torch.float32) + 1.0) * 0.5).clamp(0.0, 1.0)
+            if vision_res > 0:
+                h, w = int(img_01.shape[1]), int(img_01.shape[2])
+                target_area = float(vision_res * vision_res)
+                scale = math.sqrt(target_area / float(max(1, h * w)))
+                new_h = max(16, int(round((float(h) * scale) / 16.0)) * 16)
+                new_w = max(16, int(round((float(w) * scale) / 16.0)) * 16)
+                if new_h != h or new_w != w:
+                    img_01 = F.interpolate(
+                        img_01.unsqueeze(0),
+                        size=(new_h, new_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0).clamp(0.0, 1.0)
+            return img_01.permute(1, 2, 0).unsqueeze(0).contiguous()
+
+    @staticmethod
+    def _apply_prompt_template(
+        text: str,
+        template: str,
+        supports_llama_template: bool,
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Apply an optional user-specified `clip_prompt_template`:
+          - Empty template -> pass `text` verbatim (`llama_template=None`).
+          - Contains `{prompt}` -> substitute `{prompt}` with `text`.
+          - Contains `{}` and tokenizer supports `llama_template` -> pass as `llama_template` kwarg.
+          - Otherwise -> prepend template before non-empty `text`.
+        """
+        tpl = (template or "")
+        if not tpl.strip():
+            return text, None
+        if "{prompt}" in tpl:
+            return tpl.replace("{prompt}", text), None
+        if "{}" in tpl and supports_llama_template:
+            return text, tpl
+        if "{}" in tpl:
+            return tpl.replace("{}", text), None
+        if not text:
+            return text, None
+        return f"{tpl}{text}", None
+
+    @staticmethod
+    def _encode_single_prompt(
+        clip: Any,
+        text: str,
+        control_images: Optional[List[torch.Tensor]] = None,
+        llama_template: Optional[str] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
         """
         Encode a single prompt with ComfyUI's `CLIP` object, preferring `return_dict=True`
         (and also supporting `encode_from_tokens_scheduled` / nested `[[cond, dict]]` outputs)
         so any model-specific conditioning keys (`attention_mask`, `clip_l`, `guidance`, etc.)
         are preserved alongside `cond` and `pooled_output`.
+        Optionally forwards `images=control_images` and/or `llama_template=llama_template`
+        to vision-language / LLM text encoders.
         """
-        tokens = clip.tokenize(text)
+        tok_kwargs: Dict[str, Any] = {}
+        if control_images:
+            tok_kwargs["images"] = control_images
+        if llama_template is not None:
+            tok_kwargs["llama_template"] = llama_template
+
+        if tok_kwargs:
+            try:
+                tokens = clip.tokenize(text, **tok_kwargs)
+            except TypeError:
+                # Graceful fallback if the connected CLIP tokenizer does not accept `images` or `llama_template`
+                fallback_kw = {k: v for k, v in tok_kwargs.items() if k != "images"}
+                try:
+                    tokens = clip.tokenize(text, **fallback_kw) if fallback_kw else clip.tokenize(text)
+                except TypeError:
+                    tokens = clip.tokenize(text)
+        else:
+            tokens = clip.tokenize(text)
+
         extra_dict: Dict[str, Any] = {}
         encoded: Any = None
         if hasattr(clip, "encode_from_tokens") and callable(clip.encode_from_tokens):
@@ -619,6 +831,79 @@ class OmniLoRAPrecomputeConditioning:
 
         return cond, pooled if isinstance(pooled, torch.Tensor) else None, extra_dict
 
+    @staticmethod
+    def _stack_prompt_batch_outputs(
+        batch_conds: List[torch.Tensor],
+        batch_pools: List[torch.Tensor],
+        batch_extra_lists: Dict[str, List[Any]],
+        batch_len: int,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+        """Stack per-sample CLIP outputs (`cond`, `pooled_output`, `extra_conds`) with sequence padding & mask synthesis."""
+        orig_seq_lens = [
+            int(t.shape[0]) if t.ndim == 2 else (int(t.shape[1]) if t.ndim >= 3 else 0)
+            for t in batch_conds
+        ]
+        stacked_cond = _pad_and_stack_sequence_tensors(batch_conds)
+        batch_seq_len = int(stacked_cond.shape[1]) if stacked_cond.ndim >= 2 else 0
+        stacked_pool = torch.stack(batch_pools, dim=0) if (len(batch_pools) == batch_len and len(batch_pools) > 0) else None
+
+        batch_extra: Dict[str, Any] = {}
+        for ek, ev_list in batch_extra_lists.items():
+            if len(ev_list) == batch_len and all(isinstance(v, torch.Tensor) for v in ev_list):
+                single_list = [
+                    (v[0] if v.ndim >= 2 and int(v.shape[0]) == 1 else v)
+                    for v in ev_list
+                ]
+                if ek in ("attention_mask", "mask", "txt_mask") and all(v.ndim == 1 for v in single_list):
+                    target_m_len = max(batch_seq_len, max(int(v.shape[0]) for v in single_list))
+                    padded_masks = [
+                        (F.pad(v, (0, target_m_len - int(v.shape[0])), value=0) if int(v.shape[0]) < target_m_len else v[:target_m_len])
+                        for v in single_list
+                    ]
+                    batch_extra[ek] = torch.stack(padded_masks, dim=0)
+                elif ek == "context_attention_bias" and all(v.ndim == 1 for v in single_list):
+                    target_m_len = max(batch_seq_len, max(int(v.shape[0]) for v in single_list))
+                    padded_biases = [
+                        (F.pad(v, (0, target_m_len - int(v.shape[0])), value=-1e4) if int(v.shape[0]) < target_m_len else v[:target_m_len])
+                        for v in single_list
+                    ]
+                    batch_extra[ek] = torch.stack(padded_biases, dim=0)
+                elif all(v.shape == single_list[0].shape for v in single_list):
+                    batch_extra[ek] = torch.stack(single_list, dim=0)
+                elif all(v.ndim == 1 for v in single_list):
+                    target_1d_len = max(int(v.shape[0]) for v in single_list)
+                    padded_1d = [
+                        (F.pad(v, (0, target_1d_len - int(v.shape[0])), value=0) if int(v.shape[0]) < target_1d_len else v[:target_1d_len])
+                        for v in single_list
+                    ]
+                    batch_extra[ek] = torch.stack(padded_1d, dim=0)
+                elif all(v.ndim >= 2 and v.shape[1:] == single_list[0].shape[1:] for v in single_list):
+                    batch_extra[ek] = _pad_and_stack_sequence_tensors(single_list)
+                else:
+                    batch_extra[ek] = ev_list[-1]
+            else:
+                batch_extra[ek] = ev_list[-1]
+
+        if (
+            len(orig_seq_lens) > 1
+            and batch_seq_len > 0
+            and any(0 < s_len < batch_seq_len for s_len in orig_seq_lens)
+        ):
+            if not any(mk in batch_extra for mk in ("attention_mask", "mask", "txt_mask")):
+                synth_mask = torch.zeros((len(orig_seq_lens), batch_seq_len), dtype=torch.long)
+                for b_i, s_len in enumerate(orig_seq_lens):
+                    synth_mask[b_i, : min(s_len, batch_seq_len)] = 1
+                batch_extra["attention_mask"] = synth_mask
+            if "context_attention_bias" not in batch_extra:
+                src_mask = batch_extra.get("attention_mask")
+                if isinstance(src_mask, torch.Tensor) and src_mask.ndim == 2 and int(src_mask.shape[1]) == batch_seq_len:
+                    batch_extra["context_attention_bias"] = torch.where(
+                        src_mask > 0,
+                        torch.zeros_like(src_mask, dtype=stacked_cond.dtype),
+                        torch.full_like(src_mask, -1e4, dtype=stacked_cond.dtype),
+                    )
+        return stacked_cond, stacked_pool, batch_extra
+
     def _encode_with_comfy_or_adapter(
         self,
         pixel_batches: List[torch.Tensor],
@@ -630,15 +915,26 @@ class OmniLoRAPrecomputeConditioning:
         offload_between_encoders: bool = True,
         encode_flipped_latents: bool = False,
         mask_batches: Optional[List[Optional[torch.Tensor]]] = None,
+        control_batches: Optional[List[List[Optional[torch.Tensor]]]] = None,
+        control_source_batches: Optional[List[List[Optional[str]]]] = None,
+        pass_control_to_clip: str = "auto",
+        clip_vision_resolution: int = 384,
+        clip_prompt_template: str = "",
+        streaming_dataset: Optional[OmniLoRADataset] = None,
+        streaming_batch_plans: Optional[List[List[Any]]] = None,
     ) -> Tuple[List[Dict[str, Any]], bool, Optional[torch.Tensor], Optional[torch.Tensor], Dict[str, Any]]:
         if vae is None or not hasattr(vae, "encode") or clip is None or not hasattr(clip, "tokenize"):
             raise ValueError("Both 'vae' and 'clip' inputs are required for OmniLoRAPrecomputeConditioning.")
+
+        use_streaming = streaming_dataset is not None and streaming_batch_plans is not None
+        num_stage1 = len(streaming_batch_plans) if use_streaming and streaming_batch_plans is not None else len(pixel_batches)
+        num_stage2 = len(streaming_batch_plans) if use_streaming and streaming_batch_plans is not None else len(prompt_batches)
 
         pbar: Optional[Any] = None
         try:
             import comfy.utils  # type: ignore
 
-            pbar = comfy.utils.ProgressBar(len(pixel_batches) + len(prompt_batches))
+            pbar = comfy.utils.ProgressBar(num_stage1 + num_stage2)
         except Exception:
             pass
 
@@ -646,35 +942,138 @@ class OmniLoRAPrecomputeConditioning:
         inner_model = getattr(model, "model", model) if model is not None else None
         process_latent_in = getattr(inner_model, "process_latent_in", None) if inner_model is not None else None
 
-        # Stage 1: Encode images one sample at a time ([1, H, W, C]) to minimize peak VAE VRAM,
-        # then immediately unload VAE before loading CLIP so both encoders never coexist in VRAM.
+        def _safe_process_latent_in(lat_tensor: torch.Tensor) -> Tuple[torch.Tensor, bool]:
+            if not callable(process_latent_in):
+                return lat_tensor, False
+            # Guard against stale `inner_model.latent_shapes` left on multimodal models (e.g.
+            # MiniMaxH3 / LTXAV) by a previous ComfyUI KSampler run: single-stream image latents
+            # must be scaled without multi-stream audio slice rescaling.
+            had_stale_shapes = (
+                inner_model is not None
+                and getattr(inner_model, "latent_shapes", None) is not None
+            )
+            prev_shapes = getattr(inner_model, "latent_shapes", None) if had_stale_shapes else None
+            if had_stale_shapes:
+                try:
+                    inner_model.latent_shapes = None
+                except Exception:
+                    had_stale_shapes = False
+            try:
+                return process_latent_in(lat_tensor), True
+            except Exception:
+                return lat_tensor, False
+            finally:
+                if had_stale_shapes:
+                    try:
+                        inner_model.latent_shapes = prev_shapes
+                    except Exception:
+                        pass
+
+        def _downsample_single_mask_to_latent(mask_t: torch.Tensor, lat_h: int, lat_w: int) -> torch.Tensor:
+            with torch.inference_mode(False):
+                m_cpu = mask_t.detach().to(device="cpu", dtype=torch.float32)
+                if m_cpu.ndim == 2:
+                    m_cpu = m_cpu.unsqueeze(0).unsqueeze(0)
+                elif m_cpu.ndim == 3:
+                    m_cpu = m_cpu.unsqueeze(0)
+                if m_cpu.shape[-2:] != (lat_h, lat_w):
+                    interp_mode = (
+                        "area"
+                        if (int(m_cpu.shape[-2]) >= lat_h and int(m_cpu.shape[-1]) >= lat_w)
+                        else "bilinear"
+                    )
+                    if interp_mode == "bilinear":
+                        m_lat = F.interpolate(m_cpu, size=(lat_h, lat_w), mode="bilinear", align_corners=False)
+                    else:
+                        m_lat = F.interpolate(m_cpu, size=(lat_h, lat_w), mode="area")
+                else:
+                    m_lat = m_cpu
+                return m_lat.squeeze(0).clamp(0.0, 1.0).clone()
+
+        resolved_ctrl_batches: List[List[Optional[torch.Tensor]]] = (
+            list(control_batches)
+            if (not use_streaming and control_batches is not None and len(control_batches) == len(pixel_batches))
+            else ([] if use_streaming else [[None] * int(px.shape[0]) for px in pixel_batches])
+        )
+        resolved_ctrl_sources: List[List[Optional[str]]] = (
+            list(control_source_batches)
+            if (not use_streaming and control_source_batches is not None and len(control_source_batches) == len(pixel_batches))
+            else ([] if use_streaming else [[None] * int(px.shape[0]) for px in pixel_batches])
+        )
+
+        # Stage 1: Encode target images AND optional control images one sample at a time ([1, H, W, C])
+        # to minimize peak VAE VRAM AND peak CPU RAM (in streaming mode, only 1 decoded image pair
+        # exists in host RAM at any moment), then immediately unload VAE before loading CLIP so both
+        # encoders never coexist in VRAM.
+        # IMPORTANT: Control latents are cached as RAW UNSCALED VAE outputs (no `process_latent_in`),
+        # matching ComfyUI's `ReferenceLatent` and `InstructPixToPixConditioning` nodes, because
+        # `BaseModel.extra_conds` / `concat_cond` applies `self.process_latent_in(...)` natively.
         cached_latents: List[torch.Tensor] = []
         cached_latents_flipped: List[Optional[torch.Tensor]] = []
+        cached_ctrl_latents: List[Optional[List[Optional[torch.Tensor]]]] = []
+        cached_ctrl_latents_flipped: List[Optional[List[Optional[torch.Tensor]]]] = []
+        streamed_mask_batches: List[Optional[torch.Tensor]] = []
         pixel_hw_list: List[Tuple[int, int]] = []
         try:
             with torch.no_grad():
-                for pixels in pixel_batches:
+                for batch_i in range(num_stage1):
                     _check_comfy_interrupt()
-                    if pixels.ndim >= 4:
-                        pixel_hw_list.append((int(pixels.shape[-2]), int(pixels.shape[-1])))
+                    if use_streaming and streaming_batch_plans is not None and streaming_dataset is not None:
+                        chunk = streaming_batch_plans[batch_i]
+                        bh, bw = int(chunk[0].bucket_size[0]), int(chunk[0].bucket_size[1])
+                        pixel_hw_list.append((bh, bw))
+                        batch_len = len(chunk)
+                        pixels_batch_ref: Optional[torch.Tensor] = None
+                        ctrl_px_list: List[Optional[torch.Tensor]] = []
                     else:
-                        pixel_hw_list.append((0, 0))
+                        chunk = None
+                        pixels_batch_ref = pixel_batches[batch_i]
+                        if pixels_batch_ref.ndim >= 4:
+                            pixel_hw_list.append((int(pixels_batch_ref.shape[-2]), int(pixels_batch_ref.shape[-1])))
+                        else:
+                            pixel_hw_list.append((0, 0))
+                        batch_len = int(pixels_batch_ref.shape[0])
+                        ctrl_px_list = resolved_ctrl_batches[batch_i]
+
                     sample_lats: List[torch.Tensor] = []
                     sample_lats_flip: List[torch.Tensor] = []
-                    for idx in range(pixels.shape[0]):
+                    sample_ctrl_lats: List[Optional[torch.Tensor]] = []
+                    sample_ctrl_lats_flip: List[Optional[torch.Tensor]] = []
+                    sample_lat_masks: List[Optional[torch.Tensor]] = []
+                    has_batch_ctrl = False
+                    has_batch_mask = False
+
+                    for idx in range(batch_len):
                         _check_comfy_interrupt()
-                        single_px = pixels[idx : idx + 1]
+                        raw_sample_mask: Optional[torch.Tensor] = None
+                        if use_streaming and chunk is not None and streaming_dataset is not None:
+                            px_chw, raw_sample_mask, ctrl_px = streaming_dataset.decode_sample_tensors(chunk[idx])
+                            single_px = px_chw.unsqueeze(0)
+                        else:
+                            assert pixels_batch_ref is not None
+                            single_px = pixels_batch_ref[idx : idx + 1]
+                            ctrl_px = ctrl_px_list[idx] if idx < len(ctrl_px_list) else None
+
                         comfy_pixels = ((single_px.permute(0, 2, 3, 1) + 1.0) * 0.5).clamp(0.0, 1.0)
                         lat = vae.encode(comfy_pixels)
-                        if callable(process_latent_in):
-                            try:
-                                lat = process_latent_in(lat)
-                                latent_scaled = True
-                            except Exception:
-                                pass
+                        lat, did_scale = _safe_process_latent_in(lat)
+                        if did_scale:
+                            latent_scaled = True
                         with torch.inference_mode(False):
                             lat_cpu = lat.detach().to(device="cpu", dtype=dtype).clone()
                             sample_lats.append(lat_cpu)
+                        if use_streaming:
+                            if isinstance(raw_sample_mask, torch.Tensor) and raw_sample_mask.numel() > 0 and lat_cpu.ndim >= 4:
+                                has_batch_mask = True
+                                sample_lat_masks.append(
+                                    _downsample_single_mask_to_latent(
+                                        raw_sample_mask,
+                                        int(lat_cpu.shape[-2]),
+                                        int(lat_cpu.shape[-1]),
+                                    )
+                                )
+                            else:
+                                sample_lat_masks.append(None)
                         del lat, comfy_pixels
 
                         if encode_flipped_latents:
@@ -682,16 +1081,42 @@ class OmniLoRAPrecomputeConditioning:
                             flipped_px = torch.flip(single_px, dims=[-1])
                             comfy_pixels_flip = ((flipped_px.permute(0, 2, 3, 1) + 1.0) * 0.5).clamp(0.0, 1.0)
                             lat_flip = vae.encode(comfy_pixels_flip)
-                            if callable(process_latent_in):
-                                try:
-                                    lat_flip = process_latent_in(lat_flip)
-                                    latent_scaled = True
-                                except Exception:
-                                    pass
+                            lat_flip, did_scale_flip = _safe_process_latent_in(lat_flip)
+                            if did_scale_flip:
+                                latent_scaled = True
                             with torch.inference_mode(False):
                                 lat_flip_cpu = lat_flip.detach().to(device="cpu", dtype=dtype).clone()
                                 sample_lats_flip.append(lat_flip_cpu)
                             del lat_flip, comfy_pixels_flip, flipped_px
+
+                        if isinstance(ctrl_px, torch.Tensor) and ctrl_px.ndim >= 3 and ctrl_px.numel() > 0:
+                            has_batch_ctrl = True
+                            _check_comfy_interrupt()
+                            single_ctrl = ctrl_px.unsqueeze(0) if ctrl_px.ndim == 3 else ctrl_px[0:1]
+                            comfy_ctrl = ((single_ctrl.permute(0, 2, 3, 1) + 1.0) * 0.5).clamp(0.0, 1.0)
+                            c_lat = vae.encode(comfy_ctrl)
+                            with torch.inference_mode(False):
+                                c_lat_cpu = c_lat.detach().to(device="cpu", dtype=dtype).clone()
+                                sample_ctrl_lats.append(c_lat_cpu)
+                            del c_lat, comfy_ctrl
+
+                            if encode_flipped_latents:
+                                _check_comfy_interrupt()
+                                flipped_ctrl = torch.flip(single_ctrl, dims=[-1])
+                                comfy_ctrl_flip = ((flipped_ctrl.permute(0, 2, 3, 1) + 1.0) * 0.5).clamp(0.0, 1.0)
+                                c_lat_flip = vae.encode(comfy_ctrl_flip)
+                                with torch.inference_mode(False):
+                                    c_lat_flip_cpu = c_lat_flip.detach().to(device="cpu", dtype=dtype).clone()
+                                    sample_ctrl_lats_flip.append(c_lat_flip_cpu)
+                                del c_lat_flip, comfy_ctrl_flip, flipped_ctrl
+                            del single_ctrl
+                        else:
+                            sample_ctrl_lats.append(None)
+                            if encode_flipped_latents:
+                                sample_ctrl_lats_flip.append(None)
+
+                        if use_streaming:
+                            del px_chw, raw_sample_mask, ctrl_px, single_px
 
                     with torch.inference_mode(False):
                         batch_lat = torch.cat(sample_lats, dim=0) if len(sample_lats) > 1 else sample_lats[0]
@@ -705,26 +1130,107 @@ class OmniLoRAPrecomputeConditioning:
                             cached_latents_flipped.append(batch_lat_flip)
                         else:
                             cached_latents_flipped.append(None)
+                        cached_ctrl_latents.append(sample_ctrl_lats if has_batch_ctrl else None)
+                        cached_ctrl_latents_flipped.append(
+                            sample_ctrl_lats_flip if (has_batch_ctrl and encode_flipped_latents) else None
+                        )
+                        if use_streaming:
+                            if has_batch_mask and batch_lat.ndim >= 4:
+                                lat_h, lat_w = int(batch_lat.shape[-2]), int(batch_lat.shape[-1])
+                                full_ones_m: Optional[torch.Tensor] = None
+                                filled_masks: List[torch.Tensor] = []
+                                for sm in sample_lat_masks:
+                                    if sm is not None:
+                                        filled_masks.append(sm)
+                                    else:
+                                        if full_ones_m is None:
+                                            full_ones_m = torch.ones((1, lat_h, lat_w), dtype=torch.float32, device="cpu")
+                                        filled_masks.append(full_ones_m)
+                                streamed_mask_batches.append(torch.stack(filled_masks, dim=0).to(dtype=torch.float32))
+                            else:
+                                streamed_mask_batches.append(None)
                     if pbar is not None:
                         pbar.update(1)
         finally:
             if offload_between_encoders:
                 _try_comfy_unload_models()
 
-        # Stage 2: Encode prompts with deduplication cache so repeated captions are encoded only once,
+        # Stage 2: Encode prompts with deduplication cache so repeated captions (or identical
+        # `(caption, control_image)` pairs on VLM text encoders) are encoded only once,
         # plus encode the unconditional empty prompt `""` once for dynamic per-step CFG caption dropout.
+        pass_ctrl_mode = str(pass_control_to_clip or "auto").strip().lower()
+        clip_supports_images = self._clip_supports_images_kwarg(clip)
+        clip_supports_llama_tpl = self._clip_supports_llama_template_kwarg(clip)
+        use_clip_vision = (
+            True
+            if pass_ctrl_mode == "enabled"
+            else (False if pass_ctrl_mode == "disabled" else clip_supports_images)
+        )
+        if pass_ctrl_mode == "enabled" and not clip_supports_images:
+            logging.warning(
+                "[OmniLoRA] pass_control_to_clip='enabled' requested, but connected CLIP tokenizer does not "
+                "declare an `images` parameter; attempting pass-through with safe text-only fallback."
+            )
+
         cached_embeds: List[torch.Tensor] = []
         cached_pooled: List[Optional[torch.Tensor]] = []
         cached_extras: List[Dict[str, Any]] = []
-        prompt_cache: Dict[str, Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]] = {}
+        cached_embeds_flipped: List[Optional[torch.Tensor]] = []
+        cached_pooled_flipped: List[Optional[torch.Tensor]] = []
+        cached_extras_flipped: List[Optional[Dict[str, Any]]] = []
+        prompt_cache: Dict[Tuple[str, str, bool, str], Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]] = {}
         uncond_embed: Optional[torch.Tensor] = None
         uncond_pooled: Optional[torch.Tensor] = None
         uncond_extra: Dict[str, Any] = {}
+        clip_actually_used_control = False
 
-        def _get_or_encode_prompt(text: str) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
-            if text in prompt_cache:
-                return prompt_cache[text]
-            cond, pooled, extra_dict = self._encode_single_prompt(clip, text)
+        def _get_or_encode_prompt(
+            text: str,
+            ctrl_px: Optional[torch.Tensor] = None,
+            ctrl_src_key: str = "",
+            is_flipped: bool = False,
+            apply_template: bool = True,
+            ctrl_px_loader: Optional[Any] = None,
+            has_ctrl: bool = False,
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+            nonlocal clip_actually_used_control
+            formatted_text, llama_tpl = (
+                self._apply_prompt_template(text, clip_prompt_template, clip_supports_llama_tpl)
+                if apply_template
+                else (text, None)
+            )
+            has_ctrl_img = bool(
+                has_ctrl
+                or (isinstance(ctrl_px, torch.Tensor) and ctrl_px.ndim >= 3 and ctrl_px.numel() > 0)
+            )
+            use_img_here = bool(use_clip_vision and has_ctrl_img)
+            cache_key = (
+                formatted_text,
+                ctrl_src_key if use_img_here else "",
+                bool(is_flipped) if use_img_here else False,
+                llama_tpl or "",
+            )
+            if cache_key in prompt_cache:
+                return prompt_cache[cache_key]
+
+            clip_imgs: Optional[List[torch.Tensor]] = None
+            if use_img_here:
+                resolved_px = ctrl_px
+                if resolved_px is None and callable(ctrl_px_loader):
+                    resolved_px = ctrl_px_loader()
+                if isinstance(resolved_px, torch.Tensor) and resolved_px.ndim >= 3 and resolved_px.numel() > 0:
+                    c_in = torch.flip(resolved_px, dims=[-1]) if is_flipped else resolved_px
+                    clip_imgs = [self._resize_control_for_clip_vision(c_in, int(clip_vision_resolution))]
+                    clip_actually_used_control = True
+                    del c_in
+                del resolved_px
+
+            cond, pooled, extra_dict = self._encode_single_prompt(
+                clip,
+                formatted_text,
+                control_images=clip_imgs,
+                llama_template=llama_tpl,
+            )
             with torch.inference_mode(False):
                 c_raw = cond.detach().to(device="cpu", dtype=dtype).clone()
                 c_clean = c_raw[0] if c_raw.ndim == 3 else c_raw
@@ -738,19 +1244,59 @@ class OmniLoRAPrecomputeConditioning:
                         clean_extra[ek] = ev.detach().to(device="cpu").clone()
                     else:
                         clean_extra[ek] = ev
-            prompt_cache[text] = (c_clean, p_clean, clean_extra)
+            prompt_cache[cache_key] = (c_clean, p_clean, clean_extra)
             return c_clean, p_clean, clean_extra
 
         try:
             with torch.no_grad():
-                for prompts in prompt_batches:
+                for batch_i in range(num_stage2):
                     _check_comfy_interrupt()
+                    if use_streaming and streaming_batch_plans is not None and streaming_dataset is not None:
+                        chunk = streaming_batch_plans[batch_i]
+                        prompts = [s.caption for s in chunk]
+                    else:
+                        chunk = None
+                        prompts = prompt_batches[batch_i]
+                        ctrl_px_list = resolved_ctrl_batches[batch_i]
+                        ctrl_src_list = resolved_ctrl_sources[batch_i]
+
                     batch_conds: List[torch.Tensor] = []
                     batch_pools: List[torch.Tensor] = []
                     batch_extra_lists: Dict[str, List[Any]] = {}
-                    for text in prompts:
+                    batch_has_vlm_ctrl = False
+
+                    for p_i, text in enumerate(prompts):
                         _check_comfy_interrupt()
-                        c_clean, p_clean, clean_extra = _get_or_encode_prompt(text)
+                        if use_streaming and chunk is not None and streaming_dataset is not None:
+                            sample_obj = chunk[p_i]
+                            c_has = bool(sample_obj.has_control)
+                            c_src = (sample_obj.control_source_name or f"ctrl_{batch_i}_{p_i}") if c_has else ""
+                            c_px = None
+                            c_loader = (
+                                (lambda _s=sample_obj: streaming_dataset.decode_sample_control_tensor(_s))
+                                if c_has
+                                else None
+                            )
+                        else:
+                            c_px = ctrl_px_list[p_i] if p_i < len(ctrl_px_list) else None
+                            c_has = bool(isinstance(c_px, torch.Tensor) and c_px.ndim >= 3 and c_px.numel() > 0)
+                            c_src = (
+                                (ctrl_src_list[p_i] or f"ctrl_{batch_i}_{p_i}")
+                                if (p_i < len(ctrl_src_list) and c_has)
+                                else ""
+                            )
+                            c_loader = None
+
+                        if use_clip_vision and c_has:
+                            batch_has_vlm_ctrl = True
+                        c_clean, p_clean, clean_extra = _get_or_encode_prompt(
+                            text,
+                            ctrl_px=c_px,
+                            ctrl_src_key=c_src,
+                            is_flipped=False,
+                            ctrl_px_loader=c_loader,
+                            has_ctrl=c_has,
+                        )
                         batch_conds.append(c_clean)
                         if isinstance(p_clean, torch.Tensor):
                             batch_pools.append(p_clean)
@@ -758,88 +1304,73 @@ class OmniLoRAPrecomputeConditioning:
                             batch_extra_lists.setdefault(ek, []).append(ev)
 
                     with torch.inference_mode(False):
-                        orig_seq_lens = [
-                            int(t.shape[0]) if t.ndim == 2 else (int(t.shape[1]) if t.ndim >= 3 else 0)
-                            for t in batch_conds
-                        ]
-                        stacked_cond = _pad_and_stack_sequence_tensors(batch_conds)
-                        batch_seq_len = int(stacked_cond.shape[1]) if stacked_cond.ndim >= 2 else 0
+                        stacked_cond, stacked_pool, batch_extra = self._stack_prompt_batch_outputs(
+                            batch_conds, batch_pools, batch_extra_lists, len(prompts)
+                        )
                         cached_embeds.append(stacked_cond)
-                        if len(batch_pools) == len(prompts) and len(batch_pools) > 0:
-                            cached_pooled.append(torch.stack(batch_pools, dim=0))
-                        else:
-                            cached_pooled.append(None)
-
-                        batch_extra: Dict[str, Any] = {}
-                        for ek, ev_list in batch_extra_lists.items():
-                            if len(ev_list) == len(prompts) and all(isinstance(v, torch.Tensor) for v in ev_list):
-                                single_list = [
-                                    (v[0] if v.ndim >= 2 and int(v.shape[0]) == 1 else v)
-                                    for v in ev_list
-                                ]
-                                if ek in ("attention_mask", "mask", "txt_mask") and all(v.ndim == 1 for v in single_list):
-                                    target_m_len = max(batch_seq_len, max(int(v.shape[0]) for v in single_list))
-                                    padded_masks = [
-                                        (F.pad(v, (0, target_m_len - int(v.shape[0])), value=0) if int(v.shape[0]) < target_m_len else v[:target_m_len])
-                                        for v in single_list
-                                    ]
-                                    batch_extra[ek] = torch.stack(padded_masks, dim=0)
-                                elif ek == "context_attention_bias" and all(v.ndim == 1 for v in single_list):
-                                    target_m_len = max(batch_seq_len, max(int(v.shape[0]) for v in single_list))
-                                    padded_biases = [
-                                        (F.pad(v, (0, target_m_len - int(v.shape[0])), value=-1e4) if int(v.shape[0]) < target_m_len else v[:target_m_len])
-                                        for v in single_list
-                                    ]
-                                    batch_extra[ek] = torch.stack(padded_biases, dim=0)
-                                elif all(v.shape == single_list[0].shape for v in single_list):
-                                    batch_extra[ek] = torch.stack(single_list, dim=0)
-                                elif all(v.ndim == 1 for v in single_list):
-                                    target_1d_len = max(int(v.shape[0]) for v in single_list)
-                                    padded_1d = [
-                                        (F.pad(v, (0, target_1d_len - int(v.shape[0])), value=0) if int(v.shape[0]) < target_1d_len else v[:target_1d_len])
-                                        for v in single_list
-                                    ]
-                                    batch_extra[ek] = torch.stack(padded_1d, dim=0)
-                                elif all(v.ndim >= 2 and v.shape[1:] == single_list[0].shape[1:] for v in single_list):
-                                    batch_extra[ek] = _pad_and_stack_sequence_tensors(single_list)
-                                else:
-                                    batch_extra[ek] = ev_list[-1]
-                            else:
-                                batch_extra[ek] = ev_list[-1]
-
-                        # When `batch_size > 1` stacks prompts of differing sequence lengths into `stacked_cond`,
-                        # synthesize `attention_mask` and `context_attention_bias` so padded trailing tokens are
-                        # masked out in models that support attention masks/biases (e.g. MOSSImage, QwenImage, Lumina2).
-                        if (
-                            len(orig_seq_lens) > 1
-                            and batch_seq_len > 0
-                            and any(0 < s_len < batch_seq_len for s_len in orig_seq_lens)
-                        ):
-                            if not any(mk in batch_extra for mk in ("attention_mask", "mask", "txt_mask")):
-                                synth_mask = torch.zeros((len(orig_seq_lens), batch_seq_len), dtype=torch.long)
-                                for b_i, s_len in enumerate(orig_seq_lens):
-                                    synth_mask[b_i, : min(s_len, batch_seq_len)] = 1
-                                batch_extra["attention_mask"] = synth_mask
-                            if "context_attention_bias" not in batch_extra:
-                                src_mask = batch_extra.get("attention_mask")
-                                if isinstance(src_mask, torch.Tensor) and src_mask.ndim == 2 and int(src_mask.shape[1]) == batch_seq_len:
-                                    batch_extra["context_attention_bias"] = torch.where(
-                                        src_mask > 0,
-                                        torch.zeros_like(src_mask, dtype=stacked_cond.dtype),
-                                        torch.full_like(src_mask, -1e4, dtype=stacked_cond.dtype),
-                                    )
+                        cached_pooled.append(stacked_pool)
                         cached_extras.append(batch_extra)
+
+                    # When random_flip is active AND a VLM CLIP consumed the control image, also cache
+                    # the horizontally flipped CLIP conditioning so target, control latent, and VLM
+                    # visual tokens stay 100% geometrically aligned on flipped steps.
+                    if encode_flipped_latents and batch_has_vlm_ctrl:
+                        flip_conds: List[torch.Tensor] = []
+                        flip_pools: List[torch.Tensor] = []
+                        flip_extra_lists: Dict[str, List[Any]] = {}
+                        for p_i, text in enumerate(prompts):
+                            _check_comfy_interrupt()
+                            if use_streaming and chunk is not None and streaming_dataset is not None:
+                                sample_obj = chunk[p_i]
+                                c_has = bool(sample_obj.has_control)
+                                c_src = (sample_obj.control_source_name or f"ctrl_{batch_i}_{p_i}") if c_has else ""
+                                c_px = None
+                                c_loader = (
+                                    (lambda _s=sample_obj: streaming_dataset.decode_sample_control_tensor(_s))
+                                    if c_has
+                                    else None
+                                )
+                            else:
+                                c_px = ctrl_px_list[p_i] if p_i < len(ctrl_px_list) else None
+                                c_has = bool(isinstance(c_px, torch.Tensor) and c_px.ndim >= 3 and c_px.numel() > 0)
+                                c_src = (
+                                    (ctrl_src_list[p_i] or f"ctrl_{batch_i}_{p_i}")
+                                    if (p_i < len(ctrl_src_list) and c_has)
+                                    else ""
+                                )
+                                c_loader = None
+                            fc_clean, fp_clean, f_extra = _get_or_encode_prompt(
+                                text,
+                                ctrl_px=c_px,
+                                ctrl_src_key=c_src,
+                                is_flipped=True,
+                                ctrl_px_loader=c_loader,
+                                has_ctrl=c_has,
+                            )
+                            flip_conds.append(fc_clean)
+                            if isinstance(fp_clean, torch.Tensor):
+                                flip_pools.append(fp_clean)
+                            for ek, ev in f_extra.items():
+                                flip_extra_lists.setdefault(ek, []).append(ev)
+                        with torch.inference_mode(False):
+                            f_cond, f_pool, f_ext = self._stack_prompt_batch_outputs(
+                                flip_conds, flip_pools, flip_extra_lists, len(prompts)
+                            )
+                            cached_embeds_flipped.append(f_cond)
+                            cached_pooled_flipped.append(f_pool)
+                            cached_extras_flipped.append(f_ext)
+                    else:
+                        cached_embeds_flipped.append(None)
+                        cached_pooled_flipped.append(None)
+                        cached_extras_flipped.append(None)
 
                     if pbar is not None:
                         pbar.update(1)
 
                 # Encode the unconditional empty prompt `""` once so `OmniLoRATrainer` can swap it in
                 # dynamically on any training step when `caption_dropout > 0.0`.
-                # Preserve exact per-batch and unconditional token sequence lengths (`text_len`) without
-                # cross-dataset zero-padding so architectures whose RoPE or text self-attention depends on
-                # true `context.shape[1]` (e.g. MOSSImage, Fibo2, QwenImage, Flux) see exact token positions.
                 _check_comfy_interrupt()
-                u_cond, u_pool, u_ext = _get_or_encode_prompt("")
+                u_cond, u_pool, u_ext = _get_or_encode_prompt("", ctrl_px=None, apply_template=False)
                 with torch.inference_mode(False):
                     uncond_embed = u_cond.unsqueeze(0).clone() if u_cond.ndim == 2 else u_cond.clone()
                     if isinstance(u_pool, torch.Tensor):
@@ -870,23 +1401,43 @@ class OmniLoRAPrecomputeConditioning:
                 adapter._validate_context_dim(cached_embeds[0], backbone=backbone)
 
         batches: List[Dict[str, Any]] = []
-        resolved_masks: List[Optional[torch.Tensor]] = (
-            list(mask_batches)
-            if mask_batches is not None and len(mask_batches) == len(cached_latents)
-            else [None] * len(cached_latents)
-        )
+        if use_streaming:
+            resolved_masks: List[Optional[torch.Tensor]] = streamed_mask_batches
+        else:
+            resolved_masks = (
+                list(mask_batches)
+                if mask_batches is not None and len(mask_batches) == len(cached_latents)
+                else [None] * len(cached_latents)
+            )
         lat_scale = int(
             (getattr(getattr(inner_model, "latent_format", None), "spacial_downscale_ratio", 0) if inner_model is not None else 0)
             or getattr(vae, "spacial_downscale_ratio", 0)
             or 8
         )
-        for batch_idx, (lat, lat_flip, emb, pool, extra, raw_mask_b) in enumerate(zip(
+        for batch_idx, (
+            lat,
+            lat_flip,
+            emb,
+            pool,
+            extra,
+            emb_flip,
+            pool_flip,
+            extra_flip,
+            raw_mask_b,
+            ctrl_lat_b,
+            ctrl_lat_flip_b,
+        ) in enumerate(zip(
             cached_latents,
             cached_latents_flipped,
             cached_embeds,
             cached_pooled,
             cached_extras,
+            cached_embeds_flipped,
+            cached_pooled_flipped,
+            cached_extras_flipped,
             resolved_masks,
+            cached_ctrl_latents,
+            cached_ctrl_latents_flipped,
         )):
             px_h, px_w = pixel_hw_list[batch_idx] if batch_idx < len(pixel_hw_list) else (0, 0)
             if px_h > 0 and px_w > 0:
@@ -905,6 +1456,16 @@ class OmniLoRAPrecomputeConditioning:
                 item["pooled_output"] = pool
             if extra:
                 item["extra_conds"] = extra
+            if emb_flip is not None:
+                item["prompt_embeds_flipped"] = emb_flip
+            if pool_flip is not None:
+                item["pooled_output_flipped"] = pool_flip
+            if extra_flip:
+                item["extra_conds_flipped"] = extra_flip
+            if ctrl_lat_b is not None:
+                item["control_latents"] = ctrl_lat_b
+            if ctrl_lat_flip_b is not None:
+                item["control_latents_flipped"] = ctrl_lat_flip_b
             if isinstance(raw_mask_b, torch.Tensor) and raw_mask_b.numel() > 0 and lat.ndim >= 4:
                 with torch.inference_mode(False):
                     m_cpu = raw_mask_b.detach().to(device="cpu", dtype=torch.float32)
@@ -929,6 +1490,7 @@ class OmniLoRAPrecomputeConditioning:
                         item["loss_mask_flipped"] = torch.flip(m_lat_clean, dims=[-1]).clone()
             batches.append(item)
 
+        self._last_clip_used_control_images = clip_actually_used_control
         return batches, latent_scaled, uncond_embed, uncond_pooled, uncond_extra
 
     def precompute(
@@ -938,22 +1500,51 @@ class OmniLoRAPrecomputeConditioning:
         vae: Optional[Any] = None,
         clip: Optional[Any] = None,
         model: Optional[Any] = None,
+        pass_control_to_clip: str = "auto",
+        clip_vision_resolution: int = 384,
+        clip_prompt_template: str = "",
     ) -> Tuple[CachedConditioningBundle]:
         plan = detect_and_configure(preferred_backend="auto", requested_dtype="auto")
         dtype = plan.backend.torch_dtype
 
-        # Encode unique samples once (temporarily setting num_repeats=1 if >1), then expand repeats in CPU RAM
+        # Encode unique samples once (temporarily setting num_repeats=1 if >1), then expand repeats in CPU RAM.
+        # Prefer lazy streaming (`build_streaming_batch_plans`) so folder-backed datasets decode only
+        # 1 image pair at a time in O(1) CPU RAM instead of materializing the whole dataset up front.
         orig_repeats = max(1, dataset.config.num_repeats)
         dataset.config.num_repeats = 1
+        use_streaming_plans = hasattr(dataset, "build_streaming_batch_plans") and hasattr(
+            dataset, "decode_sample_tensors"
+        )
+        unique_batch_plans: Optional[List[List[Any]]] = None
+        unique_pixel_batches: List[torch.Tensor] = []
+        unique_prompt_batches: List[List[str]] = []
+        unique_mask_batches: List[Optional[torch.Tensor]] = []
+        unique_control_batches: List[List[Optional[torch.Tensor]]] = []
+        unique_control_source_batches: List[List[Optional[str]]] = []
         try:
-            if hasattr(dataset, "build_batches_with_masks"):
+            if use_streaming_plans:
+                unique_batch_plans = dataset.build_streaming_batch_plans()
+            elif hasattr(dataset, "build_batches_full"):
+                (
+                    unique_pixel_batches,
+                    unique_prompt_batches,
+                    unique_mask_batches,
+                    unique_control_batches,
+                    unique_control_source_batches,
+                ) = dataset.build_batches_full()
+            elif hasattr(dataset, "build_batches_with_masks"):
                 unique_pixel_batches, unique_prompt_batches, unique_mask_batches = dataset.build_batches_with_masks()
+                unique_control_batches = [[None] * int(px.shape[0]) for px in unique_pixel_batches]
+                unique_control_source_batches = [[None] * int(px.shape[0]) for px in unique_pixel_batches]
             else:
                 unique_pixel_batches, unique_prompt_batches = dataset.build_batches()
                 unique_mask_batches = [None] * len(unique_pixel_batches)
+                unique_control_batches = [[None] * int(px.shape[0]) for px in unique_pixel_batches]
+                unique_control_source_batches = [[None] * int(px.shape[0]) for px in unique_pixel_batches]
         finally:
             dataset.config.num_repeats = orig_repeats
 
+        self._last_clip_used_control_images = False
         (
             unique_cached_batches,
             latent_scaled,
@@ -970,10 +1561,29 @@ class OmniLoRAPrecomputeConditioning:
             offload_between_encoders=offload_encoders_after_cache,
             encode_flipped_latents=bool(dataset.config.random_flip),
             mask_batches=unique_mask_batches,
+            control_batches=unique_control_batches,
+            control_source_batches=unique_control_source_batches,
+            pass_control_to_clip=pass_control_to_clip,
+            clip_vision_resolution=int(clip_vision_resolution),
+            clip_prompt_template=str(clip_prompt_template or ""),
+            streaming_dataset=dataset if use_streaming_plans else None,
+            streaming_batch_plans=unique_batch_plans if use_streaming_plans else None,
         )
-        del unique_pixel_batches, unique_prompt_batches, unique_mask_batches
+        has_ctrl_latents = any(
+            isinstance(b.get("control_latents"), list) and any(c is not None for c in b["control_latents"])
+            for b in unique_cached_batches
+        )
+        num_ctrl_imgs = int(getattr(dataset, "num_controlled_images", 0) or 0)
+        del (
+            unique_batch_plans,
+            unique_pixel_batches,
+            unique_prompt_batches,
+            unique_mask_batches,
+            unique_control_batches,
+            unique_control_source_batches,
+        )
 
-        # Free uncompressed [3, H, W] float32 pixel tensors from host RAM now that latents are cached
+        # Free uncompressed [3, H, W] float32 pixel & control tensors from host RAM now that latents are cached
         if hasattr(dataset, "release_pixel_memory"):
             dataset.release_pixel_memory()
         gc.collect()
@@ -996,6 +1606,9 @@ class OmniLoRAPrecomputeConditioning:
             uncond_prompt_embeds=uncond_embed,
             uncond_pooled_output=uncond_pooled,
             uncond_extra_conds=uncond_extra,
+            has_control_latents=has_ctrl_latents,
+            clip_used_control_images=bool(getattr(self, "_last_clip_used_control_images", False)),
+            num_controlled_images=num_ctrl_imgs,
         )
         return (bundle,)
 
@@ -1350,6 +1963,30 @@ class OmniLoRATrainer:
                         "tooltip": "LoCon / Conv-LoRA mode: When False (default), adapts Attention, FeedForward/MLP, and block/skip projections (including SpatialTransformer proj_in/proj_out). When True, also adapts ResNet/Downsample/Upsample Convolution layers inside repeating blocks (excluding raw input/output stems).",
                     },
                 ),
+                "control_mode": (
+                    ["auto", "reference_latents", "concat_latent_image"],
+                    {
+                        "default": "auto",
+                        "tooltip": "How paired control images are routed into the diffusion model. 'auto' introspects the loaded ComfyUI model (uses reference_latents for token-concatenated edit DiTs, and concat_latent_image for channel-concatenated / image_cond edit models).",
+                    },
+                ),
+                "reference_latents_method": (
+                    ["auto", "offset", "index", "index_timestep_zero", "uxo"],
+                    {
+                        "default": "auto",
+                        "tooltip": "Optional positional-encoding / timestep method for reference_latents models ('offset', 'index', 'index_timestep_zero', 'uxo'). 'auto' defers to ComfyUI's native model default.",
+                    },
+                ),
+                "control_dropout": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Probability of randomly dropping the control image per sample during training (0.0 = always conditioned; e.g. 0.05-0.10 teaches CFG / unconditional fallback).",
+                    },
+                ),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -1394,6 +2031,9 @@ class OmniLoRATrainer:
         max_timestep: float = 1.0,
         min_snr_gamma: float = 0.0,
         include_conv_layers: bool = False,
+        control_mode: str = "auto",
+        reference_latents_method: str = "auto",
+        control_dropout: float = 0.0,
         unique_id: Optional[str] = None,
         precision: str = "auto",
         vram_mode: str = "auto",
@@ -1689,6 +2329,19 @@ class OmniLoRATrainer:
                 use_rslora=resolved_rslora,
                 include_conv=bool(include_conv_layers),
             )
+            has_control_latents = bool(getattr(cached_data, "has_control_latents", False)) or any(
+                isinstance(b.get("control_latents"), list) and any(c is not None for c in b["control_latents"])
+                for b in cached_data.batches
+            )
+            adapter.control_mode = str(control_mode or "auto")
+            adapter.reference_latents_method = str(reference_latents_method or "auto")
+            resolved_control_mode = (
+                adapter.resolve_control_mode(external_backbone, requested_mode=control_mode)
+                if has_control_latents
+                else "none"
+            )
+            dynamic_ctrl_drop = max(0.0, min(1.0, float(control_dropout or 0.0)))
+
             loras_dir = _resolve_comfy_loras_dir()
             ckpt_target_dir = _resolve_target_output_dir(custom_checkpoint_dir, loras_dir)
             train_cfg = TrainingConfig(
@@ -1712,6 +2365,7 @@ class OmniLoRATrainer:
                 max_train_steps=steps,
                 seed=int(seed),
                 gradient_checkpointing=gradient_checkpointing,
+                has_control_latents=has_control_latents,
                 lora=lora_cfg,
             )
 
@@ -1813,10 +2467,17 @@ class OmniLoRATrainer:
                     for detail_line in summary_lines[1:]:
                         logging.info(f"[OmniLoRA] {detail_line}")
 
+                ctrl_log_suffix = (
+                    f" | control={resolved_control_mode}"
+                    f"{f'({reference_latents_method})' if (resolved_control_mode == 'reference_latents' and str(reference_latents_method or 'auto').lower() != 'auto') else ''}"
+                    f"{f' drop={dynamic_ctrl_drop:g}' if dynamic_ctrl_drop > 0.0 else ''}"
+                    if has_control_latents
+                    else ""
+                )
                 logging.info(
                     f"[OmniLoRA] Training {adapter.spec.model_id} on {plan.backend.backend_id.upper()} | "
                     f"{steps_label} | compute={plan.resolved_dtype}, weights={weight_format}, lora={effective_lora_dtype} | "
-                    f"opt={optimizer.upper()} lr={learning_rate:g} sched={sched_label} rank={resolved_rank} alpha={resolved_alpha:g} accum={grad_accum_steps} ckpt={ckpt_label} | "
+                    f"opt={optimizer.upper()} lr={learning_rate:g} sched={sched_label} rank={resolved_rank} alpha={resolved_alpha:g} accum={grad_accum_steps} ckpt={ckpt_label}{ctrl_log_suffix} | "
                     f"Model: {vram_placement}{ledger_suffix} ({total_gb:.2f} GB GPU)"
                 )
 
@@ -1897,15 +2558,30 @@ class OmniLoRATrainer:
                         mask_t = batch_dict.get("loss_mask")
                         mask_flip_t = batch_dict.get("loss_mask_flipped")
                         prompt_t = batch_dict["prompt_embeds"]
+                        prompt_flip_t = batch_dict.get("prompt_embeds_flipped")
                         pooled_t = (
                             batch_dict["pooled_output"]
                             if "pooled_output" in batch_dict and isinstance(batch_dict["pooled_output"], torch.Tensor)
                             else None
                         )
+                        pooled_flip_t = (
+                            batch_dict["pooled_output_flipped"]
+                            if "pooled_output_flipped" in batch_dict and isinstance(batch_dict["pooled_output_flipped"], torch.Tensor)
+                            else None
+                        )
                         extra_t = batch_dict.get("extra_conds")
+                        extra_flip_t = batch_dict.get("extra_conds_flipped")
+                        raw_ctrl_b = batch_dict.get("control_latents")
+                        ctrl_list: Optional[List[Optional[torch.Tensor]]] = (
+                            list(raw_ctrl_b) if isinstance(raw_ctrl_b, list) else None
+                        )
+                        raw_ctrl_flip_b = batch_dict.get("control_latents_flipped")
+                        ctrl_flip_list: Optional[List[Optional[torch.Tensor]]] = (
+                            list(raw_ctrl_flip_b) if isinstance(raw_ctrl_flip_b, list) else None
+                        )
 
                         # 1. If a bucket batch contains multiple samples (batch_size > 1), shuffle
-                        # the within-batch sample order on each draw.
+                        # the within-batch sample order on each draw (keeping targets, controls, masks, and prompts in lockstep).
                         bsz = int(latents_t.shape[0]) if isinstance(latents_t, torch.Tensor) and latents_t.ndim >= 1 else 1
                         perm_indices: Optional[List[int]] = None
                         if bsz > 1 and isinstance(prompt_t, torch.Tensor) and int(prompt_t.shape[0]) == bsz:
@@ -1919,8 +2595,12 @@ class OmniLoRATrainer:
                             if isinstance(mask_flip_t, torch.Tensor) and int(mask_flip_t.shape[0]) == bsz:
                                 mask_flip_t = mask_flip_t[perm_indices]
                             prompt_t = prompt_t[perm_indices]
+                            if isinstance(prompt_flip_t, torch.Tensor) and int(prompt_flip_t.shape[0]) == bsz:
+                                prompt_flip_t = prompt_flip_t[perm_indices]
                             if isinstance(pooled_t, torch.Tensor) and pooled_t.ndim >= 1 and int(pooled_t.shape[0]) == bsz:
                                 pooled_t = pooled_t[perm_indices]
+                            if isinstance(pooled_flip_t, torch.Tensor) and pooled_flip_t.ndim >= 1 and int(pooled_flip_t.shape[0]) == bsz:
+                                pooled_flip_t = pooled_flip_t[perm_indices]
                             if isinstance(extra_t, dict):
                                 perm_extra: Dict[str, Any] = {}
                                 for ek, ev in extra_t.items():
@@ -1929,12 +2609,26 @@ class OmniLoRATrainer:
                                     else:
                                         perm_extra[ek] = ev
                                 extra_t = perm_extra
+                            if isinstance(extra_flip_t, dict):
+                                perm_extra_f: Dict[str, Any] = {}
+                                for ek, ev in extra_flip_t.items():
+                                    if isinstance(ev, torch.Tensor) and ev.ndim >= 1 and int(ev.shape[0]) == bsz:
+                                        perm_extra_f[ek] = ev[perm_indices]
+                                    else:
+                                        perm_extra_f[ek] = ev
+                                extra_flip_t = perm_extra_f
+                            if ctrl_list is not None and len(ctrl_list) == bsz:
+                                ctrl_list = [ctrl_list[idx_p] for idx_p in perm_indices]
+                            if ctrl_flip_list is not None and len(ctrl_flip_list) == bsz:
+                                ctrl_flip_list = [ctrl_flip_list[idx_p] for idx_p in perm_indices]
 
-                        # 2. Dynamic per-sample horizontal flip (`random_flip`) using pre-cached VAE flipped latents
-                        # and synchronized flipped loss_mask
+                        # 2. Dynamic per-sample horizontal flip (`random_flip`) using pre-cached VAE flipped latents,
+                        # synchronized flipped loss_mask, synchronized flipped control latents, and (for VLM CLIPs)
+                        # synchronized flipped prompt embeddings.
                         if dynamic_flip_enabled and isinstance(latents_flip_t, torch.Tensor) and latents_flip_t.shape == latents_t.shape:
                             if bsz == 1:
-                                if batch_rng.random() < 0.5:
+                                flip_flags = [batch_rng.random() < 0.5]
+                                if flip_flags[0]:
                                     latents_t = latents_flip_t
                                     if isinstance(mask_t, torch.Tensor):
                                         mask_t = (
@@ -1942,6 +2636,14 @@ class OmniLoRATrainer:
                                             if isinstance(mask_flip_t, torch.Tensor) and mask_flip_t.shape == mask_t.shape
                                             else torch.flip(mask_t, dims=[-1])
                                         )
+                                    if ctrl_list is not None and ctrl_flip_list is not None and len(ctrl_flip_list) == 1:
+                                        ctrl_list = list(ctrl_flip_list)
+                                    if isinstance(prompt_flip_t, torch.Tensor):
+                                        prompt_t = prompt_flip_t
+                                        if isinstance(pooled_flip_t, torch.Tensor):
+                                            pooled_t = pooled_flip_t
+                                        if isinstance(extra_flip_t, dict):
+                                            extra_t = extra_flip_t
                             else:
                                 flip_flags = [batch_rng.random() < 0.5 for _ in range(bsz)]
                                 if all(flip_flags):
@@ -1952,6 +2654,14 @@ class OmniLoRATrainer:
                                             if isinstance(mask_flip_t, torch.Tensor) and mask_flip_t.shape == mask_t.shape
                                             else torch.flip(mask_t, dims=[-1])
                                         )
+                                    if ctrl_list is not None and ctrl_flip_list is not None and len(ctrl_flip_list) == bsz:
+                                        ctrl_list = list(ctrl_flip_list)
+                                    if isinstance(prompt_flip_t, torch.Tensor) and int(prompt_flip_t.shape[0]) == bsz:
+                                        prompt_t = prompt_flip_t
+                                        if isinstance(pooled_flip_t, torch.Tensor) and int(pooled_flip_t.shape[0]) == bsz:
+                                            pooled_t = pooled_flip_t
+                                        if isinstance(extra_flip_t, dict):
+                                            extra_t = extra_flip_t
                                 elif any(flip_flags):
                                     latents_t = torch.stack(
                                         [latents_flip_t[i] if flip_flags[i] else latents_t[i] for i in range(bsz)],
@@ -1968,6 +2678,42 @@ class OmniLoRATrainer:
                                                 [torch.flip(mask_t[i], dims=[-1]) if flip_flags[i] else mask_t[i] for i in range(bsz)],
                                                 dim=0,
                                             )
+                                    if ctrl_list is not None and ctrl_flip_list is not None and len(ctrl_flip_list) == bsz:
+                                        ctrl_list = [
+                                            ctrl_flip_list[i] if flip_flags[i] else ctrl_list[i]
+                                            for i in range(bsz)
+                                        ]
+                                    if isinstance(prompt_flip_t, torch.Tensor) and prompt_flip_t.shape == prompt_t.shape:
+                                        prompt_t = torch.stack(
+                                            [prompt_flip_t[i] if flip_flags[i] else prompt_t[i] for i in range(bsz)],
+                                            dim=0,
+                                        )
+                                        if (
+                                            isinstance(pooled_t, torch.Tensor)
+                                            and isinstance(pooled_flip_t, torch.Tensor)
+                                            and pooled_flip_t.shape == pooled_t.shape
+                                        ):
+                                            pooled_t = torch.stack(
+                                                [pooled_flip_t[i] if flip_flags[i] else pooled_t[i] for i in range(bsz)],
+                                                dim=0,
+                                            )
+                                        if isinstance(extra_t, dict) and isinstance(extra_flip_t, dict):
+                                            blended_extra: Dict[str, Any] = {}
+                                            for ek, ev in extra_t.items():
+                                                ev_f = extra_flip_t.get(ek)
+                                                if (
+                                                    isinstance(ev, torch.Tensor)
+                                                    and isinstance(ev_f, torch.Tensor)
+                                                    and ev_f.shape == ev.shape
+                                                    and int(ev.shape[0]) == bsz
+                                                ):
+                                                    blended_extra[ek] = torch.stack(
+                                                        [ev_f[i] if flip_flags[i] else ev[i] for i in range(bsz)],
+                                                        dim=0,
+                                                    )
+                                                else:
+                                                    blended_extra[ek] = ev
+                                            extra_t = blended_extra
 
                         # 3. Dynamic per-sample CFG caption dropout (`caption_dropout`) using pre-cached unconditional prompt
                         if dynamic_cap_drop > 0.0 and isinstance(prompt_t, torch.Tensor):
@@ -2067,6 +2813,16 @@ class OmniLoRATrainer:
                                                     merged_extra[ek] = ev_cloned
                                         extra_t = merged_extra
 
+                        # 4. Dynamic per-sample control dropout (`control_dropout`) for CFG / unconditional edit training
+                        ctrl_drop_flags: Optional[List[bool]] = None
+                        if ctrl_list is not None:
+                            ctrl_drop_flags = [c is None for c in ctrl_list]
+                            if dynamic_ctrl_drop > 0.0:
+                                for i in range(len(ctrl_list)):
+                                    if ctrl_list[i] is not None and batch_rng.random() < dynamic_ctrl_drop:
+                                        ctrl_list[i] = None
+                                        ctrl_drop_flags[i] = True
+
                         lat_scale = (
                             int(getattr(adapter.latent_format, "spacial_downscale_ratio", 8) or 8)
                             if getattr(adapter, "latent_format", None) is not None
@@ -2088,6 +2844,15 @@ class OmniLoRATrainer:
                             item_batch["pooled_output"] = pooled_t
                         if extra_t:
                             item_batch["extra_conds"] = extra_t
+                        if ctrl_list is not None and any(c is not None for c in ctrl_list):
+                            item_batch["control_latents"] = ctrl_list
+                            item_batch["control_mode"] = str(control_mode or "auto")
+                            item_batch["reference_latents_method"] = str(reference_latents_method or "auto")
+                        if ctrl_drop_flags is not None and any(ctrl_drop_flags):
+                            item_batch["control_dropped"] = (
+                                ctrl_drop_flags[0] if len(ctrl_drop_flags) == 1 else ctrl_drop_flags
+                            )
+                            item_batch["control_mode"] = str(control_mode or "auto")
                         micro_batches.append(item_batch)
 
                     last_metrics = pipeline.train_step(step_idx, micro_batches=micro_batches)
@@ -2385,6 +3150,10 @@ class OmniLoRATrainer:
                 pipeline.optimizer = None
                 pipeline.lr_scheduler = None
                 pipeline.grad_scaler = None
+                try:
+                    pipeline.cleanup()
+                except Exception:
+                    pass
                 release_streamed_weight_buffers()
                 gc.collect()
                 try:
@@ -2496,6 +3265,11 @@ class OmniLoRATrainer:
                 "seed": int(seed),
                 "random_flip": dynamic_flip_enabled,
                 "caption_dropout": dynamic_cap_drop,
+                "has_control_latents": has_control_latents,
+                "control_mode_resolved": resolved_control_mode,
+                "reference_latents_method": str(reference_latents_method or "auto"),
+                "control_dropout": dynamic_ctrl_drop,
+                "clip_used_control_images": bool(getattr(cached_data, "clip_used_control_images", False)),
                 "resumed_from_lora": resumed_bundle.source_name if resumed_bundle is not None else None,
                 "resumed_lora_layers": setup_info.get("resumed_lora_layers", 0),
                 "steps_this_session": steps,

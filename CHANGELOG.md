@@ -1,11 +1,65 @@
 # Changelog
 
 All notable changes to **ComfyUI-OmniLoRA** are documented in this file.
-Versioning follows [Semantic Versioning](https://semver.org/) and is tracked via Git tags (`v1.0.x`) on `master` for the Comfy Registry and ComfyUI Manager.
+Versioning follows [Semantic Versioning](https://semver.org/) and is tracked via Git tags (`v1.x.y`) on `master` for the Comfy Registry and ComfyUI Manager.
 
 ---
 
-## [1.0.4] - 2026-04-12
+## [1.1.0] - 2026-11-21
+
+### Added
+- **Universal Image Editing / Control Folder Support**:
+  - Added paired control/source folder loading to `OmniLoRADatasetLoader` (`control_path`, `control_resize_mode` `"match_target"` / `"preserve_aspect"`, direct in-graph `control_images` tensor input, cross-extension and mirrored subfolder stem matching, mixed controlled/uncontrolled datasets, and fail-fast 0-match validation).
+  - Upgraded `OmniLoRAPrecomputeConditioning` to cache raw unscaled VAE control latents (matching ComfyUI's native `ReferenceLatent` and `InstructPixToPixConditioning` nodes), auto-detect VLM text encoders accepting `clip.tokenize(..., images=[...])`, resize control images via `clip_vision_resolution`, support custom `clip_prompt_template` (`{prompt}` / `{}`), and synchronize `random_flip` across target latents, control latents, and VLM visual tokens.
+  - Added `control_mode` (`"auto"` / `"reference_latents"` / `"concat_latent_image"`), `reference_latents_method` (`"auto"` / `"offset"` / `"index"` / `"index_timestep_zero"` / `"uxo"`), `control_dropout`, edit-aware VRAM ledger activation accounting (`has_control_latents`), and safe per-item microbatching for mixed controlled/uncontrolled batches in `OmniLoRATrainer` and `ComfyModelAdapter`.
+  - Added [`example_workflows/omni_lora_image_edit_workflow.json`](./example_workflows/omni_lora_image_edit_workflow.json) and a 14-architecture unmocked edit contract test suite (`TestRealForwardEditModels`) covering Flux Kontext, Flux 2, Flux 3 Klein, Qwen-Image 1.0/2.1, OmniGen2, Boogu, MOSS-Image, FIBO 2.0, Krea 2, JoyImage, Mage-Flow (plus live dynamic discovery of future `ref_latents` models), HiDream-E1, and SD1.5 InstructPix2Pix — verified in both FP32 and BF16, at both square and mismatched (`preserve_aspect`) control resolutions, across `reference_latents_method` modes (`offset`, `index`, `index_timestep_zero`, `uxo`), and through native ComfyUI `LoraLoader` round-trips (including dedicated edit branches `ref_image_refiner.*` and `content_mode_blocks.image_cond.*`).
+- **Lazy Streaming Dataset Loading & Pre-Caching**:
+  - `OmniLoRADataset` now scans folder-based datasets via image headers only (dimensions, EXIF orientation, alpha/sidecar mask detection, and control-folder pairing) without eagerly decoding pixel buffers into CPU RAM.
+  - `OmniLoRAPrecomputeConditioning` streams one image pair at a time during Stage 1 (VAE encoding + immediate latent-resolution mask downsampling) and decodes control images on-demand only on cache misses during Stage 2 VLM CLIP encoding — reducing peak host RAM on large paired datasets from `O(N)` to `O(1)` image pair while keeping `DatasetSample` properties 100% backward-compatible.
+- **Scoped (Non-Permanent) PyTorch Op Wrappers**:
+  - Replaced permanent global monkey-patching of `torch.*` (`cat`, `stack`, `add`, `lerp`, `matmul`, etc.) and `torch.nn.functional.*` (`scaled_dot_product_attention`, `linear`, `conv1d/2d/3d`, `layer_norm`, `rms_norm`, `group_norm`, `pixel_shuffle/unshuffle`) with a thread-safe, ref-counted `_scoped_training_op_wrappers()` lease restored cleanly in `LoRATrainingPipeline.cleanup()` and `finally:` blocks so post-training ComfyUI inference and `torch.compile` run on native unpatched PyTorch callables.
+- **44-Architecture Unmocked Real-Forward Verification Suite (`RealForwardModelRegistry`)**:
+  - Replaced mocked forward tests with real unmocked `comfy.ldm.*` + `comfy.model_base.*` execution across 44 Image & Video architectures, verifying 7 end-to-end training invariants on every model plus a fast `torch.bfloat16` real-forward + backward smoke contract across all 44 models on CPU.
+  - Broadened `TestComfyUIUpstreamDriftGuard` to scan for *any* `.preprocess_*(` call or custom `process_latent_in` override across `comfy.model_base` subclasses, added live `comfy.text_encoders.*` VLM tokenizer detection verification, and upgraded `ComfyModelAdapter` to emit a clear rate-limited `logging.warning` whenever `inner_model.extra_conds(...)` raises instead of failing silently.
+- **LTX-AV 2.0 & 2.5 (`LTXAVModel`) Full Support**:
+  - Automatically excludes paired secondary `audio_*` transformer branches and audio connectors during video-only LoRA training while preserving full targeting on audio-only architectures.
+  - Preserves all 3 legal pre- and post-connector text embedding widths (`cross_attention_dim`, concatenated `cross_attention_dim + audio_cross_attention_dim`, and `caption_proj_before_connector` / `first_linear` mode) and reconciles post-connector `attention_mask` lengths for variable-length multi-sample batches.
+- **MiniMax-H3-Image (`MiniMaxH3ImageModel`) Support**:
+  - Added full support for `MiniMaxH3ImageModel` single-stream image latents (`audio_latents_dim=None`), PDD curves, gate compression, and strict `batch_size == 1` microbatching alongside `MiniMaxH3Model` dual-stream video/audio.
+  - Preserved `float32` precision on MiniMax H3 / H3-Image small numerical islands (`video_patch_proj`, `audio_patch_proj`, `time_embedder`, `final_layer` PDD heads, and curve-form `adaln_proj`) during VRAM placement so training matches inference numerically.
+  - Guarded `OmniLoRAPrecomputeConditioning` against stale `inner_model.latent_shapes` left on multimodal models (`MiniMaxH3`, `LTXAV`) by prior ComfyUI `KSampler` runs.
+- **ComfyUI `comfy_aimdo.malloc_graph` & `comfy.model_prefetch` Training Guard**:
+  - Safely guards ComfyUI's inference-only `aimdo` memory compiler and prefetch hooks during training to prevent `RuntimeError: aimdo memory compile error` (`rogues: N`) when autograd saves intermediate activations.
+- **Unbounded In-Place Autograd Fidelity Guards**:
+  - Removed the previous 8 MB saved-tensor snapshot cap and hardened autograd safety for in-place slice mutations (`CopySlices`), `torch.cat(..., out=buf)` (Flux 3 Klein), and MiniMax H3 `_mod_scale_shift` / `_mod_gate` under both `gradient_checkpointing=True` and `False`, guaranteeing `comfy.model_management.in_training` is always restored on exceptions.
+
+### Fixed
+- **MiniMax-H3-Image BF16 `torch.lerp` Mixed-DType Crash**:
+  - Aligned floating-point operand dtypes in the scoped `torch.lerp` wrapper to prevent `RuntimeError: expected dtype BFloat16 for weight but got dtype float` during BF16 training and probes.
+- **Krea 2 `reference_latents_method="auto"` Routing**:
+  - Automatically defaults to `reference_latents_method="index"` when `control_mode="reference_latents"` is active on a backbone whose `default_ref_method` is `None`.
+- **Mismatched `preserve_aspect` Control Alignment on `concat_latent_image` Models**:
+  - Bilinearly aligns control latents to `noisy_latents` `(H, W)` in FP32 (preserving 5D temporal dimensions) for channel-concatenated / `image_cond` models (`HiDream-E1`, `InstructPix2Pix`, etc.) while keeping `reference_latents` DiTs at their native aspect ratio.
+- **Instance-Wrapped `backbone.forward` Signature Resolution**:
+  - Inspects `type(backbone).forward` in `ComfyModelAdapter` so instance-level `(*args, **kwargs)` wrappers from ComfyUI hooks/extensions never hide required positional parameters (such as `LTXBaseModel.forward(..., attention_mask)`).
+- **VLM CLIP Detection & Post-Injection LoRA Key-Map Hardening**:
+  - Hardened `_clip_supports_images_kwarg` / `_clip_supports_llama_template_kwarg` against `None` `llama_template_images` class attributes on non-VLM tokenizers, and sanitized `.base_layer.` in `LoRAInjector.capture_comfy_lora_key_map` if invoked after LoRA injection.
+- **PixArt (`PixArtMS`) Crash & Frozen Base-Model `.eval()` Discipline**:
+  - Kept the frozen base backbone in `.eval()` mode during LoRA fine-tuning while enabling `.train()` exclusively on injected LoRA adapter layers (`LoRALinear` / `lora_dropout`).
+  - Eliminates PixArt's `CaptionEmbedder.token_drop` crash (`AssertionError` on variable-length prompts plus a hardcoded `.cuda()` call that failed on XPU/CPU/MPS/DirectML) and prevents frozen base-model dropout, stochastic depth, and BatchNorm running-stat updates from perturbing LoRA training or checkpointing parity.
+- **OmniGen2 & Boogu Multi-Batch (`B > 1`) `attention_mask` & `num_tokens` Crashes**:
+  - Reshaped raw 2D `(B, L_k)` per-sample key padding masks to `(B, 1, 1, L_k)` in `_wrapped_sdpa` to prevent right-aligned broadcast collisions against `L_q` when `batch_size > 1`.
+  - Clamped batched `num_tokens` to `context.shape[1]` and added OmniGen2 / Boogu to multi-row `attention_mask` single-item microbatching so each sample receives its exact per-prompt token count and RoPE positions.
+- **Bria FIBO 2.0 Bundled Multi-Layer Context Width**:
+  - Fixed `_infer_backbone_context_dim` and `_collect_valid_backbone_context_dims` to recognize Fibo2's bundled `(1 + len(injection_layers)) * cap_feat_dim` context width instead of misadapting or truncating conditioning tensors.
+- **Anima `batch_size > 1` `extra_conds` `inference_mode` Escape**:
+  - Exited `torch.inference_mode()` cleanly under `torch.no_grad()` when running `Anima.extra_conds` on multi-sample batches so conditioning tensors remain autograd-compatible.
+- **Stable Cascade 1D Scalar Conditioning Broadcast**:
+  - Fixed 1D scalar conditioning broadcast (`sca`, `crp`) across `batch_size > 1` and refined nested `nn.ModuleList` structural role classification to exclude pure modulation `TimestepBlock` layers.
+
+---
+
+## [1.0.4] - 2026-11-18
 
 ### Fixed
 - **Flux / Flux.2 / Chroma `int64` `attention_mask` SDPA Crash**:
@@ -15,7 +69,7 @@ Versioning follows [Semantic Versioning](https://semver.org/) and is tracked via
 
 ---
 
-## [1.0.3] - 2026-04-12
+## [1.0.3] - 2026-11-18
 
 ### Added
 - **MiniMax H3 Dual-Stream Audio-Video Training Support (`MiniMaxH3Model` / `MiniMaxH3AV`)**:
@@ -36,7 +90,7 @@ Versioning follows [Semantic Versioning](https://semver.org/) and is tracked via
 
 ---
 
-## [1.0.2] - 2026-04-11
+## [1.0.2] - 2026-11-17
 
 ### Added
 - **Comfy Kitchen (`--use-ck-attention`) & SageAttention (`--use-sage-attention`) Training Guards**:
@@ -49,14 +103,14 @@ Versioning follows [Semantic Versioning](https://semver.org/) and is tracked via
 
 ---
 
-## [1.0.1] - 2026-04-10
+## [1.0.1] - 2026-11-17
 
 ### Fixed
 - Refactored subprocess and file-handling helpers to eliminate Comfy Registry YARA security scanner false positives.
 
 ---
 
-## [1.0.0] - 2026-04-09
+## [1.0.0] - 2026-11-17
 
 ### Added
 - Initial stable release of **ComfyUI-OmniLoRA**:
