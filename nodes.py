@@ -25,6 +25,7 @@ Provides 6 modular ComfyUI nodes under category `OmniLoRA/Training`:
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import inspect
 import json
@@ -34,7 +35,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -116,8 +117,8 @@ def _try_comfy_unload_models() -> None:
                         continue
                     if hasattr(loaded_m, "currently_used"):
                         loaded_m.currently_used = False
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.debug(f"[OmniLoRA] Could not inspect loaded ComfyUI model entry: {exc}")
 
         mm.unload_all_models()
 
@@ -132,21 +133,23 @@ def _try_comfy_unload_models() -> None:
                         and getattr(loaded_m, "real_model", True) is not None
                     ):
                         loaded_m.model_unload()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.debug(f"[OmniLoRA] Model unload entry cleanup warning: {exc}")
 
         if hasattr(mm, "cleanup_models_gc"):
             try:
                 mm.cleanup_models_gc()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.debug(f"[OmniLoRA] comfy.model_management.cleanup_models_gc failed: {exc}")
         if hasattr(mm, "cleanup_models"):
             try:
                 mm.cleanup_models()
-            except Exception:
-                pass
-    except Exception:
+            except Exception as exc:
+                logging.debug(f"[OmniLoRA] comfy.model_management.cleanup_models failed: {exc}")
+    except ImportError:
         pass
+    except Exception as exc:
+        logging.debug(f"[OmniLoRA] Could not unload ComfyUI models: {exc}")
     gc.collect()
     try:
         import comfy.model_management as mm  # type: ignore
@@ -155,8 +158,10 @@ def _try_comfy_unload_models() -> None:
             mm.soft_empty_cache(True)
         except TypeError:
             mm.soft_empty_cache()
-    except Exception:
+    except ImportError:
         pass
+    except Exception as exc:
+        logging.debug(f"[OmniLoRA] comfy.model_management.soft_empty_cache failed: {exc}")
     for dev_attr in ("xpu", "cuda", "mps", "npu", "hpu"):
         dev_mod = getattr(torch, dev_attr, None)
         if dev_mod is not None and hasattr(dev_mod, "empty_cache"):
@@ -174,8 +179,8 @@ def _try_comfy_unload_models() -> None:
                     if hasattr(dev_mod, "synchronize"):
                         dev_mod.synchronize()
                     dev_mod.empty_cache()
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.debug(f"[OmniLoRA] Device {dev_attr} cache flush warning: {exc}")
     if had_loaded_models:
         trim_process_working_set()
 
@@ -330,12 +335,19 @@ def _load_lora_safetensors_or_pt(file_path: Path) -> Tuple[Dict[str, torch.Tenso
         except ImportError:
             pass
 
-    try:
-        import comfy.utils  # type: ignore
+    raw_obj: Any = None
+    if file_path.suffix.lower() != ".safetensors":
+        try:
+            raw_obj = torch.load(str(file_path), map_location="cpu", weights_only=True)
+        except Exception:
+            raw_obj = None
+    if raw_obj is None:
+        try:
+            import comfy.utils  # type: ignore
 
-        raw_obj = comfy.utils.load_torch_file(str(file_path), safe_load=True)
-    except Exception:
-        raw_obj = torch.load(str(file_path), map_location="cpu", weights_only=True)
+            raw_obj = comfy.utils.load_torch_file(str(file_path), safe_load=True)
+        except Exception:
+            raw_obj = torch.load(str(file_path), map_location="cpu", weights_only=True)
 
     if isinstance(raw_obj, dict):
         if "state_dict" in raw_obj and isinstance(raw_obj["state_dict"], dict):
@@ -1396,7 +1408,7 @@ class OmniLoRAPrecomputeConditioning:
                 adapter._validate_and_prepare_latents(
                     cached_latents[0],
                     backbone=backbone,
-                    latent_scaled=True,
+                    latent_scaled=latent_scaled,
                 )
                 adapter._validate_context_dim(cached_embeds[0], backbone=backbone)
 
@@ -1999,6 +2011,79 @@ class OmniLoRATrainer:
     FUNCTION = "train_lora"
     CATEGORY = "OmniLoRA/Training"
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _scoped_comfy_training_flags(model: Optional[Any] = None) -> Iterator[Callable[[], None]]:
+        """
+        Toggle ComfyUI's global `mm.in_training` and `cli_args.args.disable_comfy_compiler`
+        for the active training session and deterministically restore their exact prior
+        values on both normal completion and any pre-training setup exception.
+        """
+        orig_in_training: Optional[bool] = None
+        orig_disable_compiler: Optional[bool] = None
+        has_mm = False
+        restored = False
+
+        try:
+            import comfy.model_management as mm  # type: ignore
+
+            has_mm = True
+            orig_in_training = getattr(mm, "in_training", False)
+            mm.in_training = True
+        except Exception:
+            pass
+        try:
+            import comfy.cli_args as cli_args  # type: ignore
+
+            if hasattr(cli_args, "args"):
+                orig_disable_compiler = getattr(cli_args.args, "disable_comfy_compiler", None)
+                cli_args.args.disable_comfy_compiler = True
+                active_infer_attn: List[str] = []
+                if bool(getattr(cli_args.args, "use_ck_attention", False)):
+                    active_infer_attn.append("--use-ck-attention (Comfy Kitchen)")
+                if bool(getattr(cli_args.args, "use_sage_attention", False)):
+                    active_infer_attn.append("--use-sage-attention (SageAttention)")
+                if (
+                    model is not None
+                    and isinstance(getattr(model, "model_options", None), dict)
+                    and isinstance(model.model_options.get("transformer_options"), dict)
+                    and "optimized_attention_override" in model.model_options["transformer_options"]
+                ):
+                    active_infer_attn.append("model_options.optimized_attention_override")
+                if active_infer_attn:
+                    logging.info(
+                        f"[OmniLoRA] Detected inference-only attention configuration ({', '.join(active_infer_attn)}); "
+                        "routing training attention and RoPE/AdaLN kernels through differentiable PyTorch SDPA."
+                    )
+        except Exception:
+            pass
+
+        def _restore_flags() -> None:
+            nonlocal restored
+            if restored:
+                return
+            restored = True
+            if has_mm:
+                try:
+                    import comfy.model_management as mm  # type: ignore
+
+                    mm.in_training = bool(orig_in_training)
+                except Exception:
+                    pass
+            if orig_disable_compiler is not None:
+                try:
+                    import comfy.cli_args as cli_args  # type: ignore
+
+                    if hasattr(cli_args, "args"):
+                        cli_args.args.disable_comfy_compiler = orig_disable_compiler
+                except Exception:
+                    pass
+
+        try:
+            yield _restore_flags
+        finally:
+            _restore_flags()
+
     def train_lora(
         self,
         cached_data: CachedConditioningBundle,
@@ -2039,43 +2124,12 @@ class OmniLoRATrainer:
         vram_mode: str = "auto",
     ) -> Tuple[Any, OmniLoRANetworkBundle, str]:
         # CRITICAL: Exit ComfyUI's global torch.inference_mode() so autograd can build computation graphs
-        with torch.inference_mode(False), torch.enable_grad():
+        with (
+            torch.inference_mode(False),
+            torch.enable_grad(),
+            self._scoped_comfy_training_flags(model) as _restore_comfy_training_flags,
+        ):
             torch.set_default_dtype(torch.float32)
-
-            orig_in_training = False
-            orig_disable_compiler: Optional[bool] = None
-            try:
-                import comfy.model_management as mm  # type: ignore
-
-                orig_in_training = getattr(mm, "in_training", False)
-                mm.in_training = True
-            except Exception:
-                pass
-            try:
-                import comfy.cli_args as cli_args  # type: ignore
-
-                if hasattr(cli_args, "args"):
-                    orig_disable_compiler = getattr(cli_args.args, "disable_comfy_compiler", None)
-                    cli_args.args.disable_comfy_compiler = True
-                    active_infer_attn: List[str] = []
-                    if bool(getattr(cli_args.args, "use_ck_attention", False)):
-                        active_infer_attn.append("--use-ck-attention (Comfy Kitchen)")
-                    if bool(getattr(cli_args.args, "use_sage_attention", False)):
-                        active_infer_attn.append("--use-sage-attention (SageAttention)")
-                    if (
-                        model is not None
-                        and isinstance(getattr(model, "model_options", None), dict)
-                        and isinstance(model.model_options.get("transformer_options"), dict)
-                        and "optimized_attention_override" in model.model_options["transformer_options"]
-                    ):
-                        active_infer_attn.append("model_options.optimized_attention_override")
-                    if active_infer_attn:
-                        logging.info(
-                            f"[OmniLoRA] Detected inference-only attention configuration ({', '.join(active_infer_attn)}); "
-                            "routing training attention and RoPE/AdaLN kernels through differentiable PyTorch SDPA."
-                        )
-            except Exception:
-                pass
 
             install_comfy_runtime_hooks()
 
@@ -2379,12 +2433,35 @@ class OmniLoRATrainer:
             setup_info: Dict[str, Any] = {}
             last_metrics = None
             saved_checkpoints: List[str] = []
+            last_completed_step = 0
+            filtered_resumed_state: Dict[str, torch.Tensor] = (
+                dict(resumed_bundle.state_dict) if resumed_bundle is not None else {}
+            )
 
             try:
                 setup_info = pipeline.setup(
                     external_backbone=external_backbone,
                     initial_lora_state=resumed_bundle.state_dict if resumed_bundle is not None else None,
                 )
+                if resumed_bundle is not None and pipeline.backbone is not None:
+                    backbone_mods = dict(pipeline.backbone.named_modules())
+                    invalid_resumed_prefixes: set[str] = set()
+                    for rk, rt in resumed_bundle.state_dict.items():
+                        mod_p, comp = LoRAInjector._strip_lora_key_prefix_and_suffix(rk)
+                        if comp == "down" and isinstance(rt, torch.Tensor) and rt.ndim == 2:
+                            mod_obj = backbone_mods.get(mod_p)
+                            w_obj = getattr(mod_obj, "weight", None) if mod_obj is not None else None
+                            if (
+                                isinstance(w_obj, torch.Tensor)
+                                and w_obj.ndim >= 3
+                                and w_obj.numel() != w_obj.shape[0] * w_obj.shape[1]
+                            ):
+                                invalid_resumed_prefixes.add(mod_p)
+                    filtered_resumed_state = {
+                        rk: rv
+                        for rk, rv in resumed_bundle.state_dict.items()
+                        if LoRAInjector._strip_lora_key_prefix_and_suffix(rk)[0] not in invalid_resumed_prefixes
+                    }
                 vram_budget = setup_info.get("vram_budget", {})
 
                 ui_pbar: Optional[Any] = None
@@ -2856,6 +2933,7 @@ class OmniLoRATrainer:
                         micro_batches.append(item_batch)
 
                     last_metrics = pipeline.train_step(step_idx, micro_batches=micro_batches)
+                    last_completed_step = step_idx
                     step_duration = float(last_metrics.step_time_ms) / 1000.0 if last_metrics else 0.0
 
                     # Exclude Step 1's one-time kernel compilation warm-up from the steady-state EMA speed
@@ -2934,7 +3012,7 @@ class OmniLoRATrainer:
                         (ckpt_interval > 0 and step_idx % ckpt_interval == 0) or manual_ckpt
                     ) and pipeline.backbone is not None:
                         cum_step = prior_steps + step_idx
-                        ckpt_state = dict(resumed_bundle.state_dict) if resumed_bundle is not None else {}
+                        ckpt_state = dict(filtered_resumed_state)
                         ckpt_state.update(
                             LoRAInjector.extract_lora_state_dict(
                                 pipeline.backbone,
@@ -2993,25 +3071,7 @@ class OmniLoRATrainer:
                         pass
 
                 assert pipeline.backbone is not None
-                if resumed_bundle is not None:
-                    backbone_mods = dict(pipeline.backbone.named_modules())
-                    invalid_resumed_prefixes: set[str] = set()
-                    for rk, rt in resumed_bundle.state_dict.items():
-                        mod_p, comp = LoRAInjector._strip_lora_key_prefix_and_suffix(rk)
-                        if comp == "down" and isinstance(rt, torch.Tensor) and rt.ndim == 2:
-                            mod_obj = backbone_mods.get(mod_p)
-                            w_obj = getattr(mod_obj, "weight", None) if mod_obj is not None else None
-                            if (
-                                isinstance(w_obj, torch.Tensor)
-                                and w_obj.ndim >= 3
-                                and w_obj.numel() != w_obj.shape[0] * w_obj.shape[1]
-                            ):
-                                invalid_resumed_prefixes.add(mod_p)
-                    lora_state = {
-                        rk: rv
-                        for rk, rv in resumed_bundle.state_dict.items()
-                        if LoRAInjector._strip_lora_key_prefix_and_suffix(rk)[0] not in invalid_resumed_prefixes
-                    }
+                lora_state = dict(filtered_resumed_state)
                 lora_state.update(
                     LoRAInjector.extract_lora_state_dict(
                         pipeline.backbone,
@@ -3019,13 +3079,11 @@ class OmniLoRATrainer:
                     )
                 )
             except BaseException as exc:
-                completed_step_idx = int(locals().get("step_idx", 0))
+                completed_step_idx = last_completed_step
                 emergency_ckpt_path_str = ""
                 if completed_step_idx > 0 and pipeline.backbone is not None:
                     try:
-                        emerg_state: Dict[str, torch.Tensor] = {}
-                        if resumed_bundle is not None:
-                            emerg_state.update(resumed_bundle.state_dict)
+                        emerg_state: Dict[str, torch.Tensor] = dict(filtered_resumed_state)
                         emerg_state.update(
                             LoRAInjector.extract_lora_state_dict(
                                 pipeline.backbone,
@@ -3088,8 +3146,8 @@ class OmniLoRATrainer:
                 # on user Interrupt or OOM) so zero untracked tensors remain on the GPU.
                 try:
                     plan.backend.synchronize()
-                except Exception:
-                    pass
+                except Exception as sync_exc:
+                    logging.debug(f"[OmniLoRA] Pre-cleanup backend synchronize warning: {sync_exc}")
                 offload_dev = torch.device("cpu")
                 if model is not None:
                     raw_off = getattr(model, "offload_device", None) or getattr(
@@ -3145,37 +3203,24 @@ class OmniLoRATrainer:
                                             pass
                         if hasattr(model, "model_loaded_weight_memory"):
                             model.model_loaded_weight_memory = 0
-                    except Exception:
-                        pass
+                    except Exception as reset_exc:
+                        logging.warning(f"[OmniLoRA] Warning resetting ModelPatcher residency metadata: {reset_exc}")
                 pipeline.optimizer = None
                 pipeline.lr_scheduler = None
                 pipeline.grad_scaler = None
                 try:
                     pipeline.cleanup()
-                except Exception:
-                    pass
+                except Exception as clean_exc:
+                    logging.warning(f"[OmniLoRA] Warning during pipeline cleanup: {clean_exc}")
                 release_streamed_weight_buffers()
                 gc.collect()
                 try:
                     plan.backend.synchronize()
                     plan.backend.empty_cache()
-                except Exception:
-                    pass
+                except Exception as cache_exc:
+                    logging.debug(f"[OmniLoRA] Post-cleanup cache release warning: {cache_exc}")
                 _try_comfy_unload_models()
-                try:
-                    import comfy.model_management as mm  # type: ignore
-
-                    mm.in_training = False
-                except Exception:
-                    pass
-                if orig_disable_compiler is not None:
-                    try:
-                        import comfy.cli_args as cli_args  # type: ignore
-
-                        if hasattr(cli_args, "args"):
-                            cli_args.args.disable_comfy_compiler = orig_disable_compiler
-                    except Exception:
-                        pass
+                _restore_comfy_training_flags()
 
             install_comfy_runtime_hooks()
 
@@ -3228,7 +3273,14 @@ class OmniLoRATrainer:
                     import comfy.sd  # type: ignore
 
                     out_model, _ = comfy.sd.load_lora_for_models(base_patcher, None, lora_state, 1.0, 0.0)
-                except Exception:
+                except (ImportError, ModuleNotFoundError):
+                    out_model = base_patcher
+                except Exception as patch_exc:
+                    logging.warning(
+                        f"[OmniLoRA] Failed to apply trained LoRA onto output MODEL via "
+                        f"comfy.sd.load_lora_for_models ({type(patch_exc).__name__}: {patch_exc}); "
+                        "returning base MODEL without attached LoRA patches (use the LORA output or Load LoRA node)."
+                    )
                     out_model = base_patcher
 
                 if out_model is not source_patcher:

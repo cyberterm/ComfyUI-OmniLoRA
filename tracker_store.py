@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -23,7 +24,13 @@ _DISK_FLUSH_INTERVAL_SEC = 10.0
 
 
 def _default_state_file() -> Path:
-    return Path(__file__).resolve().parent / ".omni_lora_tracker_runs.json"
+    env_override = os.environ.get("OMNI_LORA_TRACKER_STATE_FILE", "").strip()
+    if env_override:
+        return Path(env_override).expanduser()
+    pkg_dir = Path(__file__).resolve().parent
+    if os.access(pkg_dir, os.W_OK):
+        return pkg_dir / ".omni_lora_tracker_runs.json"
+    return Path(tempfile.gettempdir()) / "omni_lora_tracker_runs.json"
 
 
 class OmniLoRATelemetryStore:
@@ -40,13 +47,20 @@ class OmniLoRATelemetryStore:
         self._runs: Dict[str, Dict[str, Any]] = {}
         self._run_order: List[str] = []
         self._deleted_run_ids: set[str] = set()
+        self._pending_checkpoint_nodes: set[str] = set()
+        self._pending_wildcard_checkpoints: int = 0
         self._last_flush_time: float = 0.0
+        self._flush_warned: bool = False
         if self._explicit_state_file:
             self._load_from_disk()
         else:
-            # Start each ComfyUI server process with a clean run store so stale runs
-            # from previous sessions never stick around across restarts.
-            self._flush_to_disk(force=True)
+            # Start each ComfyUI server process with a clean run store without writing an
+            # empty state file on import; only unlink any stale state file left by a prior run.
+            try:
+                if self._state_file.exists():
+                    self._state_file.unlink()
+            except OSError as exc:
+                logging.debug(f"[OmniLoRA] Could not remove stale telemetry cache '{self._state_file}': {exc}")
 
     def _load_from_disk(self) -> None:
         try:
@@ -101,15 +115,16 @@ class OmniLoRATelemetryStore:
                     "_steps": steps_by_num,
                 }
                 self._run_order.append(run_id)
-        except Exception:
+        except Exception as exc:
             # Never block startup if temp cache is unreadable or corrupt
-            pass
+            logging.warning(f"[OmniLoRA] Could not load telemetry cache '{self._state_file}': {exc}")
 
     def _flush_to_disk(self, force: bool = False) -> None:
         now = time.time()
         if not force and (now - self._last_flush_time) < _DISK_FLUSH_INTERVAL_SEC:
             return
         self._last_flush_time = now
+        tmp_path = self._state_file.with_suffix(".tmp")
         try:
             serialized_runs: List[Dict[str, Any]] = []
             for rid in self._run_order[-self._max_runs :]:
@@ -119,11 +134,18 @@ class OmniLoRATelemetryStore:
                 serialized_runs.append(self._serialize_run(run, after_step=0))
             payload = {"saved_at": now, "runs": serialized_runs}
             self._state_file.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self._state_file.with_suffix(".tmp")
             tmp_path.write_text(json.dumps(payload), encoding="utf-8")
             os.replace(tmp_path, self._state_file)
-        except Exception:
-            pass
+            self._flush_warned = False
+        except Exception as exc:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+            if not self._flush_warned:
+                self._flush_warned = True
+                logging.warning(f"[OmniLoRA] Could not persist telemetry cache '{self._state_file}': {exc}")
 
     def _evict_if_needed(self) -> None:
         while len(self._run_order) > self._max_runs:
@@ -364,20 +386,31 @@ class OmniLoRATelemetryStore:
             return len(to_remove)
 
     def request_checkpoint(self, node_id: Optional[str] = None) -> None:
+        target = str(node_id or "").strip()
         with self._lock:
-            self._manual_checkpoint_requested = True
-            self._manual_checkpoint_node_id = str(node_id or "").strip()
+            if target:
+                self._pending_checkpoint_nodes.add(target)
+            else:
+                self._pending_wildcard_checkpoints += 1
 
     def consume_checkpoint_request(self, node_id: Optional[str] = None) -> bool:
+        target = str(node_id or "").strip()
         with self._lock:
-            if not getattr(self, "_manual_checkpoint_requested", False):
+            if target:
+                if target in self._pending_checkpoint_nodes:
+                    self._pending_checkpoint_nodes.discard(target)
+                    return True
+                if self._pending_wildcard_checkpoints > 0:
+                    self._pending_wildcard_checkpoints -= 1
+                    return True
                 return False
-            req_node = getattr(self, "_manual_checkpoint_node_id", "")
-            if req_node and node_id and str(node_id).strip() != req_node:
-                return False
-            self._manual_checkpoint_requested = False
-            self._manual_checkpoint_node_id = ""
-            return True
+            if self._pending_wildcard_checkpoints > 0:
+                self._pending_wildcard_checkpoints -= 1
+                return True
+            if self._pending_checkpoint_nodes:
+                self._pending_checkpoint_nodes.pop()
+                return True
+            return False
 
 
 TRACKER_STORE = OmniLoRATelemetryStore()

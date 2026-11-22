@@ -799,13 +799,13 @@ class OmniLoRADataset:
                 with open(caption_file, "r", encoding="utf-8", errors="ignore") as f:
                     return f.read().strip()
         if manifest_captions:
-            for cand_key in (
-                img_path.name,
-                img_path.stem,
-                str(img_path.relative_to(root_folder)).replace("\\", "/")
-                if (root_folder is not None and img_path.is_relative_to(root_folder))
-                else "",
-            ):
+            cand_keys: List[str] = []
+            if root_folder is not None and img_path.is_relative_to(root_folder):
+                rel_p = img_path.relative_to(root_folder)
+                cand_keys.append(rel_p.as_posix())
+                cand_keys.append(rel_p.with_suffix("").as_posix())
+            cand_keys.extend((img_path.name, img_path.stem))
+            for cand_key in cand_keys:
                 if cand_key and cand_key in manifest_captions:
                     return manifest_captions[cand_key]
         return ""
@@ -820,6 +820,38 @@ class OmniLoRADataset:
         import json as _json
 
         out: Dict[str, str] = {}
+        short_key_owner: Dict[str, str] = {}
+        ambiguous_short_keys: set[str] = set()
+
+        def _register_entry(scan_dir: Path, raw_fn: str, cap: str) -> None:
+            fn_norm = raw_fn.replace("\\", "/").strip()
+            while fn_norm.startswith("./"):
+                fn_norm = fn_norm[2:]
+            if not fn_norm or not cap:
+                return
+            try:
+                rel_dir = scan_dir.relative_to(folder).as_posix()
+            except ValueError:
+                rel_dir = ""
+            rel_prefix = "" if rel_dir in ("", ".") else rel_dir
+            full_key = f"{rel_prefix}/{fn_norm}" if rel_prefix else fn_norm
+            out[fn_norm] = cap
+            out[full_key] = cap
+            full_stem_rel = str(Path(full_key).with_suffix("")).replace("\\", "/")
+            if full_stem_rel:
+                out[full_stem_rel] = cap
+
+            for sk in (Path(fn_norm).name, Path(fn_norm).stem):
+                if not sk or sk in ambiguous_short_keys:
+                    continue
+                prev_owner = short_key_owner.get(sk)
+                if prev_owner is not None and prev_owner != full_key:
+                    ambiguous_short_keys.add(sk)
+                    out.pop(sk, None)
+                else:
+                    short_key_owner[sk] = full_key
+                    out[sk] = cap
+
         candidate_dirs = [folder] + [
             d
             for d in sorted(folder.iterdir())
@@ -852,9 +884,7 @@ class OmniLoRADataset:
                                     or ""
                                 ).strip()
                                 if fn and cap:
-                                    out[fn] = cap
-                                    out[Path(fn).name] = cap
-                                    out[Path(fn).stem] = cap
+                                    _register_entry(scan_dir, fn, cap)
                     except Exception:
                         pass
             for json_name in ("captions.json", "metadata.json"):
@@ -866,15 +896,11 @@ class OmniLoRADataset:
                         if isinstance(parsed, dict):
                             for k, v in parsed.items():
                                 if isinstance(v, str) and v.strip():
-                                    out[str(k)] = v.strip()
-                                    out[Path(str(k)).name] = v.strip()
-                                    out[Path(str(k)).stem] = v.strip()
+                                    _register_entry(scan_dir, str(k), v.strip())
                                 elif isinstance(v, dict):
                                     cap = str(v.get("text") or v.get("caption") or v.get("prompt") or "").strip()
                                     if cap:
-                                        out[str(k)] = cap
-                                        out[Path(str(k)).name] = cap
-                                        out[Path(str(k)).stem] = cap
+                                        _register_entry(scan_dir, str(k), cap)
                     except Exception:
                         pass
         return out
@@ -919,13 +945,21 @@ class OmniLoRADataset:
         """
         by_rel_stem: Dict[str, Path] = {}
         by_stem: Dict[str, Path] = {}
+        ambiguous_stems: set[str] = set()
         for ctrl_path in cls._discover_dataset_image_files(control_dir):
             try:
                 rel_no_ext = str(ctrl_path.relative_to(control_dir).with_suffix("")).replace("\\", "/").lower()
             except ValueError:
                 rel_no_ext = ctrl_path.stem.lower()
             by_rel_stem.setdefault(rel_no_ext, ctrl_path)
-            by_stem.setdefault(ctrl_path.stem.lower(), ctrl_path)
+            stem_low = ctrl_path.stem.lower()
+            if stem_low in ambiguous_stems:
+                continue
+            if stem_low in by_stem:
+                del by_stem[stem_low]
+                ambiguous_stems.add(stem_low)
+            else:
+                by_stem[stem_low] = ctrl_path
         return by_rel_stem, by_stem
 
     @staticmethod
@@ -1250,7 +1284,10 @@ class OmniLoRADataset:
                     )
 
         if control_dir is not None and folder_image_count > 0 and folder_control_matches == 0:
-            sample_ctrl_stem = next(iter(ctrl_by_stem.keys()), "(no images found)")
+            sample_ctrl_stem = next(
+                iter(ctrl_by_stem.keys()),
+                next(iter(ctrl_by_rel.keys()), "(no images found)"),
+            )
             raise ValueError(
                 f"[OmniLoRA] control_path='{control_dir}' matched 0 of {folder_image_count} target images "
                 f"in '{folder_str}'. Target and control images must share matching filename stems "
@@ -1268,6 +1305,11 @@ class OmniLoRADataset:
                 ctrl_imgs = comfy_control_images.detach()
                 if ctrl_imgs.ndim == 3:
                     ctrl_imgs = ctrl_imgs.unsqueeze(0)
+                if int(ctrl_imgs.shape[0]) not in (1, int(imgs.shape[0])):
+                    raise ValueError(
+                        f"[OmniLoRA] control_images batch size ({int(ctrl_imgs.shape[0])}) must match "
+                        f"images batch size ({int(imgs.shape[0])}) or be 1 for single-control broadcasting."
+                    )
 
             prompt_lines = [
                 line.strip()

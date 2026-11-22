@@ -13,6 +13,7 @@ Follows ComfyUI's node-graph & `model_management` philosophy:
 from __future__ import annotations
 
 import contextlib
+import functools
 import gc
 import logging
 import math
@@ -40,6 +41,41 @@ from ..backends.base import (
 )
 from ..lora.layers import LoRAConfig, LoRAInjector, LoRALinear
 from ..models.base import BaseModelAdapter
+
+
+@contextlib.contextmanager
+def _scoped_comfy_in_training() -> Iterator[None]:
+    """Temporarily set `comfy.model_management.in_training = True` and restore its previous value on exit."""
+    mm = None
+    had_attr = False
+    prev_val = False
+    try:
+        import comfy.model_management as mm  # type: ignore
+
+        had_attr = hasattr(mm, "in_training")
+        prev_val = bool(getattr(mm, "in_training", False))
+        mm.in_training = True
+    except Exception:
+        mm = None
+    try:
+        yield
+    finally:
+        if mm is not None:
+            try:
+                mm.in_training = prev_val if had_attr else False
+            except Exception:
+                pass
+
+
+def _with_scoped_comfy_in_training(fn: Any) -> Any:
+    """Wrap a method so `comfy.model_management.in_training` is scoped to the call and never leaked."""
+
+    @functools.wraps(fn)
+    def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        with _scoped_comfy_in_training():
+            return fn(*args, **kwargs)
+
+    return _wrapped
 
 
 def _clone_tensors_for_grad(obj: Any) -> Any:
@@ -665,6 +701,11 @@ def _install_chunked_sdpa_wrapper() -> None:
                 or key.dtype == torch.float32
                 or value.dtype == torch.float32
                 or not (query.dtype == key.dtype == value.dtype)
+                or (
+                    isinstance(attn_mask, torch.Tensor)
+                    and attn_mask.is_floating_point()
+                    and attn_mask.dtype != query.dtype
+                )
             )
         ):
             ac_dt: Optional[torch.dtype] = None
@@ -685,7 +726,7 @@ def _install_chunked_sdpa_wrapper() -> None:
                             pass
                 except Exception:
                     pass
-            if ac_dt is None and not (query.dtype == key.dtype == value.dtype):
+            if ac_dt is None:
                 for t_cand in (value, key, query):
                     if t_cand.dtype in (torch.float16, torch.bfloat16):
                         ac_dt = t_cand.dtype
@@ -700,7 +741,17 @@ def _install_chunked_sdpa_wrapper() -> None:
                 if value.dtype != ac_dt:
                     value = value.to(dtype=ac_dt)
                 if isinstance(attn_mask, torch.Tensor) and attn_mask.is_floating_point() and attn_mask.dtype != ac_dt:
-                    attn_mask = attn_mask.to(dtype=ac_dt)
+                    if ac_dt == torch.float16 and attn_mask.dtype == torch.float32:
+                        # Clamp large finite negative mask sentinels (e.g. -1e9 / finfo(fp32).min)
+                        # before FP16 downcast so they stay finite instead of becoming -inf, while
+                        # preserving explicit -inf mask entries unchanged.
+                        attn_mask = torch.where(
+                            torch.isfinite(attn_mask),
+                            attn_mask.clamp(min=-1e4, max=1e4),
+                            attn_mask,
+                        ).to(dtype=ac_dt)
+                    else:
+                        attn_mask = attn_mask.to(dtype=ac_dt)
 
         if (
             not is_causal
@@ -1210,7 +1261,7 @@ def _install_chunked_sdpa_wrapper() -> None:
         F.conv2d = _dml_safe_conv2d
 
     orig_conv3d = getattr(F, "_omni_orig_conv3d", getattr(F, "conv3d", None))
-    if orig_conv3d is not None and not getattr(F.conv3d, "_omni_dml_safe", False):
+    if orig_conv3d is not None and not getattr(F.conv3d, "_omni_train_dml_safe", False):
         setattr(F, "_omni_orig_conv3d", orig_conv3d)
 
         def _dml_safe_conv3d(
@@ -1324,6 +1375,7 @@ def _install_chunked_sdpa_wrapper() -> None:
             return orig_conv3d(input, weight, bias, stride, padding, dilation, groups)
 
         setattr(_dml_safe_conv3d, "_omni_dml_safe", True)
+        setattr(_dml_safe_conv3d, "_omni_train_dml_safe", True)
         F.conv3d = _dml_safe_conv3d
 
     orig_pixel_unshuffle = getattr(F, "_omni_orig_pixel_unshuffle", getattr(F, "pixel_unshuffle", None))
@@ -1387,6 +1439,8 @@ def _install_chunked_sdpa_wrapper() -> None:
 _OUT_KWARG_WRAPPERS_INSTALLED: bool = False
 _SEQ_PROMOTE_OPS: Tuple[str, ...] = ("cat", "stack", "hstack", "vstack", "dstack", "column_stack", "row_stack")
 _MATMUL_PROMOTE_OPS: Tuple[str, ...] = ("bmm", "matmul", "mm", "addmm", "baddbmm")
+_FP32_AUTOCAST_GUARD_TORCH_OPS: Tuple[str, ...] = ("mv", "addmv", "addbmm", "addr", "einsum")
+_TRAINING_TENSOR_MM_OPS: Tuple[str, ...] = ("__matmul__", "matmul", "bmm", "mm", "mv", "addmm", "baddbmm")
 
 
 def _unify_16bit_seq_tensors(tensors: Any) -> Any:
@@ -1441,20 +1495,94 @@ def _unify_16bit_matmul_args(args: Tuple[Any, ...]) -> Tuple[Any, ...]:
     )
 
 
+def _active_fp16_autocast_device_type(t: torch.Tensor) -> Optional[str]:
+    """
+    Return `t.device.type` when `torch.amp.autocast` is active on that device with
+    `dtype == torch.float16`, otherwise `None`.
+    """
+    dev_type = t.device.type
+    if dev_type in ("meta", "privateuseone", "dml"):
+        return None
+    try:
+        if torch.is_autocast_enabled(dev_type) and torch.get_autocast_dtype(dev_type) == torch.float16:
+            return dev_type
+    except TypeError:
+        try:
+            if dev_type == "cpu":
+                if torch.is_autocast_cpu_enabled() and torch.get_autocast_cpu_dtype() == torch.float16:
+                    return dev_type
+            elif torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16:
+                return dev_type
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
+
+
+def _should_keep_fp32_under_fp16_autocast(
+    args: Tuple[Any, ...],
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """
+    Detect pure non-differentiable `float32` linear-algebra calls (such as RoPE/MRoPE
+    frequency products `inv_freq.float() @ position_ids.float()` where coordinates like
+    Ideogram 4's `IMAGE_POSITION_OFFSET = 65536` exceed `fp16` max `65504.0`).
+
+    When all floating-point tensor operands are `torch.float32` with `requires_grad == False`
+    and `torch.amp.autocast` is active in `torch.float16`, returns the autocast `device_type`
+    so the wrapper can temporarily run the op with `autocast(enabled=False)` and preserve
+    exact ComfyUI inference precision with zero GPU-CPU syncs.
+    """
+    first_fp32: Optional[torch.Tensor] = None
+
+    def _scan(obj: Any, depth: int = 0) -> bool:
+        nonlocal first_fp32
+        if isinstance(obj, torch.Tensor):
+            if obj.is_floating_point():
+                if obj.dtype != torch.float32 or obj.requires_grad:
+                    return False
+                if first_fp32 is None:
+                    first_fp32 = obj
+            return True
+        if depth < 3 and isinstance(obj, (tuple, list)):
+            for item in obj:
+                if not _scan(item, depth + 1):
+                    return False
+        return True
+
+    for a in args:
+        if not _scan(a, 0):
+            return None
+    if kwargs:
+        for v in kwargs.values():
+            if not _scan(v, 0):
+                return None
+    if first_fp32 is None:
+        return None
+    return _active_fp16_autocast_device_type(first_fp32)
+
+
 def _install_out_kwarg_autograd_wrappers() -> None:
     """
-    Wrap `torch.cat`, `torch.stack`, `torch.add`, `torch.matmul`, etc. so that:
+    Wrap `torch.cat`, `torch.stack`, `torch.add`, `torch.matmul`, `torch.einsum`,
+    and `torch.Tensor` matmul methods so that:
     1. When an inference-authored ComfyUI model (such as `comfy/ldm/flux3/model.py` calling
        `torch.cat([img] + [...], dim=1, out=x)`) passes `out=x` while `torch.is_grad_enabled()`
        is True and inputs require grad, the operation executes without `out=` to build the
        autograd graph and copies the differentiable result into `x` via `x.copy_(res)`.
     2. Mixed `(float32, 16-bit)` inputs to `matmul`/`bmm`/`mm`/`addmm` are unified to 16-bit.
-    3. Installs `_install_chunked_sdpa_wrapper()` for memory-bounded high-res / non-Flash SDPA.
+    3. Pure non-differentiable `float32` matmul/`@`/`einsum` ops (e.g. Ideogram 4 MRoPE with
+       `IMAGE_POSITION_OFFSET = 65536 > 65504`) stay in `float32` under `fp16` autocast
+       instead of overflowing to `+inf`/`NaN`.
+    4. Installs `_install_chunked_sdpa_wrapper()` for memory-bounded high-res / non-Flash SDPA.
     """
     global _OUT_KWARG_WRAPPERS_INSTALLED
     if (
         _OUT_KWARG_WRAPPERS_INSTALLED
         and getattr(torch.cat, "_omni_out_kwarg_safe", False)
+        and getattr(torch.einsum, "_omni_fp32_autocast_safe", False)
+        and getattr(torch.Tensor.__matmul__, "_omni_fp32_autocast_safe", False)
         and getattr(F.scaled_dot_product_attention, "_omni_chunked_sdpa_safe", False)
     ):
         return
@@ -1478,6 +1606,10 @@ def _install_out_kwarg_autograd_wrappers() -> None:
                         args = (unified_seq,) + args[1:]
                 elif is_mm_op and len(args) >= 2:
                     args = _unify_16bit_matmul_args(args)
+                    fp32_ac_dev = _should_keep_fp32_under_fp16_autocast(args, kwargs)
+                    if fp32_ac_dev is not None:
+                        with torch.amp.autocast(device_type=fp32_ac_dev, enabled=False):
+                            return target_fn(*args, **kwargs)
                 elif is_lerp_op and len(args) >= 3:
                     a0, a1, a2 = args[0], args[1], args[2]
                     if (
@@ -1512,6 +1644,56 @@ def _install_out_kwarg_autograd_wrappers() -> None:
             setattr(torch, op_name, _make_wrapper(orig_fn, op_name))
         except Exception:
             pass
+
+    for op_name in _FP32_AUTOCAST_GUARD_TORCH_OPS:
+        fn = getattr(torch, op_name, None)
+        if fn is None or getattr(fn, "_omni_fp32_autocast_safe", False):
+            continue
+        orig_fn = getattr(torch, f"_omni_orig_{op_name}", fn)
+        setattr(torch, f"_omni_orig_{op_name}", orig_fn)
+
+        def _make_fp32_guard_wrapper(target_fn: Any) -> Any:
+            def _wrapped_fp32_guard(*args: Any, **kwargs: Any) -> Any:
+                fp32_ac_dev = _should_keep_fp32_under_fp16_autocast(args, kwargs)
+                if fp32_ac_dev is not None:
+                    with torch.amp.autocast(device_type=fp32_ac_dev, enabled=False):
+                        return target_fn(*args, **kwargs)
+                return target_fn(*args, **kwargs)
+
+            setattr(_wrapped_fp32_guard, "_omni_fp32_autocast_safe", True)
+            setattr(_wrapped_fp32_guard, "_omni_orig_fn", target_fn)
+            return _wrapped_fp32_guard
+
+        try:
+            setattr(torch, op_name, _make_fp32_guard_wrapper(orig_fn))
+        except Exception:
+            pass
+
+    for attr_name in _TRAINING_TENSOR_MM_OPS:
+        fn = getattr(torch.Tensor, attr_name, None)
+        if fn is None or getattr(fn, "_omni_fp32_autocast_safe", False):
+            continue
+        orig_fn = _TRAINING_TENSOR_ORIG_OPS.get(attr_name, fn)
+        _TRAINING_TENSOR_ORIG_OPS[attr_name] = orig_fn
+
+        def _make_tensor_mm_wrapper(target_fn: Any) -> Any:
+            def _wrapped_tensor_mm(self: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+                if isinstance(self, torch.Tensor) and self.dtype == torch.float32 and not self.requires_grad:
+                    fp32_ac_dev = _should_keep_fp32_under_fp16_autocast((self,) + args, kwargs)
+                    if fp32_ac_dev is not None:
+                        with torch.amp.autocast(device_type=fp32_ac_dev, enabled=False):
+                            return target_fn(self, *args, **kwargs)
+                return target_fn(self, *args, **kwargs)
+
+            setattr(_wrapped_tensor_mm, "_omni_fp32_autocast_safe", True)
+            setattr(_wrapped_tensor_mm, "_omni_orig_fn", target_fn)
+            return _wrapped_tensor_mm
+
+        try:
+            setattr(torch.Tensor, attr_name, _make_tensor_mm_wrapper(orig_fn))
+        except Exception:
+            pass
+
     _OUT_KWARG_WRAPPERS_INSTALLED = True
 
 
@@ -1519,6 +1701,8 @@ _TRAINING_OP_WRAPPERS_LOCK = threading.RLock()
 _TRAINING_OP_WRAPPERS_REFCOUNT: int = 0
 _TRAINING_OP_SAVED_F: Dict[str, Any] = {}
 _TRAINING_OP_SAVED_TORCH: Dict[str, Any] = {}
+_TRAINING_OP_SAVED_TENSOR_OPS: Dict[str, Tuple[bool, Any]] = {}
+_TRAINING_TENSOR_ORIG_OPS: Dict[str, Any] = {}
 
 _TRAINING_WRAPPED_F_OPS: Tuple[Tuple[str, str], ...] = (
     ("scaled_dot_product_attention", "_omni_orig_sdpa"),
@@ -1537,9 +1721,10 @@ _TRAINING_WRAPPED_F_OPS: Tuple[Tuple[str, str], ...] = (
 def _acquire_training_op_wrappers() -> None:
     """
     Increment the ref-counted training op wrapper lease and activate OmniLoRA's
-    `torch.*` and `torch.nn.functional.*` training wrappers. Snapshots the exact
-    pre-scope callables on the 0 -> 1 transition so `_release_training_op_wrappers()`
-    restores native PyTorch callables with zero residual inference overhead.
+    `torch.*`, `torch.Tensor.*`, and `torch.nn.functional.*` training wrappers.
+    Snapshots the exact pre-scope callables on the 0 -> 1 transition so
+    `_release_training_op_wrappers()` restores native PyTorch callables with zero
+    residual inference overhead.
     """
     global _TRAINING_OP_WRAPPERS_REFCOUNT
     with _TRAINING_OP_WRAPPERS_LOCK:
@@ -1554,17 +1739,30 @@ def _acquire_training_op_wrappers() -> None:
                 else:
                     _TRAINING_OP_SAVED_F[attr_name] = cur
             _TRAINING_OP_SAVED_TORCH.clear()
-            for op_name in _OUT_KWARG_TORCH_OPS:
+            for op_name in _OUT_KWARG_TORCH_OPS + _FP32_AUTOCAST_GUARD_TORCH_OPS:
                 cur = getattr(torch, op_name, None)
                 if cur is None:
                     continue
-                if getattr(cur, "_omni_out_kwarg_safe", False):
+                if getattr(cur, "_omni_out_kwarg_safe", False) or getattr(cur, "_omni_fp32_autocast_safe", False):
                     _TRAINING_OP_SAVED_TORCH[op_name] = getattr(torch, f"_omni_orig_{op_name}", cur)
                 else:
                     _TRAINING_OP_SAVED_TORCH[op_name] = cur
+            _TRAINING_OP_SAVED_TENSOR_OPS.clear()
+            for attr_name in _TRAINING_TENSOR_MM_OPS:
+                was_in_dict = attr_name in torch.Tensor.__dict__
+                cur = torch.Tensor.__dict__[attr_name] if was_in_dict else getattr(torch.Tensor, attr_name, None)
+                if cur is None:
+                    continue
+                if getattr(cur, "_omni_fp32_autocast_safe", False):
+                    orig_saved = _TRAINING_TENSOR_ORIG_OPS.get(attr_name, cur)
+                    _TRAINING_OP_SAVED_TENSOR_OPS[attr_name] = (False, orig_saved)
+                else:
+                    _TRAINING_OP_SAVED_TENSOR_OPS[attr_name] = (was_in_dict, cur)
             _install_out_kwarg_autograd_wrappers()
         elif (
             not getattr(torch.cat, "_omni_out_kwarg_safe", False)
+            or not getattr(torch.einsum, "_omni_fp32_autocast_safe", False)
+            or not getattr(torch.Tensor.__matmul__, "_omni_fp32_autocast_safe", False)
             or not getattr(F.scaled_dot_product_attention, "_omni_chunked_sdpa_safe", False)
         ):
             _install_out_kwarg_autograd_wrappers()
@@ -1574,8 +1772,8 @@ def _acquire_training_op_wrappers() -> None:
 def _release_training_op_wrappers(force: bool = False) -> None:
     """
     Decrement the ref-counted training op wrapper lease and restore every wrapped
-    `torch.*` and `torch.nn.functional.*` callable back to its pre-scope target
-    once the outermost training scope exits (`refcount == 0`).
+    `torch.*`, `torch.Tensor.*`, and `torch.nn.functional.*` callable back to its
+    pre-scope target once the outermost training scope exits (`refcount == 0`).
     """
     global _TRAINING_OP_WRAPPERS_REFCOUNT, _OUT_KWARG_WRAPPERS_INSTALLED
     with _TRAINING_OP_WRAPPERS_LOCK:
@@ -1595,15 +1793,32 @@ def _release_training_op_wrappers(force: bool = False) -> None:
                     setattr(F, attr_name, saved)
                 except Exception:
                     pass
-        for op_name in _OUT_KWARG_TORCH_OPS:
+        for op_name in _OUT_KWARG_TORCH_OPS + _FP32_AUTOCAST_GUARD_TORCH_OPS:
             saved = _TRAINING_OP_SAVED_TORCH.get(op_name, getattr(torch, f"_omni_orig_{op_name}", None))
             if saved is not None:
                 try:
                     setattr(torch, op_name, saved)
                 except Exception:
                     pass
+        for attr_name in _TRAINING_TENSOR_MM_OPS:
+            saved_entry = _TRAINING_OP_SAVED_TENSOR_OPS.get(attr_name)
+            if saved_entry is not None:
+                was_in_dict, saved_fn = saved_entry
+                try:
+                    if was_in_dict:
+                        setattr(torch.Tensor, attr_name, saved_fn)
+                    elif attr_name in torch.Tensor.__dict__:
+                        delattr(torch.Tensor, attr_name)
+                except Exception:
+                    pass
+            elif attr_name in torch.Tensor.__dict__ and getattr(torch.Tensor.__dict__[attr_name], "_omni_fp32_autocast_safe", False):
+                try:
+                    delattr(torch.Tensor, attr_name)
+                except Exception:
+                    pass
         _TRAINING_OP_SAVED_F.clear()
         _TRAINING_OP_SAVED_TORCH.clear()
+        _TRAINING_OP_SAVED_TENSOR_OPS.clear()
         _OUT_KWARG_WRAPPERS_INSTALLED = False
 
 
@@ -2404,6 +2619,7 @@ class LoRATrainingPipeline:
                 pass
         return scheduler, sched_name, effective_warmup
 
+    @_with_scoped_comfy_in_training
     def setup(
         self,
         external_backbone: Optional[nn.Module] = None,
@@ -2411,41 +2627,27 @@ class LoRATrainingPipeline:
     ) -> Dict[str, Any]:
         """Attach ComfyUI backbone, inject LoRA adapters, optionally load starting LoRA weights, initialize optimizer, and configure optional FP32GradScaler."""
         torch.set_default_dtype(torch.float32)
-        try:
-            import comfy.model_management as mm  # type: ignore
-
-            mm.in_training = True
-        except Exception:
-            pass
         self.backend.configure_environment()
         if self._op_wrappers_finalizer is None or not self._op_wrappers_finalizer.alive:
             _acquire_training_op_wrappers()
             self._op_wrappers_finalizer = weakref.finalize(self, _release_training_op_wrappers)
-        self.backend.manual_seed_all(self.config.seed)
+        try:
+            self.backend.manual_seed_all(self.config.seed)
 
-        device = self.backend.get_device()
-        dtype = self.backend.torch_dtype
-        lora_torch_dtype = self._resolve_lora_torch_dtype()
+            device = self.backend.get_device()
+            dtype = self.backend.torch_dtype
+            lora_torch_dtype = self._resolve_lora_torch_dtype()
 
-        if external_backbone is not None:
-            self.backend.validate_quantized_model_compatibility(external_backbone)
-            backbone = sanitize_module_no_fp64(external_backbone)
-        else:
-            backbone = self.model_adapter.build_backbone(dtype=dtype, device=torch.device("cpu"))
-            self.backend.validate_quantized_model_compatibility(backbone)
+            if external_backbone is not None:
+                self.backend.validate_quantized_model_compatibility(external_backbone)
+                backbone = sanitize_module_no_fp64(external_backbone)
+            else:
+                backbone = self.model_adapter.build_backbone(dtype=dtype, device=torch.device("cpu"))
+                self.backend.validate_quantized_model_compatibility(backbone)
 
-        # Assign `self.backbone` BEFORE `LoRAInjector.inject()` so that if any subsequent step in
-        # `setup()` fails or is interrupted, caller `finally:` blocks (`LoRAInjector.uninject(pipeline.backbone)`)
-        # always restore the live ComfyUI model cleanly.
-        self.backbone = backbone
-        self.injected_modules = LoRAInjector.inject(
-            model=backbone,
-            config=self.config.lora,
-            lora_dtype=lora_torch_dtype,
-            device=device,
-        )
-        if not self.injected_modules and external_backbone is not None:
-            backbone = self.model_adapter.build_backbone(dtype=dtype, device=torch.device("cpu"))
+            # Assign `self.backbone` BEFORE `LoRAInjector.inject()` so that if any subsequent step in
+            # `setup()` fails or is interrupted, caller `finally:` blocks (`LoRAInjector.uninject(pipeline.backbone)`)
+            # always restore the live ComfyUI model cleanly.
             self.backbone = backbone
             self.injected_modules = LoRAInjector.inject(
                 model=backbone,
@@ -2453,117 +2655,130 @@ class LoRATrainingPipeline:
                 lora_dtype=lora_torch_dtype,
                 device=device,
             )
+            if not self.injected_modules and external_backbone is not None:
+                raise RuntimeError(
+                    f"[OmniLoRA] No LoRA target modules matched on external backbone "
+                    f"'{backbone.__class__.__name__}' (requested targets: {list(self.config.lora.target_modules)}). "
+                    "Refusing to fall back to a synthetic backbone; verify `target_modules` or `target_module_filter`."
+                )
 
-        resumed_lora_layers = 0
-        if initial_lora_state:
-            load_stats = LoRAInjector.load_lora_state_dict(
+            resumed_lora_layers = 0
+            if initial_lora_state:
+                load_stats = LoRAInjector.load_lora_state_dict(
+                    backbone,
+                    initial_lora_state,
+                    comfy_model=getattr(self.model_adapter, "comfy_model", None),
+                )
+                resumed_lora_layers = int(load_stats.get("loaded_layers", 0))
+
+            # Release any cached allocator blocks from unloaded text encoders / VAE BEFORE
+            # querying free VRAM in `enforce_vram_budget` so the full GPU capacity is available.
+            try:
+                self.backend.synchronize()
+                self.backend.empty_cache()
+            except Exception:
+                pass
+
+            # Enforce deterministic VRAM ledger budget: keeps LoRA adapters + norms on GPU,
+            # places frozen base weights on GPU up to `max_resident_model_mb`, and leaves overflow
+            # frozen base weights on CPU to stream per-layer via `_StreamedLinearFn`.
+            vram_budget = self.backend.enforce_vram_budget(
                 backbone,
-                initial_lora_state,
-                comfy_model=getattr(self.model_adapter, "comfy_model", None),
+                vram_mode=self.config.vram_mode,
+                resolution=self.config.resolution,
+                batch_size=self.config.batch_size,
+                reserve_vram_gb=self.config.reserve_vram_gb,
+                optimizer_type=self.config.optimizer_type,
+                gradient_checkpointing=self.config.gradient_checkpointing,
+                has_control_latents=bool(getattr(self.config, "has_control_latents", False)),
             )
-            resumed_lora_layers = int(load_stats.get("loaded_layers", 0))
-
-        # Release any cached allocator blocks from unloaded text encoders / VAE BEFORE
-        # querying free VRAM in `enforce_vram_budget` so the full GPU capacity is available.
-        try:
-            self.backend.synchronize()
-            self.backend.empty_cache()
-        except Exception:
-            pass
-
-        # Enforce deterministic VRAM ledger budget: keeps LoRA adapters + norms on GPU,
-        # places frozen base weights on GPU up to `max_resident_model_mb`, and leaves overflow
-        # frozen base weights on CPU to stream per-layer via `_StreamedLinearFn`.
-        vram_budget = self.backend.enforce_vram_budget(
-            backbone,
-            vram_mode=self.config.vram_mode,
-            resolution=self.config.resolution,
-            batch_size=self.config.batch_size,
-            reserve_vram_gb=self.config.reserve_vram_gb,
-            optimizer_type=self.config.optimizer_type,
-            gradient_checkpointing=self.config.gradient_checkpointing,
-            has_control_latents=bool(getattr(self.config, "has_control_latents", False)),
-        )
-        self.backbone = self.backend.optimize_module(
-            backbone,
-            mode=self.config.compile_mode,
-            move_to_device=False,
-        )
-        # Keep the frozen base backbone in `.eval()` mode during LoRA fine-tuning so base-model
-        # dropout, BatchNorm running-stat updates, and ComfyUI inference-only `.training` paths
-        # (e.g. PixArt `CaptionEmbedder.token_drop`, which hardcodes `.cuda()` and asserts a fixed
-        # `y_embedding` sequence length) never fire. Enable `.train()` exclusively on injected LoRA
-        # adapter modules so `lora_dropout` remains active during training.
-        self.backbone.eval()
-        for mod in self.backbone.modules():
-            if isinstance(mod, LoRALinear) or hasattr(mod, "lora_dropout"):
-                mod.train()
-        self._patch_inplace_model_helpers(self.backbone)
-
-        total_params = sum(p.numel() for p in self.backbone.parameters())
-        offloaded_mb = float(vram_budget.get("offloaded_model_mb", 0.0))
-        resident_mb = float(vram_budget.get("resident_model_mb", 0.0))
-        usable_mb = float(vram_budget.get("usable_vram_mb", 0.0))
-        if not self.config.gradient_checkpointing and (
-            offloaded_mb > 0.0
-            or total_params >= 50_000_000
-            or (usable_mb > 0.0 and resident_mb > usable_mb * 0.40)
-        ):
-            self.config.gradient_checkpointing = True
-            logging.info(
-                "[OmniLoRA] Auto-enabled gradient_checkpointing=True to keep large model activations within VRAM."
+            self.backbone = self.backend.optimize_module(
+                backbone,
+                mode=self.config.compile_mode,
+                move_to_device=False,
             )
+            # Keep the frozen base backbone in `.eval()` mode during LoRA fine-tuning so base-model
+            # dropout, BatchNorm running-stat updates, and ComfyUI inference-only `.training` paths
+            # (e.g. PixArt `CaptionEmbedder.token_drop`, which hardcodes `.cuda()` and asserts a fixed
+            # `y_embedding` sequence length) never fire. Enable `.train()` exclusively on injected LoRA
+            # adapter modules so `lora_dropout` remains active during training.
+            self.backbone.eval()
+            for mod in self.backbone.modules():
+                if isinstance(mod, LoRALinear):
+                    mod.train()
+                    mod.base_layer.eval()
+                elif hasattr(mod, "lora_dropout"):
+                    mod.train()
+            self._patch_inplace_model_helpers(self.backbone)
 
-        if self.backend.backend_id != "cpu" and (
-            bool(vram_budget.get("offload_ckpt_inputs", 0.0))
-            or offloaded_mb > 0.0
-            or (usable_mb > 0.0 and (usable_mb - resident_mb) < 4200.0)
-        ):
-            setattr(self.backbone, "_omni_offload_ckpt_inputs", True)
+            total_params = sum(p.numel() for p in self.backbone.parameters())
+            offloaded_mb = float(vram_budget.get("offloaded_model_mb", 0.0))
+            resident_mb = float(vram_budget.get("resident_model_mb", 0.0))
+            usable_mb = float(vram_budget.get("usable_vram_mb", 0.0))
+            if not self.config.gradient_checkpointing and (
+                offloaded_mb > 0.0
+                or total_params >= 50_000_000
+                or (usable_mb > 0.0 and resident_mb > usable_mb * 0.40)
+            ):
+                self.config.gradient_checkpointing = True
+                logging.info(
+                    "[OmniLoRA] Auto-enabled gradient_checkpointing=True to keep large model activations within VRAM."
+                )
 
-        checkpointed_blocks = 0
-        if self.config.gradient_checkpointing:
-            checkpointed_blocks = self._enable_gradient_checkpointing(self.backbone)
+            if self.backend.backend_id != "cpu" and (
+                bool(vram_budget.get("offload_ckpt_inputs", 0.0))
+                or offloaded_mb > 0.0
+                or (usable_mb > 0.0 and (usable_mb - resident_mb) < 4200.0)
+            ):
+                setattr(self.backbone, "_omni_offload_ckpt_inputs", True)
 
-        trainable_params = LoRAInjector.get_trainable_parameters(self.backbone)
-        if not trainable_params:
-            raise RuntimeError("No trainable LoRA parameters were injected. Check `lora.target_modules`.")
-        self._trainable_params = trainable_params
+            checkpointed_blocks = 0
+            if self.config.gradient_checkpointing:
+                checkpointed_blocks = self._enable_gradient_checkpointing(self.backbone)
 
-        self.optimizer = self._build_fp32_safe_optimizer(trainable_params)
-        self.lr_scheduler, resolved_sched_name, effective_warmup = self._build_lr_scheduler(self.optimizer)
+            trainable_params = LoRAInjector.get_trainable_parameters(self.backbone)
+            if not trainable_params:
+                raise RuntimeError("No trainable LoRA parameters were injected. Check `lora.target_modules`.")
+            self._trainable_params = trainable_params
 
-        # Activate pure-FP32 GradScaler when either compute dtype or LoRA parameter dtype is FP16
-        use_scaler = (dtype == torch.float16) or (lora_torch_dtype == torch.float16)
-        self.grad_scaler = self.backend.create_grad_scaler(enabled=use_scaler)
+            self.optimizer = self._build_fp32_safe_optimizer(trainable_params)
+            self.lr_scheduler, resolved_sched_name, effective_warmup = self._build_lr_scheduler(self.optimizer)
 
-        trainable_count = sum(p.numel() for p in trainable_params)
-        target_summary = LoRAInjector.summarize_targets(self.backbone, self.injected_modules)
+            # Activate pure-FP32 GradScaler when either compute dtype or LoRA parameter dtype is FP16
+            use_scaler = (dtype == torch.float16) or (lora_torch_dtype == torch.float16)
+            self.grad_scaler = self.backend.create_grad_scaler(enabled=use_scaler)
 
-        return {
-            "backend": self.backend.backend_id,
-            "device": str(device),
-            "dtype": str(dtype),
-            "lora_dtype": str(lora_torch_dtype),
-            "optimizer": (self.config.optimizer_type or "radamw").lower(),
-            "lr_scheduler": resolved_sched_name,
-            "warmup_steps": effective_warmup,
-            "min_lr_ratio": float(getattr(self.config, "min_lr_ratio", 0.1)),
-            "lora_plus_lr_ratio": float(getattr(self.config, "lora_plus_lr_ratio", 2.0)),
-            "weight_decay": float(getattr(self.config, "weight_decay", 1e-2)),
-            "grad_scaler_enabled": self.grad_scaler is not None,
-            "gradient_checkpointing": bool(self.config.gradient_checkpointing),
-            "checkpointed_blocks": checkpointed_blocks,
-            "fp64_free_verified": True,
-            "injected_layer_count": len(self.injected_modules),
-            "target_summary": target_summary,
-            "resumed_lora_layers": resumed_lora_layers,
-            "total_parameters": total_params,
-            "trainable_parameters": trainable_count,
-            "trainable_ratio_pct": round((trainable_count / max(1, total_params)) * 100.0, 4),
-            "vram_budget": vram_budget,
-        }
+            trainable_count = sum(p.numel() for p in trainable_params)
+            target_summary = LoRAInjector.summarize_targets(self.backbone, self.injected_modules)
 
+            return {
+                "backend": self.backend.backend_id,
+                "device": str(device),
+                "dtype": str(dtype),
+                "lora_dtype": str(lora_torch_dtype),
+                "optimizer": (self.config.optimizer_type or "radamw").lower(),
+                "lr_scheduler": resolved_sched_name,
+                "warmup_steps": effective_warmup,
+                "min_lr_ratio": float(getattr(self.config, "min_lr_ratio", 0.1)),
+                "lora_plus_lr_ratio": float(getattr(self.config, "lora_plus_lr_ratio", 2.0)),
+                "weight_decay": float(getattr(self.config, "weight_decay", 1e-2)),
+                "grad_scaler_enabled": self.grad_scaler is not None,
+                "gradient_checkpointing": bool(self.config.gradient_checkpointing),
+                "checkpointed_blocks": checkpointed_blocks,
+                "fp64_free_verified": True,
+                "injected_layer_count": len(self.injected_modules),
+                "target_summary": target_summary,
+                "resumed_lora_layers": resumed_lora_layers,
+                "total_parameters": total_params,
+                "trainable_parameters": trainable_count,
+                "trainable_ratio_pct": round((trainable_count / max(1, total_params)) * 100.0, 4),
+                "vram_budget": vram_budget,
+            }
+        except BaseException:
+            self.cleanup()
+            raise
+
+    @_with_scoped_comfy_in_training
     def train_step(
         self,
         step_idx: int,
@@ -2573,13 +2788,6 @@ class LoRATrainingPipeline:
         """Run a single gradient-accumulated training step with `torch.amp.autocast` and synchronized step timing."""
         if self.backbone is None or self.optimizer is None or self.lr_scheduler is None:
             raise RuntimeError("Pipeline is not initialized. Call `pipeline.setup()` first.")
-
-        try:
-            import comfy.model_management as mm  # type: ignore
-
-            mm.in_training = True
-        except Exception:
-            pass
 
         device = self.backend.get_device()
         dtype = self.backend.torch_dtype
@@ -2988,6 +3196,20 @@ class LoRATrainingPipeline:
                     wrapped_count += 1
         return wrapped_count
 
+    @classmethod
+    def _unpatch_inplace_model_helpers(cls, backbone: Optional[nn.Module]) -> None:
+        """Restore any module-level `__globals__` helpers wrapped by `_patch_inplace_model_helpers`."""
+        if backbone is None:
+            return
+        patched_records = getattr(backbone, "_omni_patched_globals", None)
+        if isinstance(patched_records, list):
+            for g, fn_name, orig_fn in reversed(patched_records):
+                if isinstance(g, dict) and fn_name in g:
+                    g[fn_name] = orig_fn
+            patched_records.clear()
+        if hasattr(backbone, "_omni_patched_globals"):
+            delattr(backbone, "_omni_patched_globals")
+
     def disable_gradient_checkpointing(self) -> None:
         """Restore original block forward methods and module helpers so ComfyUI inference is unencumbered."""
         if self.backbone is None:
@@ -2999,14 +3221,7 @@ class LoRATrainingPipeline:
             delattr(self.backbone, "_omni_ckpt_state")
         if hasattr(self.backbone, "_omni_offload_ckpt_inputs"):
             delattr(self.backbone, "_omni_offload_ckpt_inputs")
-        patched_records = getattr(self.backbone, "_omni_patched_globals", None)
-        if isinstance(patched_records, list):
-            for g, fn_name, orig_fn in reversed(patched_records):
-                if isinstance(g, dict) and fn_name in g:
-                    g[fn_name] = orig_fn
-            patched_records.clear()
-        if hasattr(self.backbone, "_omni_patched_globals"):
-            delattr(self.backbone, "_omni_patched_globals")
+        self._unpatch_inplace_model_helpers(self.backbone)
         for mod in self.backbone.modules():
             if getattr(mod, "_gradient_checkpointing_enabled", False):
                 if hasattr(mod, "_orig_forward"):
@@ -3016,10 +3231,11 @@ class LoRATrainingPipeline:
 
     def cleanup(self) -> None:
         """
-        Release scoped PyTorch training op wrappers acquired by `setup()` so post-training
-        ComfyUI inference and `torch.compile` run with native unpatched `torch.*` / `F.*` ops.
+        Release scoped PyTorch training op wrappers and patched module helpers acquired by `setup()`
+        so post-training ComfyUI inference and `torch.compile` run with native unpatched callables.
         Safe to call multiple times or after a failed/interrupted `setup()`.
         """
+        self._unpatch_inplace_model_helpers(self.backbone)
         fin = getattr(self, "_op_wrappers_finalizer", None)
         if fin is not None:
             self._op_wrappers_finalizer = None

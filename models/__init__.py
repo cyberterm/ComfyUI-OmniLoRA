@@ -24,6 +24,7 @@ from .adapters import (
     normalize_legacy_lora_key,
     resolve_comfy_native_architecture,
     resolve_model_adapter,
+    uninstall_comfy_runtime_hooks,
     unwrap_comfy_diffusion_model,
 )
 from .base import BaseModelAdapter, ModelSpec
@@ -49,6 +50,7 @@ __all__ = [
     "discover_universal_target_modules",
     "ensure_comfy_importable",
     "install_comfy_runtime_hooks",
+    "uninstall_comfy_runtime_hooks",
     "normalize_legacy_lora_key",
     "resolve_comfy_native_architecture",
     "resolve_model_adapter",

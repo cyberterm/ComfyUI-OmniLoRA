@@ -26,6 +26,63 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _has_any_torch_accelerator() -> bool:
+    """Return True if any PyTorch hardware accelerator is available in this runtime."""
+    try:
+        if torch.cuda.is_available():
+            return True
+    except Exception:
+        pass
+    for attr in ("xpu", "npu", "hpu"):
+        mod = getattr(torch, attr, None)
+        if mod is not None:
+            try:
+                is_avail = getattr(mod, "is_available", None)
+                if callable(is_avail) and is_avail():
+                    return True
+            except Exception:
+                pass
+    try:
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None:
+            is_avail = getattr(mps, "is_available", None)
+            if callable(is_avail) and is_avail():
+                return True
+    except Exception:
+        pass
+    try:
+        import torch_directml  # type: ignore
+
+        is_avail = getattr(torch_directml, "is_available", None)
+        if callable(is_avail) and is_avail():
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _configure_comfy_cpu_fallback_if_needed() -> None:
+    """
+    On CPU-only PyTorch environments (such as headless GitHub Actions CI runners where
+    `--cpu` is not in `sys.argv`), set `comfy.cli_args.args.cpu = True` before
+    `comfy.model_management` is imported so `comfy.model_management.get_torch_device()`
+    uses `torch.device("cpu")` instead of raising `AssertionError: Torch not compiled
+    with CUDA enabled`.
+    """
+    if "comfy.model_management" in sys.modules:
+        return
+    if _has_any_torch_accelerator():
+        return
+    try:
+        import comfy.cli_args  # type: ignore
+
+        cli_args = getattr(comfy.cli_args, "args", None)
+        if cli_args is not None and hasattr(cli_args, "cpu") and not getattr(cli_args, "cpu", False):
+            cli_args.cpu = True
+    except Exception:
+        pass
+
+
 def ensure_comfy_importable() -> bool:
     """
     Ensure ComfyUI's `comfy` package (`comfy.model_base`, `comfy.supported_models`,
@@ -34,9 +91,11 @@ def ensure_comfy_importable() -> bool:
     standalone alongside a sibling `ComfyUI/` checkout.
     """
     if "comfy" in sys.modules:
+        _configure_comfy_cpu_fallback_if_needed()
         return True
     try:
         import comfy  # type: ignore # noqa: F401
+        _configure_comfy_cpu_fallback_if_needed()
         return True
     except Exception:
         pass
@@ -53,6 +112,7 @@ def ensure_comfy_importable() -> bool:
                     sys.path.insert(0, cand_str)
                 try:
                     import comfy  # type: ignore # noqa: F401
+                    _configure_comfy_cpu_fallback_if_needed()
                     return True
                 except Exception:
                     return False
@@ -3430,6 +3490,7 @@ def install_comfy_runtime_hooks() -> None:
                         return _omni_pixel_unshuffle_5d(input, downscale_factor)
                     raise
 
+            setattr(_omni_pixel_unshuffle, "_omni_dml_safe", True)
             F.pixel_unshuffle = _omni_pixel_unshuffle
 
         if hasattr(F, "pixel_shuffle") and not getattr(F.pixel_shuffle, "_omni_dml_safe", False):
@@ -3466,6 +3527,7 @@ def install_comfy_runtime_hooks() -> None:
                         return _omni_pixel_shuffle_5d(input, upscale_factor)
                     raise
 
+            setattr(_omni_pixel_shuffle, "_omni_dml_safe", True)
             F.pixel_shuffle = _omni_pixel_shuffle
 
         if hasattr(F, "conv3d") and not getattr(F.conv3d, "_omni_dml_safe", False):
@@ -3555,9 +3617,10 @@ def install_comfy_runtime_hooks() -> None:
                         return torch.cat(frames, dim=2)
                 return orig_conv3d(input, weight, bias, stride, padding, dilation, groups)
 
+            setattr(_omni_conv3d, "_omni_dml_safe", True)
             F.conv3d = _omni_conv3d
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug(f"[OmniLoRA] Could not install torch/F runtime hooks: {exc}")
 
     # 2. Install universal `model_lora_keys_unet` hook (always refreshes to latest implementation)
     try:
@@ -3651,11 +3714,17 @@ def install_comfy_runtime_hooks() -> None:
                 import comfy.sd  # type: ignore
 
                 if hasattr(comfy.sd, "model_lora_keys_unet"):
+                    _orig_sd_unet_keys = getattr(
+                        comfy.sd,
+                        "_omni_orig_model_lora_keys_unet",
+                        comfy.sd.model_lora_keys_unet,
+                    )
+                    setattr(comfy.sd, "_omni_orig_model_lora_keys_unet", _orig_sd_unet_keys)
                     comfy.sd.model_lora_keys_unet = _omni_model_lora_keys_unet
-            except Exception:
-                pass
-    except Exception:
-        pass
+            except Exception as exc:
+                logging.debug(f"[OmniLoRA] Could not hook comfy.sd.model_lora_keys_unet: {exc}")
+    except Exception as exc:
+        logging.debug(f"[OmniLoRA] Could not hook comfy.lora.model_lora_keys_unet: {exc}")
 
     # 3. Guard `comfy_aimdo.malloc_graph` and `comfy.model_prefetch` so ComfyUI's inference-only
     # C memory graph compiler (`control.lib.malloc_graph_pop`) never runs or raises
@@ -3842,8 +3911,8 @@ def install_comfy_runtime_hooks() -> None:
 
             setattr(base_cls, "extra_conds", _omni_extra_conds)
             setattr(base_cls, "_omni_extra_conds_patched", True)
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug(f"[OmniLoRA] Could not hook BaseModel.extra_conds: {exc}")
 
     # 5. Normalize Qwen3.5 / MOSS-Image text encoder state_dicts in `comfy.sd.detect_te_model` and
     # `comfy.sd.load_text_encoder_state_dicts` when checkpoints use `model.layers.0.linear_attn.A_log`,
@@ -3909,8 +3978,8 @@ def install_comfy_runtime_hooks() -> None:
 
             setattr(_omni_load_text_encoder_state_dicts, "_omni_patched", True)
             _csd.load_text_encoder_state_dicts = _omni_load_text_encoder_state_dicts
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug(f"[OmniLoRA] Could not hook comfy.sd text encoder detection: {exc}")
 
     # 6. Guard `comfy.weight_adapter` LoRAAdapter.calculate_weight so legacy 2D `[rank, in_c]`
     # conv LoRA weights loaded onto 3D/4D/5D convolution layers (`[out_c, in_c, kH, kW]`) are
@@ -3982,8 +4051,8 @@ def install_comfy_runtime_hooks() -> None:
 
                 setattr(lora_ad_cls, "calculate_weight", _make_safe_lora_calc(_orig_ad_calc))
                 setattr(lora_ad_cls, "_omni_calc_weight_patched", True)
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug(f"[OmniLoRA] Could not hook comfy.weight_adapter.LoRAAdapter: {exc}")
 
     # 7. Guard inference-only ComfyUI attention backends (`attention_comfy_kitchen_int8`,
     # `attention_comfy_kitchen_sol`, `attention_sage`, `attention3_sage`), pre-loaded `ComfyAttention`
@@ -4209,18 +4278,15 @@ def install_comfy_runtime_hooks() -> None:
                 setattr(ck_obj, "_omni_orig_int8_attention", _orig_ck_int8)
 
                 def _make_ck_int8_wrapper(orig_f: Any) -> Any:
-                    def _safe_ck_int8(
-                        q: torch.Tensor,
-                        k: torch.Tensor,
-                        v: torch.Tensor,
-                        scale: Optional[float] = None,
-                        attn_mask: Optional[torch.Tensor] = None,
-                        *args: Any,
-                        **kwargs: Any,
-                    ) -> torch.Tensor:
-                        if _is_omni_training_active():
-                            return _sdpa_4d_fallback(q, k, v, scale=scale, attn_mask=attn_mask)
-                        return orig_f(q, k, v, scale=scale, attn_mask=attn_mask, *args, **kwargs)
+                    def _safe_ck_int8(*args: Any, **kwargs: Any) -> torch.Tensor:
+                        if not _is_omni_training_active():
+                            return orig_f(*args, **kwargs)
+                        q = args[0] if len(args) > 0 else kwargs["q"]
+                        k = args[1] if len(args) > 1 else kwargs["k"]
+                        v = args[2] if len(args) > 2 else kwargs["v"]
+                        scale = args[3] if len(args) > 3 else kwargs.get("scale")
+                        attn_mask = args[4] if len(args) > 4 else kwargs.get("attn_mask")
+                        return _sdpa_4d_fallback(q, k, v, scale=scale, attn_mask=attn_mask)
 
                     setattr(_safe_ck_int8, "_omni_train_safe", True)
                     return _safe_ck_int8
@@ -4240,24 +4306,22 @@ def install_comfy_runtime_hooks() -> None:
                 setattr(ck_obj, "_omni_orig_int8_attention_from_prequantized", _orig_from_preq)
 
                 def _make_preq_pair(orig_p: Any, orig_fp: Any) -> Tuple[Any, Any]:
-                    def _safe_preq(
-                        q: torch.Tensor,
-                        k: torch.Tensor,
-                        v: torch.Tensor,
-                        scale: Optional[float] = None,
-                        attn_mask: Optional[torch.Tensor] = None,
-                        *args: Any,
-                        **kwargs: Any,
-                    ) -> Any:
-                        if _is_omni_training_active():
-                            return {"_omni_sdpa_qkv": (q, k, v, scale, attn_mask)}
-                        return orig_p(q, k, v, scale=scale, attn_mask=attn_mask, *args, **kwargs)
+                    def _safe_preq(*args: Any, **kwargs: Any) -> Any:
+                        if not _is_omni_training_active():
+                            return orig_p(*args, **kwargs)
+                        q = args[0] if len(args) > 0 else kwargs["q"]
+                        k = args[1] if len(args) > 1 else kwargs["k"]
+                        v = args[2] if len(args) > 2 else kwargs["v"]
+                        scale = args[3] if len(args) > 3 else kwargs.get("scale")
+                        attn_mask = args[4] if len(args) > 4 else kwargs.get("attn_mask")
+                        return {"_omni_sdpa_qkv": (q, k, v, scale, attn_mask)}
 
-                    def _safe_from_preq(quantized: Any, *args: Any, **kwargs: Any) -> torch.Tensor:
+                    def _safe_from_preq(*args: Any, **kwargs: Any) -> torch.Tensor:
+                        quantized = args[0] if len(args) > 0 else kwargs.get("quantized")
                         if isinstance(quantized, dict) and "_omni_sdpa_qkv" in quantized:
                             q, k, v, scale, attn_mask = quantized["_omni_sdpa_qkv"]
                             return _sdpa_4d_fallback(q, k, v, scale=scale, attn_mask=attn_mask)
-                        return orig_fp(quantized, *args, **kwargs)
+                        return orig_fp(*args, **kwargs)
 
                     setattr(_safe_preq, "_omni_train_safe", True)
                     setattr(_safe_from_preq, "_omni_train_safe", True)
@@ -4272,27 +4336,24 @@ def install_comfy_runtime_hooks() -> None:
                 setattr(ck_obj, "_omni_orig_sol_attn", _orig_sol)
 
                 def _make_sol_wrapper(orig_f: Any) -> Any:
-                    def _safe_sol(
-                        q: torch.Tensor,
-                        k: torch.Tensor,
-                        v: torch.Tensor,
-                        tau: float = 1.0,
-                        scale: Optional[float] = None,
-                        *args: Any,
-                        **kwargs: Any,
-                    ) -> torch.Tensor:
-                        if _is_omni_training_active():
-                            base_scale = float(scale) if scale is not None else float(int(q.shape[-1]) ** -0.5)
-                            eff_scale = base_scale / max(1e-6, float(tau or 1.0))
-                            out_4d = _sdpa_4d_fallback(
-                                q.transpose(1, 2),
-                                k.transpose(1, 2),
-                                v.transpose(1, 2),
-                                scale=eff_scale,
-                                attn_mask=None,
-                            )
-                            return out_4d.transpose(1, 2)
-                        return orig_f(q, k, v, tau=tau, scale=scale, *args, **kwargs)
+                    def _safe_sol(*args: Any, **kwargs: Any) -> torch.Tensor:
+                        if not _is_omni_training_active():
+                            return orig_f(*args, **kwargs)
+                        q = args[0] if len(args) > 0 else kwargs["q"]
+                        k = args[1] if len(args) > 1 else kwargs["k"]
+                        v = args[2] if len(args) > 2 else kwargs["v"]
+                        tau = args[3] if len(args) > 3 else kwargs.get("tau", 1.0)
+                        scale = args[4] if len(args) > 4 else kwargs.get("scale")
+                        base_scale = float(scale) if scale is not None else float(int(q.shape[-1]) ** -0.5)
+                        eff_scale = base_scale / max(1e-6, float(tau or 1.0))
+                        out_4d = _sdpa_4d_fallback(
+                            q.transpose(1, 2),
+                            k.transpose(1, 2),
+                            v.transpose(1, 2),
+                            scale=eff_scale,
+                            attn_mask=None,
+                        )
+                        return out_4d.transpose(1, 2)
 
                     setattr(_safe_sol, "_omni_train_safe", True)
                     return _safe_sol
@@ -4304,20 +4365,17 @@ def install_comfy_runtime_hooks() -> None:
                 setattr(ck_obj, "_omni_orig_rms_rope", _orig_rms_rope)
 
                 def _make_rms_rope_wrapper(orig_f: Any) -> Any:
-                    def _safe_rms_rope(
-                        q: torch.Tensor,
-                        k: torch.Tensor,
-                        pe: torch.Tensor,
-                        q_scale: Optional[torch.Tensor] = None,
-                        k_scale: Optional[torch.Tensor] = None,
-                        *args: Any,
-                        **kwargs: Any,
-                    ) -> Tuple[torch.Tensor, torch.Tensor]:
-                        if _is_omni_training_active():
-                            pos_eps = args[0] if len(args) > 0 else 1e-6
-                            eff_eps = float(kwargs.get("epsilon", kwargs.get("eps", pos_eps)))
-                            return _torch_rms_rope_interleaved(q, k, pe, q_scale, k_scale, eps=eff_eps)
-                        return orig_f(q, k, pe, q_scale, k_scale, *args, **kwargs)
+                    def _safe_rms_rope(*args: Any, **kwargs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+                        if not _is_omni_training_active():
+                            return orig_f(*args, **kwargs)
+                        q = args[0] if len(args) > 0 else kwargs["q"]
+                        k = args[1] if len(args) > 1 else kwargs["k"]
+                        pe = args[2] if len(args) > 2 else kwargs["pe"]
+                        q_scale = args[3] if len(args) > 3 else kwargs.get("q_scale")
+                        k_scale = args[4] if len(args) > 4 else kwargs.get("k_scale")
+                        pos_eps = args[5] if len(args) > 5 else 1e-6
+                        eff_eps = float(kwargs.get("epsilon", kwargs.get("eps", pos_eps)))
+                        return _torch_rms_rope_interleaved(q, k, pe, q_scale, k_scale, eps=eff_eps)
 
                     setattr(_safe_rms_rope, "_omni_train_safe", True)
                     return _safe_rms_rope
@@ -4329,18 +4387,15 @@ def install_comfy_runtime_hooks() -> None:
                 setattr(ck_obj, "_omni_orig_rms_rope1", _orig_rms_rope1)
 
                 def _make_rms_rope1_wrapper(orig_f: Any) -> Any:
-                    def _safe_rms_rope1(
-                        x: torch.Tensor,
-                        pe: torch.Tensor,
-                        scale: Optional[torch.Tensor] = None,
-                        *args: Any,
-                        **kwargs: Any,
-                    ) -> torch.Tensor:
-                        if _is_omni_training_active():
-                            pos_eps = args[0] if len(args) > 0 else 1e-6
-                            eff_eps = float(kwargs.get("epsilon", kwargs.get("eps", pos_eps)))
-                            return _torch_apply_rope_interleaved1(_rms_norm_t(x, scale, eps=eff_eps), pe)
-                        return orig_f(x, pe, scale, *args, **kwargs)
+                    def _safe_rms_rope1(*args: Any, **kwargs: Any) -> torch.Tensor:
+                        if not _is_omni_training_active():
+                            return orig_f(*args, **kwargs)
+                        x = args[0] if len(args) > 0 else kwargs["x"]
+                        pe = args[1] if len(args) > 1 else kwargs["pe"]
+                        scale = args[2] if len(args) > 2 else kwargs.get("scale")
+                        pos_eps = args[3] if len(args) > 3 else 1e-6
+                        eff_eps = float(kwargs.get("epsilon", kwargs.get("eps", pos_eps)))
+                        return _torch_apply_rope_interleaved1(_rms_norm_t(x, scale, eps=eff_eps), pe)
 
                     setattr(_safe_rms_rope1, "_omni_train_safe", True)
                     return _safe_rms_rope1
@@ -4354,36 +4409,33 @@ def install_comfy_runtime_hooks() -> None:
                     is_inplace_split = split_fn_name.endswith("_")
 
                     def _make_rms_rope_split_wrapper(orig_f: Any, inplace_flag: bool) -> Any:
-                        def _safe_rms_rope_split(
-                            q: torch.Tensor,
-                            k: torch.Tensor,
-                            pe: torch.Tensor,
-                            q_scale: Optional[torch.Tensor] = None,
-                            k_scale: Optional[torch.Tensor] = None,
-                            *args: Any,
-                            **kwargs: Any,
-                        ) -> Tuple[torch.Tensor, torch.Tensor]:
-                            if _is_omni_training_active():
-                                pos_eps = args[0] if len(args) > 0 else 1e-6
-                                eff_eps = float(kwargs.get("epsilon", kwargs.get("eps", pos_eps)))
-                                pos_rot = args[1] if len(args) > 1 else None
-                                rot_dim = kwargs.get("rot_dim", pos_rot)
-                                rq, rk = _torch_rms_rope_split_half(
-                                    q, k, pe, q_scale, k_scale, eps=eff_eps, rot_dim=rot_dim
-                                )
-                                if (
-                                    inplace_flag
-                                    and not (q.is_leaf and q.requires_grad)
-                                    and not (k.is_leaf and k.requires_grad)
-                                ):
-                                    try:
-                                        q.copy_(rq)
-                                        k.copy_(rk)
-                                        return q, k
-                                    except RuntimeError:
-                                        return rq, rk
-                                return rq, rk
-                            return orig_f(q, k, pe, q_scale, k_scale, *args, **kwargs)
+                        def _safe_rms_rope_split(*args: Any, **kwargs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+                            if not _is_omni_training_active():
+                                return orig_f(*args, **kwargs)
+                            q = args[0] if len(args) > 0 else kwargs["q"]
+                            k = args[1] if len(args) > 1 else kwargs["k"]
+                            pe = args[2] if len(args) > 2 else kwargs["pe"]
+                            q_scale = args[3] if len(args) > 3 else kwargs.get("q_scale")
+                            k_scale = args[4] if len(args) > 4 else kwargs.get("k_scale")
+                            pos_eps = args[5] if len(args) > 5 else 1e-6
+                            eff_eps = float(kwargs.get("epsilon", kwargs.get("eps", pos_eps)))
+                            pos_rot = args[6] if len(args) > 6 else None
+                            rot_dim = kwargs.get("rot_dim", pos_rot)
+                            rq, rk = _torch_rms_rope_split_half(
+                                q, k, pe, q_scale, k_scale, eps=eff_eps, rot_dim=rot_dim
+                            )
+                            if (
+                                inplace_flag
+                                and not (q.is_leaf and q.requires_grad)
+                                and not (k.is_leaf and k.requires_grad)
+                            ):
+                                try:
+                                    q.copy_(rq)
+                                    k.copy_(rk)
+                                    return q, k
+                                except RuntimeError:
+                                    return rq, rk
+                            return rq, rk
 
                         setattr(_safe_rms_rope_split, "_omni_train_safe", True)
                         return _safe_rms_rope_split
@@ -4395,20 +4447,17 @@ def install_comfy_runtime_hooks() -> None:
                 setattr(ck_obj, "_omni_orig_apply_rope_split_half", _orig_apply_split)
 
                 def _make_apply_rope_split_wrapper(orig_f: Any) -> Any:
-                    def _safe_apply_rope_split(
-                        xq: torch.Tensor,
-                        xk: torch.Tensor,
-                        freqs_cis: torch.Tensor,
-                        *args: Any,
-                        **kwargs: Any,
-                    ) -> Tuple[torch.Tensor, torch.Tensor]:
-                        if _is_omni_training_active():
-                            rot_dim = kwargs.get("rot_dim", args[0] if len(args) > 0 else None)
-                            return (
-                                _torch_apply_rope_split_half1(xq, freqs_cis, rot_dim=rot_dim),
-                                _torch_apply_rope_split_half1(xk, freqs_cis, rot_dim=rot_dim),
-                            )
-                        return orig_f(xq, xk, freqs_cis, *args, **kwargs)
+                    def _safe_apply_rope_split(*args: Any, **kwargs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+                        if not _is_omni_training_active():
+                            return orig_f(*args, **kwargs)
+                        xq = args[0] if len(args) > 0 else kwargs["xq"]
+                        xk = args[1] if len(args) > 1 else kwargs["xk"]
+                        freqs_cis = args[2] if len(args) > 2 else kwargs["freqs_cis"]
+                        rot_dim = kwargs.get("rot_dim", args[3] if len(args) > 3 else None)
+                        return (
+                            _torch_apply_rope_split_half1(xq, freqs_cis, rot_dim=rot_dim),
+                            _torch_apply_rope_split_half1(xk, freqs_cis, rot_dim=rot_dim),
+                        )
 
                     setattr(_safe_apply_rope_split, "_omni_train_safe", True)
                     return _safe_apply_rope_split
@@ -4420,19 +4469,16 @@ def install_comfy_runtime_hooks() -> None:
                 setattr(ck_obj, "_omni_orig_apply_rope", _orig_apply_rope)
 
                 def _make_apply_rope_wrapper(orig_f: Any) -> Any:
-                    def _safe_apply_rope(
-                        xq: torch.Tensor,
-                        xk: torch.Tensor,
-                        freqs_cis: torch.Tensor,
-                        *args: Any,
-                        **kwargs: Any,
-                    ) -> Tuple[torch.Tensor, torch.Tensor]:
-                        if _is_omni_training_active():
-                            return (
-                                _torch_apply_rope_interleaved1(xq, freqs_cis),
-                                _torch_apply_rope_interleaved1(xk, freqs_cis),
-                            )
-                        return orig_f(xq, xk, freqs_cis, *args, **kwargs)
+                    def _safe_apply_rope(*args: Any, **kwargs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+                        if not _is_omni_training_active():
+                            return orig_f(*args, **kwargs)
+                        xq = args[0] if len(args) > 0 else kwargs["xq"]
+                        xk = args[1] if len(args) > 1 else kwargs["xk"]
+                        freqs_cis = args[2] if len(args) > 2 else kwargs["freqs_cis"]
+                        return (
+                            _torch_apply_rope_interleaved1(xq, freqs_cis),
+                            _torch_apply_rope_interleaved1(xk, freqs_cis),
+                        )
 
                     setattr(_safe_apply_rope, "_omni_train_safe", True)
                     return _safe_apply_rope
@@ -4444,15 +4490,12 @@ def install_comfy_runtime_hooks() -> None:
                 setattr(ck_obj, "_omni_orig_apply_rope1", _orig_apply_rope1)
 
                 def _make_apply_rope1_wrapper(orig_f: Any) -> Any:
-                    def _safe_apply_rope1(
-                        x: torch.Tensor,
-                        freqs_cis: torch.Tensor,
-                        *args: Any,
-                        **kwargs: Any,
-                    ) -> torch.Tensor:
-                        if _is_omni_training_active():
-                            return _torch_apply_rope_interleaved1(x, freqs_cis)
-                        return orig_f(x, freqs_cis, *args, **kwargs)
+                    def _safe_apply_rope1(*args: Any, **kwargs: Any) -> torch.Tensor:
+                        if not _is_omni_training_active():
+                            return orig_f(*args, **kwargs)
+                        x = args[0] if len(args) > 0 else kwargs["x"]
+                        freqs_cis = args[1] if len(args) > 1 else kwargs["freqs_cis"]
+                        return _torch_apply_rope_interleaved1(x, freqs_cis)
 
                     setattr(_safe_apply_rope1, "_omni_train_safe", True)
                     return _safe_apply_rope1
@@ -4464,18 +4507,16 @@ def install_comfy_runtime_hooks() -> None:
                 setattr(ck_obj, "_omni_orig_adaln", _orig_adaln)
 
                 def _make_adaln_wrapper(orig_f: Any) -> Any:
-                    def _safe_adaln(
-                        x: torch.Tensor,
-                        scale: torch.Tensor,
-                        shift: torch.Tensor,
-                        eps: float = 1e-6,
-                        *args: Any,
-                        **kwargs: Any,
-                    ) -> torch.Tensor:
-                        if _is_omni_training_active():
-                            normed = F.layer_norm(x, (int(x.shape[-1]),), eps=float(eps or 1e-6))
-                            return torch.addcmul(shift, normed, 1.0 + scale)
-                        return orig_f(x, scale, shift, eps, *args, **kwargs)
+                    def _safe_adaln(*args: Any, **kwargs: Any) -> torch.Tensor:
+                        if not _is_omni_training_active():
+                            return orig_f(*args, **kwargs)
+                        x = args[0] if len(args) > 0 else kwargs["x"]
+                        scale = args[1] if len(args) > 1 else kwargs["scale"]
+                        shift = args[2] if len(args) > 2 else kwargs["shift"]
+                        pos_eps = args[3] if len(args) > 3 else 1e-6
+                        eps_val = float(kwargs.get("epsilon", kwargs.get("eps", pos_eps)) or 1e-6)
+                        normed = F.layer_norm(x, (int(x.shape[-1]),), eps=eps_val)
+                        return torch.addcmul(shift, normed, 1.0 + scale)
 
                     setattr(_safe_adaln, "_omni_train_safe", True)
                     return _safe_adaln
@@ -4487,25 +4528,280 @@ def install_comfy_runtime_hooks() -> None:
                 setattr(ck_obj, "_omni_orig_rms_adaln", _orig_rms_adaln)
 
                 def _make_rms_adaln_wrapper(orig_f: Any) -> Any:
-                    def _safe_rms_adaln(
-                        x: torch.Tensor,
-                        scale: torch.Tensor,
-                        shift: torch.Tensor,
-                        eps: float = 1e-6,
-                        *args: Any,
-                        **kwargs: Any,
-                    ) -> torch.Tensor:
-                        if _is_omni_training_active():
-                            normed = _rms_norm_t(x, None, eps=float(eps or 1e-6))
-                            return torch.addcmul(shift, normed, 1.0 + scale)
-                        return orig_f(x, scale, shift, eps, *args, **kwargs)
+                    def _safe_rms_adaln(*args: Any, **kwargs: Any) -> torch.Tensor:
+                        if not _is_omni_training_active():
+                            return orig_f(*args, **kwargs)
+                        x = args[0] if len(args) > 0 else kwargs["x"]
+                        scale = args[1] if len(args) > 1 else kwargs["scale"]
+                        shift = args[2] if len(args) > 2 else kwargs["shift"]
+                        pos_eps = args[3] if len(args) > 3 else 1e-6
+                        eps_val = float(kwargs.get("epsilon", kwargs.get("eps", pos_eps)) or 1e-6)
+                        normed = _rms_norm_t(x, None, eps=eps_val)
+                        return torch.addcmul(shift, normed, 1.0 + scale)
 
                     setattr(_safe_rms_adaln, "_omni_train_safe", True)
                     return _safe_rms_adaln
 
                 setattr(ck_obj, "rms_adaln", _make_rms_adaln_wrapper(_orig_rms_adaln))
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug(f"[OmniLoRA] Could not hook comfy_kitchen kernels: {exc}")
+
+
+def uninstall_comfy_runtime_hooks() -> None:
+    """
+    Revert global runtime monkey-patches installed by `install_comfy_runtime_hooks()`,
+    restoring native `torch.nn.functional`, `torch`, `comfy.*`, and `comfy_kitchen`
+    callables and removing stashed `_omni_orig_*` / marker attributes. Safe to call
+    repeatedly or when only a subset of hooks were installed.
+    """
+    # 1. Restore PyTorch F.* and torch.* wrappers installed by `install_comfy_runtime_hooks()`
+    for target_obj, attr_pairs in (
+        (
+            F,
+            (
+                ("rms_norm", "_omni_orig_rms_norm"),
+                ("pixel_unshuffle", "_omni_orig_pixel_unshuffle"),
+                ("pixel_shuffle", "_omni_orig_pixel_shuffle"),
+                ("conv3d", "_omni_orig_conv3d"),
+            ),
+        ),
+        (
+            torch,
+            (("rms_norm", "_omni_orig_rms_norm"),),
+        ),
+    ):
+        for attr_name, stash_attr in attr_pairs:
+            if hasattr(target_obj, stash_attr):
+                orig_fn = getattr(target_obj, stash_attr)
+                try:
+                    setattr(target_obj, attr_name, orig_fn)
+                except Exception as exc:
+                    logging.debug(f"[OmniLoRA] Could not restore {target_obj}.{attr_name}: {exc}")
+                try:
+                    delattr(target_obj, stash_attr)
+                except Exception:
+                    pass
+
+    # 2. Restore `comfy.lora` and `comfy.sd` LoRA key & text-encoder hooks
+    comfy_lora = sys.modules.get("comfy.lora")
+    if comfy_lora is not None:
+        if hasattr(comfy_lora, "_omni_orig_model_lora_keys_unet"):
+            try:
+                comfy_lora.model_lora_keys_unet = getattr(comfy_lora, "_omni_orig_model_lora_keys_unet")
+            except Exception as exc:
+                logging.debug(f"[OmniLoRA] Could not restore comfy.lora.model_lora_keys_unet: {exc}")
+            for marker in ("_omni_orig_model_lora_keys_unet", "_omni_lora_keys_patched"):
+                if hasattr(comfy_lora, marker):
+                    try:
+                        delattr(comfy_lora, marker)
+                    except Exception:
+                        pass
+
+    comfy_sd = sys.modules.get("comfy.sd")
+    if comfy_sd is not None:
+        for attr_name, stash_attr in (
+            ("model_lora_keys_unet", "_omni_orig_model_lora_keys_unet"),
+            ("detect_te_model", "_omni_orig_detect_te_model"),
+            ("load_text_encoder_state_dicts", "_omni_orig_load_text_encoder_state_dicts"),
+        ):
+            if hasattr(comfy_sd, stash_attr):
+                try:
+                    setattr(comfy_sd, attr_name, getattr(comfy_sd, stash_attr))
+                except Exception as exc:
+                    logging.debug(f"[OmniLoRA] Could not restore comfy.sd.{attr_name}: {exc}")
+                try:
+                    delattr(comfy_sd, stash_attr)
+                except Exception:
+                    pass
+
+    # 3. Restore `comfy_aimdo.malloc_graph` & `comfy.model_prefetch`
+    def _unpatch_malloc_graph_obj(mg_target: Any) -> None:
+        if mg_target is None:
+            return
+        if not isinstance(mg_target, type):
+            _unpatch_malloc_graph_obj(type(mg_target))
+        target_dict = getattr(mg_target, "__dict__", {})
+        if not isinstance(target_dict, dict):
+            return
+        if "_omni_orig_call" in target_dict:
+            try:
+                setattr(mg_target, "_call", target_dict["_omni_orig_call"])
+                delattr(mg_target, "_omni_orig_call")
+            except Exception as exc:
+                logging.debug(f"[OmniLoRA] Could not restore {mg_target}._call: {exc}")
+        for method_name in ("iterate", "push", "pop", "begin", "end", "pause", "resume"):
+            stash_name = f"_omni_orig_{method_name}"
+            if stash_name in target_dict:
+                try:
+                    setattr(mg_target, method_name, target_dict[stash_name])
+                    delattr(mg_target, stash_name)
+                except Exception as exc:
+                    logging.debug(f"[OmniLoRA] Could not restore {mg_target}.{method_name}: {exc}")
+        if "_omni_aimdo_patched" in target_dict:
+            try:
+                delattr(mg_target, "_omni_aimdo_patched")
+            except Exception:
+                pass
+
+    aimdo_mg = sys.modules.get("comfy_aimdo.malloc_graph")
+    if aimdo_mg is not None:
+        _unpatch_malloc_graph_obj(getattr(aimdo_mg, "MallocGraph", None))
+        _unpatch_malloc_graph_obj(getattr(aimdo_mg, "malloc_graph", None))
+
+    mp_mod = sys.modules.get("comfy.model_prefetch")
+    if mp_mod is not None:
+        _unpatch_malloc_graph_obj(getattr(mp_mod, "malloc_graph", None))
+        for fn_name in ("malloc_graph_enabled", "malloc_graph_begin", "malloc_graph_end", "prefetch_queue_pop"):
+            stash_attr = f"_omni_orig_{fn_name}"
+            if hasattr(mp_mod, stash_attr):
+                try:
+                    setattr(mp_mod, fn_name, getattr(mp_mod, stash_attr))
+                    delattr(mp_mod, stash_attr)
+                except Exception as exc:
+                    logging.debug(f"[OmniLoRA] Could not restore comfy.model_prefetch.{fn_name}: {exc}")
+
+    # 4. Restore `comfy.model_base.BaseModel.extra_conds`
+    mb_mod = sys.modules.get("comfy.model_base")
+    if mb_mod is not None:
+        base_cls = getattr(mb_mod, "BaseModel", None)
+        if base_cls is not None and hasattr(base_cls, "_omni_orig_extra_conds"):
+            try:
+                setattr(base_cls, "extra_conds", getattr(base_cls, "_omni_orig_extra_conds"))
+            except Exception as exc:
+                logging.debug(f"[OmniLoRA] Could not restore BaseModel.extra_conds: {exc}")
+            for marker in ("_omni_orig_extra_conds", "_omni_extra_conds_patched"):
+                if hasattr(base_cls, marker):
+                    try:
+                        delattr(base_cls, marker)
+                    except Exception:
+                        pass
+
+    # 5. Restore `comfy.weight_adapter` LoRA adapter `calculate_weight`
+    cwa_mod = sys.modules.get("comfy.weight_adapter")
+    if cwa_mod is not None:
+        ad_candidates: List[Any] = []
+        if hasattr(cwa_mod, "LoRAAdapter"):
+            ad_candidates.append(getattr(cwa_mod, "LoRAAdapter"))
+        if hasattr(cwa_mod, "adapters") and isinstance(cwa_mod.adapters, (list, tuple)):
+            for ad_cls in cwa_mod.adapters:
+                if ad_cls not in ad_candidates:
+                    ad_candidates.append(ad_cls)
+        for lora_ad_cls in ad_candidates:
+            if hasattr(lora_ad_cls, "_omni_orig_calculate_weight"):
+                try:
+                    setattr(lora_ad_cls, "calculate_weight", getattr(lora_ad_cls, "_omni_orig_calculate_weight"))
+                except Exception as exc:
+                    logging.debug(f"[OmniLoRA] Could not restore {lora_ad_cls}.calculate_weight: {exc}")
+                for marker in ("_omni_orig_calculate_weight", "_omni_calc_weight_patched"):
+                    if hasattr(lora_ad_cls, marker):
+                        try:
+                            delattr(lora_ad_cls, marker)
+                        except Exception:
+                            pass
+
+    # 6. Restore `comfy.ldm.modules.attention` backends & rebound module aliases
+    comfy_attn = sys.modules.get("comfy.ldm.modules.attention")
+    if comfy_attn is not None:
+        replaced_map = getattr(comfy_attn, "_omni_replaced_attn_map", None)
+        if isinstance(replaced_map, dict) and replaced_map:
+            reverse_map: Dict[int, Any] = {}
+            for orig_fn, safe_fn in replaced_map.values():
+                reverse_map[id(safe_fn)] = orig_fn
+                orig_c = getattr(getattr(orig_fn, "container_function", None), "_omni_orig_attn_fn", None)
+                if orig_c is not None:
+                    try:
+                        setattr(orig_fn, "container_function", orig_c)
+                    except Exception:
+                        pass
+
+            for fn_name in (
+                "attention_comfy_kitchen_int8",
+                "attention_comfy_kitchen_sol",
+                "attention_sage",
+                "attention3_sage",
+            ):
+                cur_fn = getattr(comfy_attn, fn_name, None)
+                if cur_fn is None:
+                    continue
+                orig_fn = reverse_map.get(id(cur_fn)) or getattr(cur_fn, "_omni_orig_attn_fn", None)
+                if orig_fn is not None and orig_fn is not cur_fn:
+                    try:
+                        setattr(comfy_attn, fn_name, orig_fn)
+                    except Exception:
+                        pass
+
+            reg_map = getattr(comfy_attn, "REGISTERED_ATTENTION_FUNCTIONS", None)
+            if isinstance(reg_map, dict):
+                for reg_k, reg_v in list(reg_map.items()):
+                    orig_fn = reverse_map.get(id(reg_v))
+                    if orig_fn is not None:
+                        reg_map[reg_k] = orig_fn
+
+            for global_attr in ("optimized_attention", "optimized_attention_masked"):
+                g_val = getattr(comfy_attn, global_attr, None)
+                orig_fn = reverse_map.get(id(g_val))
+                if orig_fn is not None:
+                    try:
+                        setattr(comfy_attn, global_attr, orig_fn)
+                    except Exception:
+                        pass
+
+            for mod_name, mod_obj in list(sys.modules.items()):
+                if not isinstance(mod_name, str) or not mod_name.startswith("comfy.") or mod_obj is None:
+                    continue
+                for attr_n in ("optimized_attention", "optimized_attention_masked"):
+                    try:
+                        cur_ref = getattr(mod_obj, attr_n, None)
+                    except Exception:
+                        continue
+                    orig_fn = reverse_map.get(id(cur_ref))
+                    if orig_fn is not None:
+                        try:
+                            setattr(mod_obj, attr_n, orig_fn)
+                        except Exception:
+                            pass
+
+        for marker in ("_omni_replaced_attn_map", "_omni_attn_hooks_installed"):
+            if hasattr(comfy_attn, marker):
+                try:
+                    delattr(comfy_attn, marker)
+                except Exception:
+                    pass
+
+    # 7. Restore `comfy_kitchen` & `comfy.quant_ops.ck` training-safe wrappers
+    ck_targets: List[Any] = []
+    ck_mod = sys.modules.get("comfy_kitchen")
+    if ck_mod is not None:
+        ck_targets.append(ck_mod)
+    qops_mod = sys.modules.get("comfy.quant_ops")
+    if qops_mod is not None and getattr(qops_mod, "ck", None) is not None:
+        qops_ck = getattr(qops_mod, "ck")
+        if qops_ck not in ck_targets:
+            ck_targets.append(qops_ck)
+
+    for ck_obj in ck_targets:
+        for fn_name in (
+            "int8_attention",
+            "prequantize_int8_attention",
+            "int8_attention_from_prequantized",
+            "sol_attn",
+            "rms_rope",
+            "rms_rope1",
+            "rms_rope_split_half",
+            "rms_rope_split_half_",
+            "apply_rope_split_half",
+            "apply_rope",
+            "apply_rope1",
+            "adaln",
+            "rms_adaln",
+        ):
+            stash_attr = f"_omni_orig_{fn_name}"
+            if hasattr(ck_obj, stash_attr):
+                try:
+                    setattr(ck_obj, fn_name, getattr(ck_obj, stash_attr))
+                    delattr(ck_obj, stash_attr)
+                except Exception as exc:
+                    logging.debug(f"[OmniLoRA] Could not restore {ck_obj}.{fn_name}: {exc}")
 
 
 def _rebind_comfy_attention_modules(root: Optional[nn.Module]) -> None:

@@ -6,9 +6,11 @@ VRAM Tiering, Precision Cascade (`bf16` -> `fp16`+GradScaler -> `fp32`), and Uni
 import copy
 import json
 import math
+import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,10 +45,17 @@ from omni_lora.models import (
     ComfyModelAdapter,
     MossImageAdapter,
     detect_comfy_model_architecture,
+    install_comfy_runtime_hooks,
     normalize_legacy_lora_key,
     resolve_model_adapter,
+    uninstall_comfy_runtime_hooks,
 )
+from omni_lora.models.adapters import ensure_comfy_importable
 from omni_lora.pipelines import LoRATrainingPipeline, TrainingConfig
+
+# Configure ComfyUI CPU fallback before any test lazily imports `comfy.model_management`
+# on CPU-only environments (e.g. headless GitHub Actions CI runners).
+ensure_comfy_importable()
 
 
 class TestOmniLoRAFramework(unittest.TestCase):
@@ -5873,6 +5882,1911 @@ class TestOmniLoRAFramework(unittest.TestCase):
         self.assertIs(torch.lerp, orig_lerp)
         self.assertIs(torch.cat, orig_cat)
 
+    def test_bug1_1_scoped_training_flags_restored_on_early_setup_error(self) -> None:
+        """Bug 1.1: Pre-try exceptions in train_lora() must restore mm.in_training and disable_comfy_compiler."""
+        import sys
+        from omni_lora.nodes import CachedConditioningBundle
+
+        fake_mm = types.ModuleType("comfy.model_management")
+        fake_mm.in_training = False  # type: ignore[attr-defined]
+        fake_cli_args = types.ModuleType("comfy.cli_args")
+        fake_cli_args.args = types.SimpleNamespace(disable_comfy_compiler=False)  # type: ignore[attr-defined]
+
+        bundle = CachedConditioningBundle(
+            batches=[{
+                "latents": torch.randn(1, 4, 8, 8),
+                "prompt_embeds": torch.randn(1, 4, 16),
+                "latent_scaled": True,
+            }],
+            resolution=64,
+            batch_size=1,
+            trigger_word="",
+            num_unique_images=1,
+            total_batches=1,
+            latent_scaled=True,
+        )
+        toy_model = nn.Sequential(nn.Linear(16, 16))
+        trainer = OmniLoRATrainer()
+
+        orig_comfy = sys.modules.get("comfy")
+        orig_mm = sys.modules.get("comfy.model_management")
+        orig_cli = sys.modules.get("comfy.cli_args")
+        _missing = object()
+        comfy_pkg = orig_comfy if orig_comfy is not None else types.ModuleType("comfy")
+        orig_mm_attr = getattr(comfy_pkg, "model_management", _missing)
+        orig_cli_attr = getattr(comfy_pkg, "cli_args", _missing)
+        if orig_comfy is None:
+            sys.modules["comfy"] = comfy_pkg
+        comfy_pkg.model_management = fake_mm  # type: ignore[attr-defined]
+        comfy_pkg.cli_args = fake_cli_args  # type: ignore[attr-defined]
+        sys.modules["comfy.model_management"] = fake_mm
+        sys.modules["comfy.cli_args"] = fake_cli_args
+        try:
+            with self.assertRaises(ValueError):
+                trainer.train_lora(
+                    cached_data=bundle,
+                    model=toy_model,
+                    backend="cpu",
+                    precision="fp32",
+                    steps=1,
+                    enable_target_module_filter=True,
+                    target_module_filter="__definitely_nonexistent_module_xyz__",
+                )
+            self.assertFalse(fake_mm.in_training)
+            self.assertFalse(fake_cli_args.args.disable_comfy_compiler)
+
+            # Also verify an initial True value is preserved (not overwritten with False)
+            fake_mm.in_training = True  # type: ignore[attr-defined]
+            fake_cli_args.args.disable_comfy_compiler = True
+            with self.assertRaises(ValueError):
+                trainer.train_lora(
+                    cached_data=bundle,
+                    model=toy_model,
+                    backend="cpu",
+                    precision="fp32",
+                    steps=1,
+                    enable_target_module_filter=True,
+                    target_module_filter="__definitely_nonexistent_module_xyz__",
+                )
+            self.assertTrue(fake_mm.in_training)
+            self.assertTrue(fake_cli_args.args.disable_comfy_compiler)
+        finally:
+            if orig_mm_attr is _missing:
+                if hasattr(comfy_pkg, "model_management"):
+                    delattr(comfy_pkg, "model_management")
+            else:
+                comfy_pkg.model_management = orig_mm_attr  # type: ignore[attr-defined]
+            if orig_cli_attr is _missing:
+                if hasattr(comfy_pkg, "cli_args"):
+                    delattr(comfy_pkg, "cli_args")
+            else:
+                comfy_pkg.cli_args = orig_cli_attr  # type: ignore[attr-defined]
+            if orig_comfy is None:
+                sys.modules.pop("comfy", None)
+            if orig_mm is not None:
+                sys.modules["comfy.model_management"] = orig_mm
+            else:
+                sys.modules.pop("comfy.model_management", None)
+            if orig_cli is not None:
+                sys.modules["comfy.cli_args"] = orig_cli
+            else:
+                sys.modules.pop("comfy.cli_args", None)
+
+    def test_bug1_2_external_backbone_zero_target_match_raises(self) -> None:
+        """Bug 1.2: setup(external_backbone=...) must raise RuntimeError when 0 targets match, never swap in ToyBackbone."""
+        plan = detect_and_configure(preferred_backend="cpu", requested_dtype="fp32", allow_fallback=True)
+        ext_backbone = nn.Sequential(nn.LayerNorm(16))
+        adapter = ComfyModelAdapter(model_id="flux_dev", comfy_model=ext_backbone)
+        pipe = LoRATrainingPipeline(
+            backend=plan.backend,
+            model_adapter=adapter,
+            config=TrainingConfig(
+                backend="cpu",
+                dtype="fp32",
+                max_train_steps=1,
+                lora=LoRAConfig(rank=4, alpha=4.0, target_modules=("__no_such_target__",)),
+            ),
+        )
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                pipe.setup(external_backbone=ext_backbone)
+            self.assertIn("No LoRA target modules matched", str(ctx.exception))
+            self.assertIs(pipe.backbone, ext_backbone)
+        finally:
+            pipe.cleanup()
+
+    def test_bug1_3_comfy_kitchen_wrappers_signature_agnostic(self) -> None:
+        """Bug 1.3: comfy_kitchen wrappers must pass through arbitrary args outside training and handle epsilon= during training."""
+        import sys
+        from omni_lora.models import install_comfy_runtime_hooks
+
+        seen_calls: List[Tuple[str, Tuple[Any, ...], Dict[str, Any]]] = []
+
+        def _orig_adaln(*args: Any, **kwargs: Any) -> torch.Tensor:
+            seen_calls.append(("adaln", args, kwargs))
+            return args[0] + 1.0
+
+        def _orig_rms_adaln(*args: Any, **kwargs: Any) -> torch.Tensor:
+            seen_calls.append(("rms_adaln", args, kwargs))
+            return args[0] + 2.0
+
+        def _orig_rms_rope(*args: Any, **kwargs: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+            seen_calls.append(("rms_rope", args, kwargs))
+            return args[0], args[1]
+
+        fake_ck = types.ModuleType("comfy_kitchen")
+        fake_ck.adaln = _orig_adaln  # type: ignore[attr-defined]
+        fake_ck.rms_adaln = _orig_rms_adaln  # type: ignore[attr-defined]
+        fake_ck.rms_rope = _orig_rms_rope  # type: ignore[attr-defined]
+
+        fake_mm = sys.modules.get("comfy.model_management")
+        created_mm = fake_mm is None
+        if created_mm:
+            fake_mm = types.ModuleType("comfy.model_management")
+            sys.modules["comfy.model_management"] = fake_mm
+        prev_in_training = getattr(fake_mm, "in_training", False)
+        orig_ck_mod = sys.modules.get("comfy_kitchen")
+        sys.modules["comfy_kitchen"] = fake_ck
+        try:
+            install_comfy_runtime_hooks()
+            x = torch.randn(1, 4, 8, requires_grad=True)
+            scale = torch.zeros(1, 1, 8)
+            shift = torch.zeros(1, 1, 8)
+
+            # Outside training: arbitrary kwargs passthrough with zero signature coupling
+            fake_mm.in_training = False  # type: ignore[attr-defined]
+            with torch.no_grad():
+                out_adaln_inf = fake_ck.adaln(x, scale, shift, epsilon=1e-5, custom_hint="v2")
+                out_rms_inf = fake_ck.rms_adaln(x, scale, shift, epsilon=1e-5, extra=42)
+            self.assertTrue(torch.allclose(out_adaln_inf, x + 1.0))
+            self.assertTrue(torch.allclose(out_rms_inf, x + 2.0))
+            self.assertEqual(seen_calls[0][2], {"epsilon": 1e-5, "custom_hint": "v2"})
+            self.assertEqual(seen_calls[1][2], {"epsilon": 1e-5, "extra": 42})
+
+            # Inside training: differentiable PyTorch fallback supports epsilon= kwarg cleanly
+            fake_mm.in_training = True  # type: ignore[attr-defined]
+            out_adaln_tr = fake_ck.adaln(x, scale, shift, epsilon=1e-5)
+            out_rms_tr = fake_ck.rms_adaln(x, scale, shift, epsilon=1e-5)
+            self.assertTrue(out_adaln_tr.requires_grad)
+            self.assertTrue(out_rms_tr.requires_grad)
+            (out_adaln_tr.sum() + out_rms_tr.sum()).backward()
+            self.assertIsNotNone(x.grad)
+        finally:
+            fake_mm.in_training = prev_in_training  # type: ignore[attr-defined]
+            if created_mm:
+                sys.modules.pop("comfy.model_management", None)
+            if orig_ck_mod is not None:
+                sys.modules["comfy_kitchen"] = orig_ck_mod
+            else:
+                sys.modules.pop("comfy_kitchen", None)
+
+    def test_bug1_4_dml_safe_markers_idempotent_and_restored(self) -> None:
+        """Bug 1.4: F.pixel_unshuffle, F.pixel_shuffle, and F.conv3d carry _omni_dml_safe=True and scope cleanly."""
+        from omni_lora.models import install_comfy_runtime_hooks
+        from omni_lora.pipelines.lora_trainer import _scoped_training_op_wrappers
+
+        install_comfy_runtime_hooks()
+        self.assertTrue(getattr(F.pixel_unshuffle, "_omni_dml_safe", False))
+        self.assertTrue(getattr(F.pixel_shuffle, "_omni_dml_safe", False))
+        self.assertTrue(getattr(F.conv3d, "_omni_dml_safe", False))
+
+        first_unshuffle = F.pixel_unshuffle
+        first_shuffle = F.pixel_shuffle
+        first_conv3d = F.conv3d
+        install_comfy_runtime_hooks()
+        self.assertIs(F.pixel_unshuffle, first_unshuffle)
+        self.assertIs(F.pixel_shuffle, first_shuffle)
+        self.assertIs(F.conv3d, first_conv3d)
+
+        with _scoped_training_op_wrappers():
+            self.assertTrue(getattr(F.conv3d, "_omni_train_dml_safe", False))
+        self.assertFalse(getattr(F.conv3d, "_omni_train_dml_safe", False))
+        install_comfy_runtime_hooks()
+
+    def test_bug1_5_lora_linear_device_mismatch_raises(self) -> None:
+        """Bug 1.5: LoRALinear.forward() must raise instead of calling .to() and severing optimizer parameter identity."""
+        base = nn.Linear(8, 8)
+        lora_mod = LoRALinear(base, rank=2, alpha=2.0, lora_dtype=torch.float32, device=torch.device("cpu"))
+        orig_a_param = lora_mod.lora_A.weight
+        lora_mod.lora_A = nn.Linear(8, 2, bias=False, device="meta", dtype=torch.float32)
+        with self.assertRaises(RuntimeError) as ctx:
+            _ = lora_mod(torch.randn(1, 8))
+        self.assertIn("severs optimizer parameter references", str(ctx.exception))
+        # Ensure base fallback can restore back cleanly without calling .to()
+        self.assertIsNotNone(orig_a_param)
+
+    def test_bug1_6_and_1_7_cleanup_unpatches_globals_and_step1_error_no_ckpt(self) -> None:
+        """Bug 1.6 & 1.7: cleanup() unpatches module __globals__ even with gradient_checkpointing=False; step-1 error writes no checkpoint."""
+        import logging
+        import unittest.mock
+        from omni_lora.nodes import CachedConditioningBundle
+
+        # 1. Verify cleanup() restores patched module __globals__ when gradient_checkpointing=False
+        ns_mod = types.ModuleType("omni_fake_ldm_mod")
+        ns_mod.torch = torch  # type: ignore[attr-defined]
+
+        def _gated_residual(x: torch.Tensor, y: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+            return x.addcmul_(y, gate)
+
+        ns_mod._gated_residual = _gated_residual  # type: ignore[attr-defined]
+        ns_dict = ns_mod.__dict__
+
+        class _BlockWithGlobal(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.proj = nn.Linear(16, 16)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return ns_mod._gated_residual(self.proj(x), x, torch.ones_like(x))
+
+        # Bind forward.__globals__ directly to ns_dict
+        exec(
+            "def _fwd_with_ns(self, x):\n    return _gated_residual(self.proj(x), x, torch.ones_like(x))\n",
+            ns_dict,
+        )
+        _BlockWithGlobal.forward = ns_dict["_fwd_with_ns"]  # type: ignore[assignment]
+
+        bb = _BlockWithGlobal()
+        plan = detect_and_configure(preferred_backend="cpu", requested_dtype="fp32", allow_fallback=True)
+        adapter = ComfyModelAdapter(model_id="flux_dev", comfy_model=bb)
+        pipe = LoRATrainingPipeline(
+            backend=plan.backend,
+            model_adapter=adapter,
+            config=TrainingConfig(
+                backend="cpu",
+                dtype="fp32",
+                gradient_checkpointing=False,
+                max_train_steps=1,
+                lora=LoRAConfig(rank=4, alpha=4.0, target_modules=("proj",)),
+            ),
+        )
+        pipe.setup(external_backbone=bb)
+        self.assertTrue(getattr(ns_dict["_gated_residual"], "_omni_inplace_safe_wrapped", False))
+        LoRAInjector.uninject(bb)
+        pipe.cleanup()
+        self.assertIs(ns_dict["_gated_residual"], _gated_residual)
+
+        # 2. Verify step-1 failure does NOT write interrupted_step_00001.safetensors and load_lora_for_models logs warning
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = CachedConditioningBundle(
+                batches=[{
+                    "latents": torch.randn(1, 4, 8, 8),
+                    "prompt_embeds": torch.randn(1, 4, 16),
+                    "latent_scaled": True,
+                }],
+                resolution=64,
+                batch_size=1,
+                trigger_word="",
+                num_unique_images=1,
+                total_batches=1,
+                latent_scaled=True,
+            )
+            trainer = OmniLoRATrainer()
+            with unittest.mock.patch.object(LoRATrainingPipeline, "train_step", side_effect=RuntimeError("boom step 1")):
+                with self.assertRaises(RuntimeError):
+                    trainer.train_lora(
+                        cached_data=bundle,
+                        model=None,
+                        backend="cpu",
+                        precision="fp32",
+                        steps=2,
+                        custom_checkpoint_dir=tmpdir,
+                        checkpoint_prefix="step1_fail_test",
+                    )
+            emerg_files = list(Path(tmpdir).glob("*interrupted_step_*"))
+            self.assertEqual(emerg_files, [])
+
+            # Also verify comfy.sd.load_lora_for_models failure logs a loud warning
+            import sys
+
+            class _TinyTrainableBackbone(nn.Module):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.in_channels = 4
+                    self.context_dim = 16
+                    self.proj = nn.Linear(4, 4)
+
+                def forward(
+                    self,
+                    x: torch.Tensor,
+                    timestep: Optional[torch.Tensor] = None,
+                    context: Optional[torch.Tensor] = None,
+                    **kwargs: Any,
+                ) -> torch.Tensor:
+                    return self.proj(x.movedim(1, -1)).movedim(-1, 1)
+
+            fake_sd = types.ModuleType("comfy.sd")
+
+            def _broken_load(*args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("simulated lora patch error")
+
+            fake_sd.load_lora_for_models = _broken_load  # type: ignore[attr-defined]
+            orig_comfy_sd = sys.modules.get("comfy")
+            orig_sd = sys.modules.get("comfy.sd")
+            _missing_sd = object()
+            comfy_pkg_sd = orig_comfy_sd if orig_comfy_sd is not None else types.ModuleType("comfy")
+            orig_sd_attr = getattr(comfy_pkg_sd, "sd", _missing_sd)
+            if orig_comfy_sd is None:
+                sys.modules["comfy"] = comfy_pkg_sd
+            comfy_pkg_sd.sd = fake_sd  # type: ignore[attr-defined]
+            sys.modules["comfy.sd"] = fake_sd
+            try:
+                toy_bb = _TinyTrainableBackbone()
+                with self.assertLogs(level=logging.WARNING) as warn_cm:
+                    _out_m, _bundle, _sum = trainer.train_lora(
+                        cached_data=bundle,
+                        model=toy_bb,
+                        backend="cpu",
+                        precision="fp32",
+                        steps=1,
+                        custom_checkpoint_dir=tmpdir,
+                        enable_target_module_filter=True,
+                        target_module_filter="proj",
+                    )
+                self.assertTrue(
+                    any("load_lora_for_models" in msg for msg in warn_cm.output),
+                    f"Expected load_lora_for_models warning, got {warn_cm.output}",
+                )
+            finally:
+                if orig_sd_attr is _missing_sd:
+                    if hasattr(comfy_pkg_sd, "sd"):
+                        delattr(comfy_pkg_sd, "sd")
+                else:
+                    comfy_pkg_sd.sd = orig_sd_attr  # type: ignore[attr-defined]
+                if orig_comfy_sd is None:
+                    sys.modules.pop("comfy", None)
+                if orig_sd is not None:
+                    sys.modules["comfy.sd"] = orig_sd
+                else:
+                    sys.modules.pop("comfy.sd", None)
+
+    def test_bug1_7_dataset_control_mismatch_and_stem_collision(self) -> None:
+        """Bug 1.7: Dataset rejects mismatched direct control batches and avoids cross-binding colliding stems."""
+        from PIL import Image
+
+        loader = OmniLoRADatasetLoader()
+        # 1. Mismatched direct control_images batch size (3 targets vs 2 controls) raises ValueError
+        imgs = torch.rand(3, 64, 64, 3, dtype=torch.float32)
+        ctrls = torch.rand(2, 64, 64, 3, dtype=torch.float32)
+        with self.assertRaises(ValueError) as ctx:
+            loader.load_dataset(
+                dataset_path="",
+                trigger_word="",
+                default_caption="edit",
+                resolution=64,
+                batch_size=1,
+                num_repeats=1,
+                center_crop=True,
+                aspect_ratio_bucketing=False,
+                random_flip=False,
+                caption_dropout=0.0,
+                images=imgs,
+                control_images=ctrls,
+            )
+        self.assertIn("control_images batch size", str(ctx.exception))
+
+        # 2. Colliding filename stems across nested subfolders in controls & manifest captions
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            tgt = root / "targets"
+            ctrl = root / "controls"
+            for sub in ("sub_a", "sub_b", "sub_c"):
+                (tgt / sub).mkdir(parents=True)
+            for sub in ("sub_a", "sub_b"):
+                (ctrl / sub).mkdir(parents=True)
+
+            Image.new("RGB", (64, 64), (200, 10, 10)).save(tgt / "sub_a" / "001.png")
+            Image.new("RGB", (64, 64), (10, 200, 10)).save(tgt / "sub_b" / "001.png")
+            Image.new("RGB", (64, 64), (10, 10, 200)).save(tgt / "sub_c" / "001.png")
+            Image.new("RGB", (64, 64), (111, 111, 111)).save(ctrl / "sub_a" / "001.png")
+            Image.new("RGB", (64, 64), (222, 222, 222)).save(ctrl / "sub_b" / "001.png")
+            (tgt / "metadata.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"file_name": "sub_a/001.png", "text": "caption A"}),
+                    json.dumps({"file_name": "sub_b/001.png", "text": "caption B"}),
+                ]),
+                encoding="utf-8",
+            )
+
+            ds, _ = loader.load_dataset(
+                dataset_path=str(tgt),
+                trigger_word="",
+                default_caption="fallback cap",
+                resolution=64,
+                batch_size=1,
+                num_repeats=1,
+                center_crop=True,
+                aspect_ratio_bucketing=False,
+                random_flip=False,
+                caption_dropout=0.0,
+                control_path=str(ctrl),
+            )
+            by_src = {
+                s.image_path.relative_to(tgt).as_posix(): s
+                for s in ds.samples
+                if s.image_path is not None
+            }
+            self.assertEqual(by_src["sub_a/001.png"].caption, "caption A")
+            self.assertEqual(by_src["sub_b/001.png"].caption, "caption B")
+            self.assertEqual(by_src["sub_c/001.png"].caption, "fallback cap")
+            self.assertTrue(by_src["sub_a/001.png"].has_control)
+            self.assertTrue(by_src["sub_b/001.png"].has_control)
+            self.assertFalse(by_src["sub_c/001.png"].has_control)
+            self.assertEqual(str(by_src["sub_a/001.png"].control_source_name).replace("\\", "/"), "sub_a/001.png")
+            self.assertEqual(str(by_src["sub_b/001.png"].control_source_name).replace("\\", "/"), "sub_b/001.png")
+
+    def test_gradient_accumulation_parity_scheduler_cadence_and_deck_shuffle(self) -> None:
+        """
+        Verify `grad_accum_steps > 1` mathematical equivalence to larger batch sizes,
+        `StepMetrics.loss` averaging across micro-batches, single-per-step scheduler
+        stepping, and `OmniLoRATrainer` deck cycling when `grad_accum_steps > num_batches`.
+        """
+        from omni_lora.nodes import CachedConditioningBundle
+
+        class _DeterministicMSEAdapter(ComfyModelAdapter):
+            def compute_training_loss(
+                self,
+                backbone: nn.Module,
+                batch: Dict[str, Any],
+                device: torch.device,
+                dtype: torch.dtype,
+            ) -> torch.Tensor:
+                x = batch["latents"].to(device=device, dtype=dtype)
+                target = batch["target"].to(device=device, dtype=dtype)
+                pred = backbone(x)
+                self.last_timestep = 0.5
+                return ((pred.to(dtype=torch.float32) - target.to(dtype=torch.float32)) ** 2).mean()
+
+        class _LinearBlockNet(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.in_channels = 4
+                self.context_dim = 16
+                self.block = nn.Linear(4, 4, bias=False)
+
+            def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+                return self.block(x)
+
+        torch.manual_seed(1234)
+        bb_accum = _LinearBlockNet()
+        bb_full = copy.deepcopy(bb_accum)
+        plan = detect_and_configure(preferred_backend="cpu", requested_dtype="fp32", allow_fallback=True)
+
+        pipe_accum = LoRATrainingPipeline(
+            backend=plan.backend,
+            model_adapter=_DeterministicMSEAdapter(model_id="flux_dev", comfy_model=bb_accum),
+            config=TrainingConfig(
+                backend="cpu",
+                dtype="fp32",
+                optimizer_type="sgd",
+                learning_rate=0.05,
+                lr_scheduler="cosine",
+                warmup_steps=0,
+                weight_decay=0.0,
+                max_grad_norm=0.0,
+                gradient_checkpointing=False,
+                gradient_accumulation_steps=2,
+                max_train_steps=4,
+                seed=7,
+                lora=LoRAConfig(rank=2, alpha=2.0, lora_dtype="fp32", target_modules=("block",)),
+            ),
+        )
+        pipe_full = LoRATrainingPipeline(
+            backend=plan.backend,
+            model_adapter=_DeterministicMSEAdapter(model_id="flux_dev", comfy_model=bb_full),
+            config=TrainingConfig(
+                backend="cpu",
+                dtype="fp32",
+                optimizer_type="sgd",
+                learning_rate=0.05,
+                lr_scheduler="cosine",
+                warmup_steps=0,
+                weight_decay=0.0,
+                max_grad_norm=0.0,
+                gradient_checkpointing=False,
+                gradient_accumulation_steps=1,
+                max_train_steps=4,
+                seed=7,
+                lora=LoRAConfig(rank=2, alpha=2.0, lora_dtype="fp32", target_modules=("block",)),
+            ),
+        )
+
+        try:
+            pipe_accum.setup(external_backbone=bb_accum)
+            pipe_full.setup(external_backbone=bb_full)
+
+            # Initialize non-zero identical LoRA weights on both pipelines so both A & B receive grads
+            with torch.no_grad():
+                torch.manual_seed(99)
+                init_a = torch.randn_like(bb_accum.block.lora_A.weight)
+                init_b = torch.randn_like(bb_accum.block.lora_B.weight) * 0.25
+                bb_accum.block.lora_A.weight.copy_(init_a)
+                bb_accum.block.lora_B.weight.copy_(init_b)
+                bb_full.block.lora_A.weight.copy_(init_a)
+                bb_full.block.lora_B.weight.copy_(init_b)
+
+            mb0 = {"latents": torch.randn(1, 4), "target": torch.randn(1, 4)}
+            mb1 = {"latents": torch.randn(1, 4), "target": torch.randn(1, 4)}
+            cat_batch = {
+                "latents": torch.cat([mb0["latents"], mb1["latents"]], dim=0),
+                "target": torch.cat([mb0["target"], mb1["target"]], dim=0),
+            }
+            with torch.no_grad():
+                exp0 = float(((bb_accum(mb0["latents"]) - mb0["target"]) ** 2).mean().item())
+                exp1 = float(((bb_accum(mb1["latents"]) - mb1["target"]) ** 2).mean().item())
+
+            metrics_accum = pipe_accum.train_step(1, micro_batches=[mb0, mb1])
+            metrics_full = pipe_full.train_step(1, batch=cat_batch)
+
+            self.assertAlmostEqual(metrics_accum.loss, 0.5 * (exp0 + exp1), places=5)
+            self.assertAlmostEqual(metrics_accum.loss, metrics_full.loss, places=5)
+            self.assertTrue(
+                torch.allclose(bb_accum.block.lora_A.weight, bb_full.block.lora_A.weight, atol=1e-5, rtol=1e-5)
+            )
+            self.assertTrue(
+                torch.allclose(bb_accum.block.lora_B.weight, bb_full.block.lora_B.weight, atol=1e-5, rtol=1e-5)
+            )
+
+            # Scheduler must advance ONCE per optimizer step even when accum_steps > len(micro_batches)
+            pipe_accum.config.gradient_accumulation_steps = 3
+            pipe_accum.train_step(2, micro_batches=[mb0, mb1])
+            assert pipe_accum.lr_scheduler is not None
+            self.assertEqual(pipe_accum.lr_scheduler.last_epoch, 2)
+        finally:
+            pipe_accum.cleanup()
+            pipe_full.cleanup()
+
+        # Verify OmniLoRATrainer handles grad_accum_steps > num_batches cleanly
+        class _TinySpatialNet(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.in_channels = 4
+                self.context_dim = 16
+                self.double_blocks = nn.ModuleList(
+                    [nn.ModuleDict({"attn": nn.Linear(4, 4)}) for _ in range(2)]
+                )
+
+            def forward(self, x: torch.Tensor, timestep: Optional[torch.Tensor] = None, context: Optional[torch.Tensor] = None, **kwargs: Any) -> torch.Tensor:
+                h = x.movedim(1, -1)
+                for blk in self.double_blocks:
+                    h = h + blk["attn"](h)
+                return h.movedim(-1, 1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = CachedConditioningBundle(
+                batches=[
+                    {"latents": torch.randn(1, 4, 8, 8), "prompt_embeds": torch.randn(1, 4, 16), "latent_scaled": True},
+                    {"latents": torch.randn(1, 4, 8, 8), "prompt_embeds": torch.randn(1, 4, 16), "latent_scaled": True},
+                ],
+                resolution=64,
+                batch_size=1,
+                trigger_word="",
+                num_unique_images=2,
+                total_batches=2,
+                latent_scaled=True,
+            )
+            _, _, sum_json = OmniLoRATrainer().train_lora(
+                cached_data=bundle,
+                model=_TinySpatialNet(),
+                backend="cpu",
+                precision="fp32",
+                rank=2,
+                alpha=2.0,
+                steps=2,
+                grad_accum_steps=4,
+                gradient_checkpointing=False,
+                custom_checkpoint_dir=tmpdir,
+            )
+            parsed = json.loads(sum_json)
+            self.assertEqual(parsed["grad_accum_steps"], 4)
+            self.assertEqual(parsed["steps_this_session"], 2)
+
+    def test_lora_dropout_training_vs_eval_isolation(self) -> None:
+        """
+        Verify `LoRATrainingPipeline.setup()` keeps base-backbone `.eval()` (e.g. base Dropout
+        stays deterministic) while setting `.train()` exclusively on injected `LoRALinear` modules,
+        so `lora_dropout > 0.0` produces stochastic training forwards and deterministic eval forwards.
+        """
+        class _BaseDropoutBackbone(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.in_channels = 4
+                self.base_drop = nn.Dropout(p=0.5)
+                self.proj = nn.Linear(8, 8)
+
+            def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+                return self.base_drop(self.proj(x))
+
+        bb = _BaseDropoutBackbone()
+        plan = detect_and_configure(preferred_backend="cpu", requested_dtype="fp32", allow_fallback=True)
+        adapter = ComfyModelAdapter(model_id="flux_dev", comfy_model=bb)
+        pipe = LoRATrainingPipeline(
+            backend=plan.backend,
+            model_adapter=adapter,
+            config=TrainingConfig(
+                backend="cpu",
+                dtype="fp32",
+                gradient_checkpointing=False,
+                max_train_steps=1,
+                lora=LoRAConfig(rank=4, alpha=4.0, dropout=0.5, lora_dtype="fp32", target_modules=("proj",)),
+            ),
+        )
+        try:
+            pipe.setup(external_backbone=bb)
+            self.assertFalse(bb.training)
+            self.assertFalse(bb.base_drop.training)
+            self.assertIsInstance(bb.proj, LoRALinear)
+            self.assertTrue(bb.proj.training)
+            self.assertFalse(bb.proj.base_layer.training)
+            self.assertTrue(bb.proj.lora_dropout.training)
+
+            with torch.no_grad():
+                bb.proj.lora_B.weight.fill_(0.5)
+
+            x = torch.ones(2, 8, dtype=torch.float32)
+            train_outs = [bb(x).detach() for _ in range(8)]
+            self.assertTrue(
+                any(not torch.allclose(train_outs[0], out, atol=1e-6) for out in train_outs[1:]),
+                "Expected stochastic output variance from active lora_dropout=0.5 in train mode",
+            )
+
+            bb.proj.eval()
+            eval_out_a = bb(x).detach()
+            eval_out_b = bb(x).detach()
+            self.assertTrue(torch.allclose(eval_out_a, eval_out_b, atol=1e-7))
+
+            LoRAInjector.uninject(bb)
+            self.assertIsInstance(bb.proj, nn.Linear)
+            post_a = bb(x).detach()
+            post_b = bb(x).detach()
+            self.assertTrue(torch.allclose(post_a, post_b, atol=1e-7))
+        finally:
+            pipe.cleanup()
+
+    def test_periodic_manual_and_interrupt_checkpoints_with_tracker(self) -> None:
+        """
+        Verify periodic `checkpoint_every_n_steps`, cumulative step naming on resume,
+        manual `TRACKER_STORE.request_checkpoint(node_id)` isolation + save, and mid-run
+        interrupt saving `*_interrupted_step_NNNNN.*` with `omni_lora.interrupted=true` & clean uninject.
+        """
+        import unittest.mock
+        from omni_lora.nodes import CachedConditioningBundle, _load_lora_safetensors_or_pt
+        from omni_lora.tracker_store import TRACKER_STORE
+
+        class _CkptTestBackbone(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.in_channels = 4
+                self.context_dim = 16
+                self.double_blocks = nn.ModuleList(
+                    [nn.ModuleDict({"attn": nn.Linear(4, 4)}) for _ in range(1)]
+                )
+
+            def forward(self, x: torch.Tensor, timestep: Optional[torch.Tensor] = None, context: Optional[torch.Tensor] = None, **kwargs: Any) -> torch.Tensor:
+                h = x.movedim(1, -1)
+                for blk in self.double_blocks:
+                    h = h + blk["attn"](h)
+                return h.movedim(-1, 1)
+
+        bundle = CachedConditioningBundle(
+            batches=[{
+                "latents": torch.randn(1, 4, 8, 8),
+                "prompt_embeds": torch.randn(1, 4, 16),
+                "latent_scaled": True,
+            }],
+            resolution=64,
+            batch_size=1,
+            trigger_word="",
+            num_unique_images=1,
+            total_batches=1,
+            latent_scaled=True,
+        )
+        trainer = OmniLoRATrainer()
+
+        TRACKER_STORE.clear(keep_active=False)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # 1. Periodic checkpoints at step 2 and step 4
+                _, lora_b1, sum1 = trainer.train_lora(
+                    cached_data=bundle,
+                    model=_CkptTestBackbone(),
+                    backend="cpu",
+                    precision="fp32",
+                    rank=2,
+                    alpha=2.0,
+                    steps=4,
+                    checkpoint_every_n_steps=2,
+                    checkpoint_prefix="per_p",
+                    custom_checkpoint_dir=tmpdir,
+                    gradient_checkpointing=False,
+                    unique_id="node_per",
+                )
+                s1 = json.loads(sum1)
+                stems1 = [Path(n).stem for n in s1["auto_checkpoints_saved"]]
+                self.assertEqual(stems1, ["per_p_step_00002", "per_p_step_00004"])
+                self.assertTrue((Path(tmpdir) / s1["auto_checkpoints_saved"][0]).is_file())
+                self.assertTrue((Path(tmpdir) / s1["auto_checkpoints_saved"][1]).is_file())
+
+                # 2. Resume from lora_b1: cumulative step 4 + 2 = 6
+                _, _, sum2 = trainer.train_lora(
+                    cached_data=bundle,
+                    model=_CkptTestBackbone(),
+                    backend="cpu",
+                    precision="fp32",
+                    initial_lora=lora_b1,
+                    steps=2,
+                    checkpoint_every_n_steps=2,
+                    checkpoint_prefix="per_p",
+                    custom_checkpoint_dir=tmpdir,
+                    gradient_checkpointing=False,
+                    unique_id="node_res",
+                )
+                s2 = json.loads(sum2)
+                self.assertEqual(s2["cumulative_steps_trained"], 6)
+                self.assertEqual([Path(n).stem for n in s2["auto_checkpoints_saved"]], ["per_p_step_00006"])
+
+                # 3. Manual checkpoint request with node_id isolation even when interval == 0
+                TRACKER_STORE.request_checkpoint(node_id="node_A")
+                self.assertFalse(TRACKER_STORE.consume_checkpoint_request("node_B"))
+                _, _, sum_m = trainer.train_lora(
+                    cached_data=bundle,
+                    model=_CkptTestBackbone(),
+                    backend="cpu",
+                    precision="fp32",
+                    rank=2,
+                    alpha=2.0,
+                    steps=1,
+                    checkpoint_every_n_steps=0,
+                    checkpoint_prefix="man_p",
+                    custom_checkpoint_dir=tmpdir,
+                    gradient_checkpointing=False,
+                    unique_id="node_A",
+                )
+                sm = json.loads(sum_m)
+                self.assertEqual([Path(n).stem for n in sm["auto_checkpoints_saved"]], ["man_p_step_00001"])
+
+                # 4. Mid-run interrupt AFTER step 1 completes writes interrupted_step_00001 & uninjects cleanly
+                bb_irq = _CkptTestBackbone()
+                orig_train_step = LoRATrainingPipeline.train_step
+                step_calls = {"count": 0}
+
+                def _fail_on_step2(self_pipe: Any, step_idx: int, *args: Any, **kwargs: Any) -> Any:
+                    step_calls["count"] += 1
+                    if step_calls["count"] == 2:
+                        raise RuntimeError("simulated mid-run cancel")
+                    return orig_train_step(self_pipe, step_idx, *args, **kwargs)
+
+                with unittest.mock.patch.object(LoRATrainingPipeline, "train_step", _fail_on_step2):
+                    with self.assertRaises(RuntimeError):
+                        trainer.train_lora(
+                            cached_data=bundle,
+                            model=bb_irq,
+                            backend="cpu",
+                            precision="fp32",
+                            rank=2,
+                            alpha=2.0,
+                            steps=3,
+                            checkpoint_prefix="irq_p",
+                            custom_checkpoint_dir=tmpdir,
+                            gradient_checkpointing=False,
+                            unique_id="node_irq",
+                        )
+
+                emerg_files = list(Path(tmpdir).glob("irq_p_interrupted_step_00001.*"))
+                self.assertEqual(len(emerg_files), 1)
+                emerg_sd, emerg_meta = _load_lora_safetensors_or_pt(emerg_files[0])
+                self.assertGreater(len(emerg_sd), 0)
+                self.assertEqual(emerg_meta.get("omni_lora.interrupted"), "true")
+                self.assertEqual(emerg_meta.get("omni_lora.steps"), "1")
+                self.assertIsInstance(bb_irq.double_blocks[0]["attn"], nn.Linear)
+
+                irq_runs = TRACKER_STORE.get_snapshot(node_ids=["node_irq"])["runs"]
+                self.assertEqual(len(irq_runs), 1)
+                self.assertEqual(irq_runs[0]["status"], "interrupted")
+                self.assertEqual(irq_runs[0]["final_step"], 1)
+        finally:
+            TRACKER_STORE.clear(keep_active=False)
+
+    def test_tracker_http_routes_and_loss_tracker_node_registry_parity(self) -> None:
+        """
+        Verify `register_omni_lora_routes`, `_parse_cursors_param`, HTTP endpoints
+        (`/omni_lora/metrics`, `/omni_lora/checkpoint`, `/omni_lora/clear`),
+        `OmniLoRALossTracker.track()`, and `NODE_CLASS_MAPPINGS`/`NODE_DISPLAY_NAME_MAPPINGS`/
+        `node_list.json` registry parity.
+        """
+        import asyncio
+        import sys
+        from omni_lora.tracker_store import (
+            TRACKER_STORE,
+            _parse_cursors_param,
+            register_omni_lora_routes,
+        )
+
+        # 1. Registry parity across Python exports and node_list.json
+        node_list_path = Path(__file__).resolve().parent.parent / "node_list.json"
+        node_list_data = json.loads(node_list_path.read_text(encoding="utf-8"))
+        self.assertEqual(set(NODE_CLASS_MAPPINGS.keys()), set(NODE_DISPLAY_NAME_MAPPINGS.keys()))
+        self.assertEqual(set(NODE_CLASS_MAPPINGS.keys()), set(node_list_data.keys()))
+        self.assertEqual(len(NODE_CLASS_MAPPINGS), 6)
+
+        # 2. _parse_cursors_param edge cases
+        self.assertEqual(_parse_cursors_param(""), {})
+        self.assertEqual(_parse_cursors_param('{"run_1": 5, "run_2": -3}'), {"run_1": 5, "run_2": 0})
+        self.assertEqual(_parse_cursors_param("run_a:2, run_b:9, malformed, run_c:nope"), {"run_a": 2, "run_b": 9})
+
+        class _FakeRoutes:
+            def __init__(self) -> None:
+                self.handlers: Dict[Tuple[str, str], Any] = {}
+
+            def get(self, path: str) -> Any:
+                def _dec(fn: Any) -> Any:
+                    self.handlers[("GET", path)] = fn
+                    return fn
+                return _dec
+
+            def post(self, path: str) -> Any:
+                def _dec(fn: Any) -> Any:
+                    self.handlers[("POST", path)] = fn
+                    return fn
+                return _dec
+
+        class _FakeRequest:
+            def __init__(self, query: Optional[Dict[str, str]] = None, body: Optional[Dict[str, Any]] = None) -> None:
+                self.rel_url = types.SimpleNamespace(query=query or {})
+                self._body = body or {}
+
+            async def json(self) -> Dict[str, Any]:
+                return self._body
+
+        installed_stub_aiohttp = False
+        orig_aiohttp = sys.modules.get("aiohttp")
+        try:
+            try:
+                import aiohttp  # noqa: F401
+            except ImportError:
+                fake_web = types.ModuleType("aiohttp.web")
+
+                def _json_response(data: Any, headers: Optional[Dict[str, str]] = None) -> Any:
+                    return types.SimpleNamespace(status=200, text=json.dumps(data), headers=headers or {})
+
+                fake_web.json_response = _json_response  # type: ignore[attr-defined]
+                fake_aiohttp = types.ModuleType("aiohttp")
+                fake_aiohttp.web = fake_web  # type: ignore[attr-defined]
+                sys.modules["aiohttp"] = fake_aiohttp
+                installed_stub_aiohttp = True
+
+            TRACKER_STORE.clear(keep_active=False)
+            fake_server = types.SimpleNamespace(routes=_FakeRoutes())
+            self.assertTrue(register_omni_lora_routes(fake_server))
+            self.assertEqual(len(fake_server.routes.handlers), 3)
+            # Second registration short-circuits cleanly via _omni_lora_routes_registered
+            self.assertTrue(register_omni_lora_routes(fake_server))
+            self.assertEqual(len(fake_server.routes.handlers), 3)
+
+            TRACKER_STORE.start_run({"run_id": "run_done", "node_id": "n1", "max_steps": 3})
+            for s in (1, 2, 3):
+                TRACKER_STORE.record_step({"run_id": "run_done", "node_id": "n1", "step": s, "loss": 1.0 / s})
+            TRACKER_STORE.complete_run({"run_id": "run_done", "final_step": 3, "final_loss": 0.33})
+
+            TRACKER_STORE.start_run({"run_id": "run_act", "node_id": "n2", "max_steps": 5})
+            for s in (1, 2):
+                TRACKER_STORE.record_step({"run_id": "run_act", "node_id": "n2", "step": s, "loss": 0.5})
+
+            get_metrics = fake_server.routes.handlers[("GET", "/omni_lora/metrics")]
+            post_ckpt = fake_server.routes.handlers[("POST", "/omni_lora/checkpoint")]
+            post_clear = fake_server.routes.handlers[("POST", "/omni_lora/clear")]
+
+            # Cursor catch-up + node_id filtering + GET save_checkpoint
+            resp1 = asyncio.run(get_metrics(_FakeRequest(query={"cursors": "run_done:1,run_act:1"})))
+            data1 = json.loads(resp1.text)
+            by_id = {r["run_id"]: r for r in data1["runs"]}
+            self.assertEqual([pt["step"] for pt in by_id["run_done"]["steps"]], [2, 3])
+            self.assertEqual([pt["step"] for pt in by_id["run_act"]["steps"]], [2])
+
+            resp2 = asyncio.run(get_metrics(_FakeRequest(query={"node_id": "n1", "save_checkpoint": "1"})))
+            data2 = json.loads(resp2.text)
+            self.assertEqual([r["run_id"] for r in data2["runs"]], ["run_done"])
+            self.assertTrue(TRACKER_STORE.consume_checkpoint_request("n1"))
+
+            # POST checkpoint
+            resp3 = asyncio.run(post_ckpt(_FakeRequest(body={"node_id": "n2"})))
+            self.assertEqual(json.loads(resp3.text)["status"], "queued")
+            self.assertTrue(TRACKER_STORE.consume_checkpoint_request("n2"))
+
+            # OmniLoRALossTracker UI payload
+            tracker_ui = OmniLoRALossTracker().track(training_summary='{"steps": 3}')
+            self.assertEqual(tracker_ui["ui"]["summary"], ['{"steps": 3}'])
+            self.assertEqual(len(tracker_ui["ui"]["runs"]), 2)
+
+            # POST clear with keep_active=True deletes completed run only
+            resp4 = asyncio.run(post_clear(_FakeRequest(body={"keep_active": True})))
+            self.assertEqual(json.loads(resp4.text)["removed"], 1)
+            self.assertEqual([r["run_id"] for r in TRACKER_STORE.get_snapshot()["runs"]], ["run_act"])
+
+            # GET clear_runs=all removes active run too
+            resp5 = asyncio.run(get_metrics(_FakeRequest(query={"clear_runs": "all"})))
+            self.assertEqual(json.loads(resp5.text)["runs"], [])
+        finally:
+            TRACKER_STORE.clear(keep_active=False)
+            if installed_stub_aiohttp:
+                if orig_aiohttp is not None:
+                    sys.modules["aiohttp"] = orig_aiohttp
+                else:
+                    sys.modules.pop("aiohttp", None)
+
+    def test_target_module_filter_sentinels_implicit_resume_and_loader_save_formats(self) -> None:
+        """
+        Verify `enable_target_module_filter` False vs True, sentinel bypass, valid match vs
+        `ValueError` on miss, implicit `out_model._omni_lora_bundle` chained resumption,
+        `OmniLoRALoader('(none)')` error, `.pt` fallback round-trip, and `OmniLoRASave(append_step_count=True)`.
+        """
+        from omni_lora.nodes import CachedConditioningBundle
+
+        class _DualBlockBackbone(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.in_channels = 4
+                self.context_dim = 16
+                self.double_blocks = nn.ModuleList(
+                    [nn.ModuleDict({"attn": nn.Linear(4, 4), "mlp": nn.Linear(4, 4)}) for _ in range(2)]
+                )
+
+            def clone(self) -> "_DualBlockBackbone":
+                return copy.deepcopy(self)
+
+            def forward(self, x: torch.Tensor, timestep: Optional[torch.Tensor] = None, context: Optional[torch.Tensor] = None, **kwargs: Any) -> torch.Tensor:
+                h = x.movedim(1, -1)
+                for blk in self.double_blocks:
+                    h = blk["mlp"](blk["attn"](h))
+                return h.movedim(-1, 1)
+
+        bundle = CachedConditioningBundle(
+            batches=[{
+                "latents": torch.randn(1, 4, 8, 8),
+                "prompt_embeds": torch.randn(1, 4, 16),
+                "latent_scaled": True,
+            }],
+            resolution=64,
+            batch_size=1,
+            trigger_word="",
+            num_unique_images=1,
+            total_batches=1,
+            latent_scaled=True,
+        )
+        trainer = OmniLoRATrainer()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1. enable_target_module_filter=False ignores non-empty bogus filter
+            _, b_disabled, s_disabled = trainer.train_lora(
+                cached_data=bundle,
+                model=_DualBlockBackbone(),
+                backend="cpu",
+                precision="fp32",
+                rank=2,
+                alpha=2.0,
+                steps=1,
+                enable_target_module_filter=False,
+                target_module_filter="__bogus_ignored__",
+                custom_checkpoint_dir=tmpdir,
+                gradient_checkpointing=False,
+            )
+            sd_dis = json.loads(s_disabled)
+            self.assertEqual(sd_dis["target_module_filter"], "")
+            self.assertEqual(sd_dis["injected_layers"], 4)
+            self.assertTrue(any("attn" in k for k in b_disabled.state_dict))
+            self.assertTrue(any("mlp" in k for k in b_disabled.state_dict))
+
+            # 2. enable_target_module_filter=True ignores sentinel values ("*", "none", "0", "all")
+            for sentinel in ("*", "none", "0", "all"):
+                _, _, s_sent = trainer.train_lora(
+                    cached_data=bundle,
+                    model=_DualBlockBackbone(),
+                    backend="cpu",
+                    precision="fp32",
+                    rank=2,
+                    alpha=2.0,
+                    steps=1,
+                    enable_target_module_filter=True,
+                    target_module_filter=sentinel,
+                    custom_checkpoint_dir=tmpdir,
+                    gradient_checkpointing=False,
+                )
+                ps = json.loads(s_sent)
+                self.assertEqual(ps["target_module_filter"], "")
+                self.assertEqual(ps["injected_layers"], 4)
+
+            # 3. Valid filter restricts injected layers
+            _, b_attn, s_attn = trainer.train_lora(
+                cached_data=bundle,
+                model=_DualBlockBackbone(),
+                backend="cpu",
+                precision="fp32",
+                rank=4,
+                alpha=8.0,
+                steps=2,
+                enable_target_module_filter=True,
+                target_module_filter="attn",
+                custom_checkpoint_dir=tmpdir,
+                gradient_checkpointing=False,
+            )
+            sa = json.loads(s_attn)
+            self.assertEqual(sa["target_module_filter"], "attn")
+            self.assertEqual(sa["injected_layers"], 2)
+            self.assertTrue(all("attn" in k and "mlp" not in k for k in b_attn.state_dict))
+
+            # 4. Unmatched filter raises ValueError listing available top-level sub-networks
+            with self.assertRaises(ValueError) as ctx:
+                trainer.train_lora(
+                    cached_data=bundle,
+                    model=_DualBlockBackbone(),
+                    backend="cpu",
+                    precision="fp32",
+                    steps=1,
+                    enable_target_module_filter=True,
+                    target_module_filter="__unmatched_xyz__",
+                    custom_checkpoint_dir=tmpdir,
+                    gradient_checkpointing=False,
+                )
+            self.assertIn("Available top-level sub-networks", str(ctx.exception))
+
+            # 5. Implicit resumption via out_model._omni_lora_bundle WITHOUT initial_lora
+            out_m1, b1, _ = trainer.train_lora(
+                cached_data=bundle,
+                model=_DualBlockBackbone(),
+                backend="cpu",
+                precision="fp32",
+                rank=4,
+                alpha=8.0,
+                steps=2,
+                custom_checkpoint_dir=tmpdir,
+                gradient_checkpointing=False,
+            )
+            self.assertTrue(hasattr(out_m1, "_omni_lora_bundle"))
+            _, b2, sum2 = trainer.train_lora(
+                cached_data=bundle,
+                model=out_m1,
+                backend="cpu",
+                precision="fp32",
+                initial_lora=None,
+                rank=16,
+                alpha=32.0,
+                steps=3,
+                custom_checkpoint_dir=tmpdir,
+                gradient_checkpointing=False,
+            )
+            s2 = json.loads(sum2)
+            self.assertEqual(b2.rank, 4)
+            self.assertEqual(b2.alpha, 8.0)
+            self.assertEqual(b2.steps_trained, 5)
+            self.assertEqual(s2["cumulative_steps_trained"], 5)
+
+            # 6. OmniLoRALoader("(none)") error & .pt round-trip + OmniLoRASave(append_step_count=True)
+            loader = OmniLoRALoader()
+            with self.assertRaises(ValueError):
+                loader.load_lora("(none)")
+
+            pt_file = Path(tmpdir) / "legacy_bundle.pt"
+            torch.save(
+                {
+                    "state_dict": b2.state_dict,
+                    "metadata": {
+                        "omni_lora.rank": "4",
+                        "omni_lora.alpha": "8.0",
+                        "omni_lora.steps": "5",
+                        "omni_lora.trigger_word": "sks_tok",
+                    },
+                },
+                pt_file,
+            )
+            loaded_bundle, info_json = loader.load_lora("(none)", custom_lora_path=str(pt_file))
+            self.assertEqual(loaded_bundle.rank, 4)
+            self.assertEqual(loaded_bundle.alpha, 8.0)
+            self.assertEqual(loaded_bundle.steps_trained, 5)
+            self.assertEqual(loaded_bundle.trigger_word, "sks_tok")
+            self.assertEqual(set(loaded_bundle.state_dict.keys()), set(b2.state_dict.keys()))
+            self.assertEqual(json.loads(info_json)["detected_rank"], 4)
+
+            saved_bundle, fname, spath = OmniLoRASave().save_lora(
+                loaded_bundle,
+                output_lora_name="final_adapter",
+                append_step_count=True,
+                custom_output_dir=tmpdir,
+            )
+            self.assertIs(saved_bundle, loaded_bundle)
+            self.assertEqual(Path(fname).stem, "final_adapter_step_00005")
+            self.assertTrue(Path(spath).is_file())
+
+    def test_conv1d_conv3d_grouped_conv_uninject_and_nan_loss_abort(self) -> None:
+        """
+        Verify `Conv1d`, `Conv3d`, grouped `Conv2d` (`rank % groups == 0` vs `eff_groups=1` fallback),
+        5D/sequence conv reshape fallback, nested `Sequential`/`ModuleList`/`ModuleDict` `uninject()`,
+        `train_step` NaN loss abort preserving weights, `pipeline.save_checkpoint()`, and `clip_grad_norm_fp32_` on FP16.
+        """
+        # 1. Conv1d & Conv3d
+        c1 = nn.Conv1d(8, 12, kernel_size=3, padding=1)
+        l1 = LoRALinear(c1, rank=4, alpha=4.0, lora_dtype=torch.float32)
+        with torch.no_grad():
+            l1.lora_B.weight.fill_(0.1)
+        x1 = torch.randn(2, 8, 10, requires_grad=True)
+        y1 = l1(x1)
+        self.assertEqual(tuple(y1.shape), (2, 12, 10))
+        y1.sum().backward()
+        self.assertEqual(tuple(l1.lora_A.weight.grad.shape), (4, 8, 3))
+        self.assertEqual(tuple(l1.lora_B.weight.grad.shape), (12, 4, 1))
+
+        c3 = nn.Conv3d(4, 6, kernel_size=3, padding=1)
+        l3 = LoRALinear(c3, rank=2, alpha=2.0, lora_dtype=torch.float32)
+        with torch.no_grad():
+            l3.lora_B.weight.fill_(0.1)
+        x3 = torch.randn(1, 4, 3, 5, 5, requires_grad=True)
+        y3 = l3(x3)
+        self.assertEqual(tuple(y3.shape), (1, 6, 3, 5, 5))
+        y3.sum().backward()
+        self.assertIsNotNone(l3.lora_A.weight.grad)
+
+        # 2. Grouped Conv2d: divisible vs non-divisible fallback
+        cg = nn.Conv2d(8, 10, kernel_size=3, padding=1, groups=2)
+        lg_div = LoRALinear(cg, rank=4, alpha=4.0, lora_dtype=torch.float32)
+        self.assertEqual(lg_div.lora_A.groups, 2)
+        self.assertEqual(tuple(lg_div.lora_A.weight.shape), (4, 4, 3, 3))
+        yg_div = lg_div(torch.randn(2, 8, 6, 6))
+        self.assertEqual(tuple(yg_div.shape), (2, 10, 6, 6))
+        yg_div.sum().backward()
+
+        lg_fb = LoRALinear(cg, rank=3, alpha=3.0, lora_dtype=torch.float32)
+        self.assertEqual(lg_fb.lora_A.groups, 1)
+        self.assertEqual(tuple(lg_fb.lora_A.weight.shape), (3, 8, 3, 3))
+        yg_fb = lg_fb(torch.randn(2, 8, 6, 6))
+        self.assertEqual(tuple(yg_fb.shape), (2, 10, 6, 6))
+        yg_fb.sum().backward()
+
+        # 3. Channel-last reshape fallback when x.ndim != lora_A.weight.ndim on pointwise Conv2d
+        class _PointwiseNdStub(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.in_channels = 4
+                self.out_channels = 6
+                self.kernel_size = (1, 1)
+                self.weight = nn.Parameter(torch.zeros(6, 4, 1, 1))
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return torch.zeros(x.shape[0], 6, *x.shape[2:], device=x.device, dtype=x.dtype)
+
+        l_perm = LoRALinear(_PointwiseNdStub(), rank=2, alpha=2.0, lora_dtype=torch.float32)
+        with torch.no_grad():
+            l_perm.lora_B.weight.fill_(0.25)
+        y_perm = l_perm(torch.randn(2, 4, 2, 3, 3))
+        self.assertEqual(tuple(y_perm.shape), (2, 6, 2, 3, 3))
+        self.assertGreater(float(y_perm.abs().sum().item()), 0.0)
+        y_perm.sum().backward()
+        self.assertIsNotNone(l_perm.lora_A.weight.grad)
+        self.assertIsNotNone(l_perm.lora_B.weight.grad)
+
+        # 4. Nested Sequential + ModuleList + ModuleDict injection and exact uninject() restoration
+        orig_seq0 = nn.Linear(8, 8)
+        orig_list0 = nn.Linear(8, 8)
+        orig_dict_proj = nn.Linear(8, 8)
+
+        class _NestedContainers(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.seq = nn.Sequential(orig_seq0, nn.ReLU())
+                self.mlist = nn.ModuleList([orig_list0])
+                self.mdict = nn.ModuleDict({"proj": orig_dict_proj})
+
+        nested = _NestedContainers()
+        inj = LoRAInjector.inject(
+            nested,
+            LoRAConfig(rank=2, alpha=2.0, target_modules=("seq.0", "mlist.0", "mdict.proj")),
+            lora_dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(len(inj), 3)
+        self.assertIsInstance(nested.seq[0], LoRALinear)
+        self.assertIsInstance(nested.mlist[0], LoRALinear)
+        self.assertIsInstance(nested.mdict["proj"], LoRALinear)
+        restored = LoRAInjector.uninject(nested)
+        self.assertEqual(restored, 3)
+        self.assertIs(nested.seq[0], orig_seq0)
+        self.assertIs(nested.mlist[0], orig_list0)
+        self.assertIs(nested.mdict["proj"], orig_dict_proj)
+
+        # 5. train_step NaN loss abort preserves weights + save_checkpoint()
+        class _NaNProbeAdapter(ComfyModelAdapter):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                self.emit_nan = False
+
+            def compute_training_loss(self, backbone: nn.Module, batch: Dict[str, Any], device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+                out = backbone(batch["latents"].to(device=device, dtype=dtype))
+                loss = (out ** 2).mean()
+                self.last_timestep = 0.5
+                if self.emit_nan:
+                    return loss * float("nan")
+                return loss
+
+        class _SimpleProj(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.in_channels = 4
+                self.proj = nn.Linear(4, 4)
+
+            def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+                return self.proj(x)
+
+        bb_nan = _SimpleProj()
+        plan = detect_and_configure(preferred_backend="cpu", requested_dtype="fp32", allow_fallback=True)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nan_adapter = _NaNProbeAdapter(model_id="flux_dev", comfy_model=bb_nan)
+            pipe = LoRATrainingPipeline(
+                backend=plan.backend,
+                model_adapter=nan_adapter,
+                config=TrainingConfig(
+                    output_dir=tmpdir,
+                    backend="cpu",
+                    dtype="fp32",
+                    gradient_checkpointing=False,
+                    max_train_steps=4,
+                    lora=LoRAConfig(rank=2, alpha=2.0, lora_dtype="fp32", target_modules=("proj",)),
+                ),
+            )
+            try:
+                pipe.setup(external_backbone=bb_nan)
+                with torch.no_grad():
+                    bb_nan.proj.lora_B.weight.fill_(0.2)
+                w_a_before = bb_nan.proj.lora_A.weight.detach().clone()
+                w_b_before = bb_nan.proj.lora_B.weight.detach().clone()
+
+                nan_adapter.emit_nan = True
+                with self.assertRaises(RuntimeError) as nan_ctx:
+                    pipe.train_step(1, batch={"latents": torch.ones(1, 4)})
+                self.assertIn("non-finite", str(nan_ctx.exception).lower())
+                self.assertTrue(torch.equal(bb_nan.proj.lora_A.weight, w_a_before))
+                self.assertTrue(torch.equal(bb_nan.proj.lora_B.weight, w_b_before))
+                self.assertIsNone(bb_nan.proj.lora_A.weight.grad)
+
+                ckpt_path = pipe.save_checkpoint(step=3)
+                self.assertTrue(ckpt_path.is_file())
+                loaded_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+                self.assertEqual(loaded_ckpt["step"], 3)
+                self.assertEqual(loaded_ckpt["rank"], 2)
+                self.assertIn("state_dict", loaded_ckpt)
+            finally:
+                pipe.cleanup()
+
+        # 6. clip_grad_norm_fp32_ avoids float16 norm overflow on 65000.0 gradients
+        p_fp16 = nn.Parameter(torch.zeros((4, 4), dtype=torch.float16))
+        p_fp16.grad = torch.full((4, 4), 65000.0, dtype=torch.float16)
+        raw_norm = LoRATrainingPipeline.clip_grad_norm_fp32_([p_fp16], max_norm=1.0)
+        self.assertTrue(math.isfinite(raw_norm))
+        self.assertGreater(raw_norm, 200000.0)
+        clipped_norm = float(p_fp16.grad.float().norm().item())
+        self.assertTrue(math.isfinite(clipped_norm))
+        self.assertLessEqual(clipped_norm, 1.05)
+
+    def test_grad_scaler_state_machine_and_fp32_optimizer_branches(self) -> None:
+        """
+        Verify `FP32GradScaler` overflow backoff/skip/growth/cap/disabled modes,
+        `PureFP32Adafactor` factored (2D) & unfactored (1D) updates, and `_fp32_master_step`
+        branches for `radamw` (`warmup_steps=0` vs `>0`), `adam`, and `sgd`.
+        """
+        from omni_lora.backends.base import FP32GradScaler
+
+        # 1. FP32GradScaler state machine
+        scaler = FP32GradScaler(init_scale=8.0, growth_factor=2.0, backoff_factor=0.5, growth_interval=2, enabled=True)
+        p_s = nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.float16))
+        opt_s = torch.optim.SGD([p_s], lr=0.1)
+
+        loss_f32 = scaler.scale(torch.tensor(0.5, dtype=torch.float16))
+        self.assertEqual(loss_f32.dtype, torch.float32)
+        self.assertAlmostEqual(float(loss_f32.item()), 4.0, places=5)
+
+        # Overflow step: skips optimizer.step() & backs off scale 8.0 -> 4.0
+        p_before = p_s.detach().clone()
+        p_s.grad = torch.tensor([float("inf"), 8.0], dtype=torch.float16)
+        scaler.unscale_(opt_s)
+        scaler.step(opt_s)
+        scaler.update()
+        self.assertTrue(torch.equal(p_s, p_before))
+        self.assertEqual(scaler.get_scale(), 4.0)
+
+        # Two consecutive finite steps grow scale 4.0 -> 8.0
+        for expected_scale in (4.0, 8.0):
+            p_s.grad = torch.tensor([4.0, 4.0], dtype=torch.float16)
+            scaler.unscale_(opt_s)
+            scaler.step(opt_s)
+            scaler.update()
+            self.assertEqual(scaler.get_scale(), expected_scale)
+
+        # Cap at 32768.0
+        scaler.update(new_scale=32768.0)
+        for _ in range(2):
+            p_s.grad = torch.tensor([4.0, 4.0], dtype=torch.float16)
+            scaler.unscale_(opt_s)
+            scaler.step(opt_s)
+            scaler.update()
+        self.assertEqual(scaler.get_scale(), 32768.0)
+
+        # Disabled scaler pass-through
+        dis = FP32GradScaler(init_scale=8.0, enabled=False)
+        self.assertEqual(dis.get_scale(), 1.0)
+        p_d = nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+        opt_d = torch.optim.SGD([p_d], lr=0.1)
+        p_d.grad = torch.tensor([2.0], dtype=torch.float32)
+        dis.step(opt_d)
+        self.assertAlmostEqual(float(p_d.item()), 0.8, places=5)
+
+        # 2. PureFP32Adafactor (2D factored + 1D unfactored) and _fp32_master_step branches
+        plan = detect_and_configure(preferred_backend="cpu", requested_dtype="fp32", allow_fallback=True)
+        dummy_adapter = ComfyModelAdapter(model_id="flux_dev", comfy_model=nn.Linear(4, 4))
+
+        pipe_ada = LoRATrainingPipeline(
+            backend=plan.backend,
+            model_adapter=dummy_adapter,
+            config=TrainingConfig(backend="cpu", dtype="fp32", optimizer_type="adafactor", learning_rate=1e-2, weight_decay=1e-2),
+        )
+        p2d = nn.Parameter(torch.randn(4, 4, dtype=torch.float16))
+        p1d = nn.Parameter(torch.randn(4, dtype=torch.bfloat16))
+        opt_ada = pipe_ada._build_fp32_safe_optimizer([p2d, p1d])
+        for _ in range(2):
+            p2d.grad = torch.ones_like(p2d) * 0.2
+            p1d.grad = torch.ones_like(p1d) * 0.2
+            opt_ada.step()
+        self.assertIn("exp_avg_sq_row", opt_ada.state[p2d])
+        self.assertIn("exp_avg_sq_col", opt_ada.state[p2d])
+        self.assertEqual(opt_ada.state[p2d]["exp_avg_sq_row"].dtype, torch.float32)
+        self.assertIn("exp_avg_sq", opt_ada.state[p1d])
+        self.assertEqual(opt_ada.state[p1d]["exp_avg_sq"].dtype, torch.float32)
+        self.assertTrue(torch.isfinite(p2d.float()).all())
+        self.assertTrue(torch.isfinite(p1d.float()).all())
+
+        # _fp32_master_step for radamw (warmup=0 vs warmup=10), adam, sgd on fp16
+        for opt_name, w_steps in (("radamw", 0), ("radamw", 10), ("adam", 0), ("sgd", 0)):
+            p_fp16 = nn.Parameter(torch.ones((3, 3), dtype=torch.float16))
+            p_init = p_fp16.detach().clone()
+            pipe_opt = LoRATrainingPipeline(
+                backend=plan.backend,
+                model_adapter=dummy_adapter,
+                config=TrainingConfig(
+                    backend="cpu",
+                    dtype="fp32",
+                    optimizer_type=opt_name,
+                    learning_rate=1e-2,
+                    warmup_steps=w_steps,
+                    weight_decay=1e-2,
+                ),
+            )
+            opt = pipe_opt._build_fp32_safe_optimizer([p_fp16])
+            for _ in range(6):
+                p_fp16.grad = torch.full_like(p_fp16, 0.25)
+                opt.step()
+            st = opt.state[p_fp16]
+            self.assertEqual(st["master_param"].dtype, torch.float32)
+            if opt_name == "sgd":
+                self.assertEqual(st["momentum_buffer"].dtype, torch.float32)
+            else:
+                self.assertEqual(st["exp_avg"].dtype, torch.float32)
+                self.assertEqual(st["exp_avg_sq"].dtype, torch.float32)
+            self.assertEqual(p_fp16.dtype, torch.float16)
+            self.assertTrue(torch.isfinite(p_fp16.float()).all())
+            self.assertFalse(torch.equal(p_fp16, p_init))
+
+    def test_backend_quantization_turing_fp16_and_dataset_edge_cases(self) -> None:
+        """
+        Verify `quantize_weight_fp8_or_int8` (INT8 & FP8 fallback), high `reserve_vram_gb` offload,
+        invalid backend graceful fallback, mocked pre-Ampere Turing `sm_75` (`fp16` + GradScaler),
+        dataset caption precedence, direct `control_images` batch=1 broadcast, all-zero `MASK` ignored,
+        `num_repeats > 1`, and `release_pixel_memory()` -> `_ensure_pixel_values_loaded()` reload.
+        """
+        import unittest.mock
+        from PIL import Image
+        from omni_lora.backends import CUDABackend, quantize_weight_fp8_or_int8
+
+        # 1. quantize_weight_fp8_or_int8
+        w = torch.linspace(-2.0, 2.0, 32, dtype=torch.float32).reshape(4, 8)
+        q_i8, sc_i8 = quantize_weight_fp8_or_int8(w, mode="int8_qlora", dest_device=torch.device("cpu"))
+        self.assertEqual(q_i8.dtype, torch.int8)
+        self.assertEqual(sc_i8.dtype, torch.float32)
+        recon = q_i8.float() * sc_i8
+        self.assertLess(float((recon - w).abs().max().item()), 0.05)
+
+        # supports_fp8=False forces clean fallback to INT8
+        q_fb, _ = quantize_weight_fp8_or_int8(w, mode="fp8_e4m3fn", dest_device=torch.device("cpu"), supports_fp8=False)
+        self.assertEqual(q_fb.dtype, torch.int8)
+
+        # When torch exposes float8_e4m3fn, mode="fp8_e4m3fn" succeeds (FP8 or INT8 fallback cleanly)
+        if hasattr(torch, "float8_e4m3fn"):
+            q_fp8, sc_fp8 = quantize_weight_fp8_or_int8(w, mode="fp8_e4m3fn", dest_device=torch.device("cpu"), supports_fp8=True)
+            self.assertIn(q_fp8.dtype, (torch.float8_e4m3fn, torch.int8))
+            self.assertEqual(sc_fp8.dtype, torch.float32)
+
+        # 2. Invalid backend graceful fallback & high reserve_vram_gb budget offload
+        fb_backend = resolve_backend(preferred="__nonexistent_accel__", allow_fallback=True)
+        self.assertIsNotNone(fb_backend)
+
+        cuda_offline = CUDABackend(device_index=0, dtype="bf16")
+        with unittest.mock.patch.object(CUDABackend, "is_available", return_value=False):
+            high_res_budget = cuda_offline.compute_vram_budget(reserve_vram_gb=100.0)
+        self.assertEqual(high_res_budget["max_resident_model_mb"], 0.0)
+        self.assertEqual(high_res_budget["offload_ckpt_inputs"], 1.0)
+
+        # 3. Mocked Turing sm_75 (major=7 < 8) selects fp16 + GradScaler
+        turing_props = types.SimpleNamespace(major=7, minor=5, name="Tesla T4", total_memory=16 * 1024**3)
+        with (
+            unittest.mock.patch.object(CUDABackend, "is_available", return_value=True),
+            unittest.mock.patch.object(torch.cuda, "device_count", return_value=1),
+            unittest.mock.patch.object(torch.cuda, "get_device_properties", return_value=turing_props),
+            unittest.mock.patch("omni_lora.backends.cuda.probe_device_fp8_support", return_value=False),
+            unittest.mock.patch.object(torch.cuda, "set_device", return_value=None),
+        ):
+            turing_plan = detect_and_configure(preferred_backend="cuda", requested_dtype="auto", allow_fallback=False)
+        self.assertEqual(turing_plan.backend.backend_id, "cuda")
+        self.assertFalse(turing_plan.capabilities.supports_bf16)
+        self.assertEqual(turing_plan.resolved_dtype, "fp16")
+        self.assertTrue(turing_plan.requires_grad_scaler)
+
+        # 4. Dataset edge cases
+        loader = OmniLoRADatasetLoader()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            for name, color in (("a.png", (200, 0, 0)), ("b.png", (0, 200, 0)), ("c.png", (0, 0, 200)), ("d.png", (120, 120, 120))):
+                Image.new("RGB", (64, 64), color).save(d / name)
+            # Precedence: .txt > .caption > captions.json > default_caption
+            (d / "a.txt").write_text("from txt", encoding="utf-8")
+            (d / "a.caption").write_text("from caption", encoding="utf-8")
+            (d / "b.caption").write_text("from caption", encoding="utf-8")
+            (d / "captions.json").write_text(
+                json.dumps({"a.png": "from json", "b.png": "from json", "c.png": "from json"}),
+                encoding="utf-8",
+            )
+            ds_disk, _ = loader.load_dataset(
+                dataset_path=str(d),
+                trigger_word="",
+                default_caption="default cap",
+                resolution=64,
+                batch_size=2,
+                num_repeats=3,
+                center_crop=True,
+                aspect_ratio_bucketing=False,
+                random_flip=False,
+                caption_dropout=0.0,
+            )
+            caps_by_name = {s.source_name: s.caption for s in ds_disk.samples}
+            self.assertEqual(caps_by_name["a.png"], "from txt")
+            self.assertEqual(caps_by_name["b.png"], "from caption")
+            self.assertEqual(caps_by_name["c.png"], "from json")
+            self.assertEqual(caps_by_name["d.png"], "default cap")
+            self.assertEqual(ds_disk.total_effective_samples, 12)
+            pix_batches, _ = ds_disk.build_batches()
+            self.assertEqual(len(pix_batches), 6)
+
+        # Direct control_images batch=1 broadcast + all-zero MASK ignored + memory release/reload
+        imgs = torch.rand(3, 64, 64, 3, dtype=torch.float32)
+        ctrl1 = torch.rand(1, 64, 64, 3, dtype=torch.float32)
+        zero_masks = torch.zeros(3, 64, 64, dtype=torch.float32)
+        ds_mem, info_mem = loader.load_dataset(
+            dataset_path="",
+            trigger_word="",
+            default_caption="edit",
+            resolution=64,
+            batch_size=1,
+            num_repeats=1,
+            center_crop=True,
+            aspect_ratio_bucketing=False,
+            random_flip=False,
+            caption_dropout=0.0,
+            images=imgs,
+            masks=zero_masks,
+            control_images=ctrl1,
+        )
+        self.assertEqual(json.loads(info_mem)["masked_images"], 0)
+        self.assertTrue(all(s.has_control and s.control_source_name == "comfy_control_000" for s in ds_mem.samples))
+        ds_mem.release_pixel_memory()
+        self.assertEqual(ds_mem.samples[0].pixel_values.numel(), 0)
+        ds_mem._ensure_pixel_values_loaded()
+        self.assertEqual(tuple(ds_mem.samples[0].pixel_values.shape), (3, 64, 64))
+
+    def test_tracker_multi_node_checkpoint_queue_and_readonly_fallback(self) -> None:
+        import os
+        import unittest.mock
+        from omni_lora.tracker_store import OmniLoRATelemetryStore, _default_state_file
+
+        # 1. Per-node checkpoint requests must not overwrite each other
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "tracker_state.json"
+            store = OmniLoRATelemetryStore(state_file=state_path)
+            store.request_checkpoint("node_A")
+            store.request_checkpoint("node_B")
+            self.assertFalse(store.consume_checkpoint_request("node_C"))
+            self.assertTrue(store.consume_checkpoint_request("node_B"))
+            self.assertFalse(store.consume_checkpoint_request("node_B"))
+            self.assertTrue(store.consume_checkpoint_request("node_A"))
+            self.assertFalse(store.consume_checkpoint_request("node_A"))
+
+            # Wildcard request can be consumed by any node, and empty node_id drains queued node requests
+            store.request_checkpoint(None)
+            self.assertTrue(store.consume_checkpoint_request("node_Z"))
+            self.assertFalse(store.consume_checkpoint_request("node_Z"))
+            store.request_checkpoint("node_X")
+            self.assertTrue(store.consume_checkpoint_request(None))
+            self.assertFalse(store.consume_checkpoint_request("node_X"))
+
+        # 2. _default_state_file() honors OMNI_LORA_TRACKER_STATE_FILE and falls back to tempdir when readonly
+        with tempfile.TemporaryDirectory() as tmpdir:
+            override_path = str(Path(tmpdir) / "custom_tracker.json")
+            with unittest.mock.patch.dict(os.environ, {"OMNI_LORA_TRACKER_STATE_FILE": override_path}):
+                self.assertEqual(_default_state_file(), Path(override_path))
+            with (
+                unittest.mock.patch.dict(os.environ, {}, clear=False),
+                unittest.mock.patch("os.access", return_value=False),
+            ):
+                os.environ.pop("OMNI_LORA_TRACKER_STATE_FILE", None)
+                self.assertEqual(
+                    _default_state_file(),
+                    Path(tempfile.gettempdir()) / "omni_lora_tracker_runs.json",
+                )
+
+            # 3. Non-explicit state_file init must not eagerly write an empty JSON file
+            lazy_path = Path(tmpdir) / "lazy_default.json"
+            with unittest.mock.patch.dict(os.environ, {"OMNI_LORA_TRACKER_STATE_FILE": str(lazy_path)}):
+                lazy_store = OmniLoRATelemetryStore(state_file=None)
+            self.assertFalse(lazy_path.exists())
+            lazy_store.start_run({"run_id": "run_1", "max_steps": 5})
+            self.assertTrue(lazy_path.exists())
+
+            # 4. Failed _flush_to_disk cleans temporary file and emits warning once until recovery
+            with unittest.mock.patch("os.replace", side_effect=PermissionError("readonly")):
+                with self.assertLogs(level="WARNING") as cm:
+                    lazy_store.record_step({"run_id": "run_1", "step": 1, "loss": 0.5})
+                    lazy_store._flush_to_disk(force=True)
+                    lazy_store._flush_to_disk(force=True)
+                warn_msgs = [m for m in cm.output if "Could not persist telemetry cache" in m]
+                self.assertEqual(len(warn_msgs), 1)
+                self.assertFalse(lazy_path.with_suffix(".tmp").exists())
+            lazy_store._flush_to_disk(force=True)
+            self.assertFalse(lazy_store._flush_warned)
+
+    def test_uninstall_comfy_runtime_hooks_round_trip(self) -> None:
+        import sys
+
+        uninstall_comfy_runtime_hooks()
+        orig_f_rms = getattr(F, "rms_norm", None)
+        orig_f_unshuffle = getattr(F, "pixel_unshuffle", None)
+        orig_f_shuffle = getattr(F, "pixel_shuffle", None)
+        orig_f_conv3d = getattr(F, "conv3d", None)
+        orig_t_rms = getattr(torch, "rms_norm", None)
+
+        def _stub_adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+            return x
+
+        fake_ck = types.ModuleType("comfy_kitchen")
+        fake_ck.adaln = _stub_adaln  # type: ignore[attr-defined]
+        prev_ck = sys.modules.get("comfy_kitchen")
+        sys.modules["comfy_kitchen"] = fake_ck
+        try:
+            install_comfy_runtime_hooks()
+            if orig_f_unshuffle is not None:
+                self.assertTrue(getattr(F.pixel_unshuffle, "_omni_dml_safe", False))
+            self.assertTrue(getattr(fake_ck.adaln, "_omni_train_safe", False))
+            self.assertTrue(hasattr(fake_ck, "_omni_orig_adaln"))
+
+            # Uninstall must restore native callables and clean up stashed markers cleanly & idempotently
+            uninstall_comfy_runtime_hooks()
+            uninstall_comfy_runtime_hooks()
+
+            if orig_f_rms is not None:
+                self.assertIs(F.rms_norm, orig_f_rms)
+                self.assertFalse(hasattr(F, "_omni_orig_rms_norm"))
+            if orig_f_unshuffle is not None:
+                self.assertIs(F.pixel_unshuffle, orig_f_unshuffle)
+                self.assertFalse(hasattr(F, "_omni_orig_pixel_unshuffle"))
+            if orig_f_shuffle is not None:
+                self.assertIs(F.pixel_shuffle, orig_f_shuffle)
+                self.assertFalse(hasattr(F, "_omni_orig_pixel_shuffle"))
+            if orig_f_conv3d is not None:
+                self.assertIs(F.conv3d, orig_f_conv3d)
+                self.assertFalse(hasattr(F, "_omni_orig_conv3d"))
+            if orig_t_rms is not None:
+                self.assertIs(torch.rms_norm, orig_t_rms)
+                self.assertFalse(hasattr(torch, "_omni_orig_rms_norm"))
+            self.assertIs(fake_ck.adaln, _stub_adaln)
+            self.assertFalse(hasattr(fake_ck, "_omni_orig_adaln"))
+
+            # Re-installing must re-arm hooks without error
+            install_comfy_runtime_hooks()
+            self.assertTrue(getattr(fake_ck.adaln, "_omni_train_safe", False))
+            uninstall_comfy_runtime_hooks()
+        finally:
+            if prev_ck is None:
+                sys.modules.pop("comfy_kitchen", None)
+            else:
+                sys.modules["comfy_kitchen"] = prev_ck
+            install_comfy_runtime_hooks()
+
+    def test_example_workflows_and_version_metadata_parity(self) -> None:
+        """All shipped example workflows must match current node INPUT_TYPES/RETURN_TYPES and version metadata must align."""
+        import re
+        import omni_lora
+
+        root = Path(__file__).resolve().parent.parent
+        pyproject_text = (root / "pyproject.toml").read_text(encoding="utf-8")
+        m_ver = re.search(r'^version\s*=\s*"([^"]+)"', pyproject_text, re.MULTILINE)
+        self.assertIsNotNone(m_ver, "pyproject.toml must declare version")
+        assert m_ver is not None
+        self.assertEqual(omni_lora.__version__, m_ver.group(1))
+
+        wf_dir = root / "example_workflows"
+        wf_files = sorted(wf_dir.glob("*.json"))
+        self.assertGreaterEqual(len(wf_files), 6)
+
+        link_only_types = {
+            "MODEL",
+            "OMNILORA_DATASET",
+            "OMNILORA_CACHED_DATA",
+            "OMNILORA_NETWORK",
+            "VAE",
+            "CLIP",
+            "IMAGE",
+            "MASK",
+        }
+        expected_nodes: Dict[str, Dict[str, Any]] = {}
+        for node_name, node_cls in NODE_CLASS_MAPPINGS.items():
+            inp_spec = node_cls.INPUT_TYPES()
+            all_inputs: Dict[str, Any] = {}
+            all_inputs.update(inp_spec.get("required", {}))
+            all_inputs.update(inp_spec.get("optional", {}))
+
+            link_inputs: List[str] = []
+            widget_count = 0
+            for inp_name, spec in all_inputs.items():
+                dtype_or_choices = spec[0]
+                meta = spec[1] if len(spec) > 1 and isinstance(spec[1], dict) else {}
+                if meta.get("forceInput") or (isinstance(dtype_or_choices, str) and dtype_or_choices in link_only_types):
+                    link_inputs.append(inp_name)
+                else:
+                    widget_count += 1
+                    if inp_name == "seed":
+                        # ComfyUI LiteGraph automatically appends control_after_generate after seed
+                        widget_count += 1
+
+            expected_nodes[node_name] = {
+                "link_inputs": link_inputs,
+                "outputs": list(getattr(node_cls, "RETURN_TYPES", ())),
+                "widget_count": widget_count,
+            }
+
+        for wf_path in wf_files:
+            wf = json.loads(wf_path.read_text(encoding="utf-8"))
+            nodes_by_id = {n["id"]: n for n in wf.get("nodes", [])}
+            links_by_id = {l[0]: l for l in wf.get("links", [])}
+            for node in wf.get("nodes", []):
+                ntype = node.get("type", "")
+                if ntype in expected_nodes:
+                    spec = expected_nodes[ntype]
+                    actual_inputs = [i["name"] for i in node.get("inputs", [])]
+                    self.assertEqual(
+                        actual_inputs,
+                        spec["link_inputs"],
+                        f"{wf_path.name} node #{node['id']} ({ntype}) inputs stale: {actual_inputs} != {spec['link_inputs']}",
+                    )
+                    actual_outputs = [o["type"] for o in node.get("outputs", [])]
+                    self.assertEqual(
+                        actual_outputs,
+                        spec["outputs"],
+                        f"{wf_path.name} node #{node['id']} ({ntype}) outputs stale: {actual_outputs} != {spec['outputs']}",
+                    )
+                    actual_widgets = node.get("widgets_values", [])
+                    self.assertEqual(
+                        len(actual_widgets),
+                        spec["widget_count"],
+                        f"{wf_path.name} node #{node['id']} ({ntype}) widget count stale: {len(actual_widgets)} != {spec['widget_count']}",
+                    )
+            for lid, (_, src_id, src_slot, dst_id, dst_slot, ltype) in links_by_id.items():
+                self.assertIn(lid, nodes_by_id[src_id]["outputs"][src_slot]["links"], f"{wf_path.name} link {lid}")
+                self.assertEqual(nodes_by_id[dst_id]["inputs"][dst_slot]["link"], lid, f"{wf_path.name} link {lid}")
+                self.assertEqual(nodes_by_id[src_id]["outputs"][src_slot]["type"], ltype, f"{wf_path.name} link {lid}")
+                self.assertEqual(nodes_by_id[dst_id]["inputs"][dst_slot]["type"], ltype, f"{wf_path.name} link {lid}")
+
+
+    def test_fp16_autocast_preserves_non_differentiable_fp32_mrope_and_sdpa_mask(self) -> None:
+        """
+        Regression test for Ideogram 4 CUDA FP16 step-1 NaN:
+        1. Non-differentiable FP32 matmul / `@` / `torch.einsum` with coordinates exceeding
+           FP16 max (`IMAGE_POSITION_OFFSET = 65536 > 65504.0`) must remain in FP32 under
+           FP16 autocast so `cos`/`sin` stay 100% finite.
+        2. Differentiable FP32 matmul operands (`requires_grad=True`) must not be exempted.
+        3. Exiting `_scoped_training_op_wrappers()` must cleanly restore `torch.einsum` and
+           `torch.Tensor.__matmul__` with no leftover wrapper entries in `torch.Tensor.__dict__`.
+        4. `_wrapped_sdpa` must clamp large finite negative FP32 additive masks (`-1e9`) to
+           finite FP16 values instead of overflowing them to `-inf`, while preserving `-inf`.
+        """
+        from omni_lora.pipelines.lora_trainer import (
+            _scoped_training_op_wrappers,
+            _should_keep_fp32_under_fp16_autocast,
+        )
+
+        had_matmul_in_dict = "__matmul__" in torch.Tensor.__dict__
+
+        # 1. Verify FP32 autocast guard decision helper on CPU/GPU without requiring CUDA hardware
+        inv_freq = torch.tensor([[[1.0], [1e-4]]], dtype=torch.float32)  # [1, 2, 1]
+        pos_ids = torch.tensor([[[0.0, 65536.0, 65537.0]]], dtype=torch.float32)  # > 65504 fp16 max
+        diff_x = torch.randn(1, 2, 3, dtype=torch.float32, requires_grad=True)
+        fp16_x = torch.randn(1, 2, 3, dtype=torch.float16)
+
+        with mock.patch.object(torch, "is_autocast_enabled", return_value=True), mock.patch.object(
+            torch, "get_autocast_dtype", return_value=torch.float16
+        ):
+            self.assertEqual(_should_keep_fp32_under_fp16_autocast((inv_freq, pos_ids)), "cpu")
+            self.assertIsNone(_should_keep_fp32_under_fp16_autocast((diff_x, pos_ids)))
+            self.assertIsNone(_should_keep_fp32_under_fp16_autocast((fp16_x, pos_ids)))
+
+        with mock.patch.object(torch, "is_autocast_enabled", return_value=True), mock.patch.object(
+            torch, "get_autocast_dtype", return_value=torch.bfloat16
+        ):
+            self.assertIsNone(_should_keep_fp32_under_fp16_autocast((inv_freq, pos_ids)))
+
+        # 2. Verify live execution under FP16 autocast (CUDA if available, else CPU if supported)
+        ac_dev = "cuda" if torch.cuda.is_available() else "cpu"
+        inv_dev = inv_freq.to(ac_dev)
+        pos_dev = pos_ids.to(ac_dev)
+
+        fp16_ac_supported = True
+        try:
+            with torch.amp.autocast(device_type=ac_dev, dtype=torch.float16, enabled=True):
+                _ = torch.matmul(inv_dev, pos_dev)
+        except Exception:
+            fp16_ac_supported = False
+
+        with _scoped_training_op_wrappers():
+            self.assertTrue(getattr(torch.einsum, "_omni_fp32_autocast_safe", False))
+            self.assertTrue(getattr(torch.Tensor.__matmul__, "_omni_fp32_autocast_safe", False))
+
+            if fp16_ac_supported:
+                with torch.amp.autocast(device_type=ac_dev, dtype=torch.float16, enabled=True):
+                    freqs_at = inv_dev @ pos_dev
+                    freqs_mm = torch.matmul(inv_dev, pos_dev)
+                    freqs_ein = torch.einsum("bik,bkj->bij", inv_dev, pos_dev)
+                    for freqs in (freqs_at, freqs_mm, freqs_ein):
+                        self.assertEqual(freqs.dtype, torch.float32)
+                        self.assertTrue(bool(torch.isfinite(freqs).all()))
+                        self.assertTrue(bool(torch.isfinite(freqs.cos()).all()))
+                        self.assertTrue(bool(torch.isfinite(freqs.sin()).all()))
+
+            # 3. Verify `_wrapped_sdpa` clamps finite -1e9 FP32 mask cleanly to finite FP16
+            #    so a fully-padded query row produces finite attention outputs instead of NaN
+            q = torch.randn(1, 2, 4, 16, dtype=torch.float32, device=ac_dev)
+            k = torch.randn(1, 2, 4, 16, dtype=torch.float16, device=ac_dev)
+            v = torch.randn(1, 2, 4, 16, dtype=torch.float16, device=ac_dev)
+            raw_mask = torch.full((1, 1, 4, 4), -1e9, dtype=torch.float32, device=ac_dev)
+            with mock.patch.object(torch, "is_autocast_enabled", return_value=True), mock.patch.object(
+                torch, "get_autocast_dtype", return_value=torch.float16
+            ):
+                sdpa_out = F.scaled_dot_product_attention(q, k, v, attn_mask=raw_mask)
+            self.assertEqual(sdpa_out.dtype, torch.float16)
+            self.assertTrue(bool(torch.isfinite(sdpa_out).all()))
+
+        # 4. Verify complete teardown after exiting `_scoped_training_op_wrappers()`
+        self.assertFalse(getattr(torch.einsum, "_omni_fp32_autocast_safe", False))
+        self.assertFalse(getattr(torch.Tensor.__matmul__, "_omni_fp32_autocast_safe", False))
+        self.assertEqual("__matmul__" in torch.Tensor.__dict__, had_matmul_in_dict)
+
+    def test_comfy_cpu_fallback_configures_cli_args_when_no_accelerator(self) -> None:
+        """
+        Verify `_configure_comfy_cpu_fallback_if_needed()` sets `comfy.cli_args.args.cpu = True`
+        on CPU-only runtimes before `comfy.model_management` is loaded, and leaves it untouched
+        when an accelerator is present.
+        """
+        import omni_lora.models.adapters as adapters_mod
+
+        fake_cli_args = types.ModuleType("comfy.cli_args")
+        fake_cli_args.args = types.SimpleNamespace(cpu=False)  # type: ignore[attr-defined]
+        fake_comfy = types.ModuleType("comfy")
+        fake_comfy.cli_args = fake_cli_args  # type: ignore[attr-defined]
+
+        orig_mm = sys.modules.pop("comfy.model_management", None)
+        orig_cli = sys.modules.get("comfy.cli_args")
+        orig_comfy = sys.modules.get("comfy")
+        try:
+            sys.modules["comfy"] = fake_comfy
+            sys.modules["comfy.cli_args"] = fake_cli_args
+
+            with mock.patch.object(adapters_mod, "_has_any_torch_accelerator", return_value=True):
+                adapters_mod._configure_comfy_cpu_fallback_if_needed()
+            self.assertFalse(fake_cli_args.args.cpu)
+
+            with mock.patch.object(adapters_mod, "_has_any_torch_accelerator", return_value=False):
+                adapters_mod._configure_comfy_cpu_fallback_if_needed()
+            self.assertTrue(fake_cli_args.args.cpu)
+        finally:
+            if orig_comfy is not None:
+                sys.modules["comfy"] = orig_comfy
+            else:
+                sys.modules.pop("comfy", None)
+            if orig_cli is not None:
+                sys.modules["comfy.cli_args"] = orig_cli
+            else:
+                sys.modules.pop("comfy.cli_args", None)
+            if orig_mm is not None:
+                sys.modules["comfy.model_management"] = orig_mm
+
+    def test_cloud_verification_summary_reports_failed_when_backend_fails(self) -> None:
+        """
+        Verify `--cloud-verify` never ends with a misleading `OK` when one or more
+        active-backend real-forward architectures failed even if all unit tests passed.
+        """
+        fail_banner = _format_cloud_verification_summary(
+            backend_id="cuda",
+            resolved_dtype="fp16",
+            backend_passed=43,
+            backend_skipped=0,
+            backend_failures=["[ideogram4] RuntimeError: non-finite loss"],
+            unit_tests_run=88,
+            unit_failures=0,
+            unit_errors=0,
+        )
+        self.assertIn("CLOUD VERIFICATION SUMMARY: FAILED", fail_banner)
+        self.assertIn("[ideogram4] RuntimeError: non-finite loss", fail_banner)
+        self.assertIn("OVERALL RESULT: FAILED (active_backend_failures=1, unit_failures=0, unit_errors=0)", fail_banner)
+        self.assertNotIn("OVERALL RESULT: OK", fail_banner)
+
+        pass_banner = _format_cloud_verification_summary(
+            backend_id="cuda",
+            resolved_dtype="fp16",
+            backend_passed=44,
+            backend_skipped=0,
+            backend_failures=[],
+            unit_tests_run=88,
+            unit_failures=0,
+            unit_errors=0,
+        )
+        self.assertIn("CLOUD VERIFICATION SUMMARY: PASS", pass_banner)
+        self.assertIn("OVERALL RESULT: OK", pass_banner)
+
+
+def _format_cloud_verification_summary(
+    *,
+    backend_id: str,
+    resolved_dtype: str,
+    backend_passed: int,
+    backend_skipped: int,
+    backend_failures: List[str],
+    unit_tests_run: int,
+    unit_failures: int,
+    unit_errors: int,
+) -> str:
+    """Format an unambiguous final combined summary banner for `--cloud-verify`."""
+    overall_ok = (len(backend_failures) == 0) and (unit_failures == 0) and (unit_errors == 0)
+    status = "PASS" if overall_ok else "FAILED"
+    lines: List[str] = [
+        "=" * 102,
+        f" CLOUD VERIFICATION SUMMARY: {status}",
+        "=" * 102,
+        (
+            f" Active Backend ({backend_id.upper()} / {resolved_dtype}) : "
+            f"{backend_passed} passed, {len(backend_failures)} failed, {backend_skipped} skipped"
+        ),
+        (
+            f" Unit & Contract Suite            : "
+            f"{unit_tests_run} run, {unit_failures} failed, {unit_errors} errors"
+        ),
+    ]
+    if backend_failures:
+        lines.append("-" * 102)
+        lines.append(f" ACTIVE-BACKEND REAL-FORWARD FAILURES ({len(backend_failures)}):")
+        for msg in backend_failures:
+            lines.append(f"   - {msg}")
+    lines.append("-" * 102)
+    if overall_ok:
+        lines.append(" OVERALL RESULT: OK")
+    else:
+        lines.append(
+            f" OVERALL RESULT: FAILED "
+            f"(active_backend_failures={len(backend_failures)}, "
+            f"unit_failures={unit_failures}, unit_errors={unit_errors})"
+        )
+    lines.append("=" * 102)
+    return "\n".join(lines)
+
 
 def run_cloud_verification_suite(preferred_backend: str = "auto") -> int:
     """
@@ -5910,12 +7824,15 @@ def run_cloud_verification_suite(preferred_backend: str = "auto") -> int:
     print(f" {'#':<2} | {'Architecture':<22} | {'Obj':<14} | {'Ch':<4} | {'Layers':<6} | {'Loss':<8} | {'RealFwd':<7} | {'Time':<7}")
     print("-" * 102)
 
+    backend_passed = 0
+    backend_skipped = 0
     backend_failures: List[str] = []
     with EmulatedComfyEnvironment(torch_device=dev, simulated_vram_mb=max(8192.0, caps.total_vram_mb)) as env:
         for idx, model_id in enumerate(RealForwardModelRegistry.MODEL_IDS, start=1):
             try:
                 spec = RealForwardModelRegistry.build(model_id, dtype=dtype, device=dev)
             except (ImportError, AttributeError) as skip_exc:
+                backend_skipped += 1
                 print(
                     f" {idx:>2} | {model_id:<22} | {'SKIP (older ComfyUI)':<37} | {'SKIP':<7} |    0ms"
                 )
@@ -5937,6 +7854,7 @@ def run_cloud_verification_suite(preferred_backend: str = "auto") -> int:
                     device=dev,
                     dtype=dtype,
                 )
+                backend_passed += 1
                 print(
                     f" {idx:>2} | {res['model_id']:<22} | {res['objective']:<14} | "
                     f"{res['latent_channels']:>3}c | {res['injected_layers']:>6} | "
@@ -5964,6 +7882,7 @@ def run_cloud_verification_suite(preferred_backend: str = "auto") -> int:
     print("-" * 102)
     print(" Running Full Unit, Edge-Case & 7-Invariant Unmocked Real-Forward Contract Suites...")
     print("-" * 102)
+    sys.stdout.flush()
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite()
     suite.addTests(loader.loadTestsFromTestCase(TestOmniLoRAFramework))
@@ -5984,6 +7903,22 @@ def run_cloud_verification_suite(preferred_backend: str = "auto") -> int:
         suite.addTests(loader.loadTestsFromTestCase(contract_cls))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
+    sys.stderr.flush()
+    sys.stdout.flush()
+    print(
+        "\n"
+        + _format_cloud_verification_summary(
+            backend_id=plan.backend.backend_id,
+            resolved_dtype=plan.resolved_dtype,
+            backend_passed=backend_passed,
+            backend_skipped=backend_skipped,
+            backend_failures=backend_failures,
+            unit_tests_run=result.testsRun,
+            unit_failures=len(result.failures),
+            unit_errors=len(result.errors),
+        )
+    )
+    sys.stdout.flush()
     return 0 if (result.wasSuccessful() and not backend_failures) else 1
 
 

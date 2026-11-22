@@ -614,13 +614,8 @@ class LoRALinear(nn.Module):
                 if raw_groups > 1 and self.in_features % raw_groups == 0 and rank % raw_groups == 0
                 else 1
             )
-            in_ch_a = (
-                self.in_features
-                if eff_groups == raw_groups or not (isinstance(weight, torch.Tensor) and weight.ndim >= 3)
-                else int(weight.shape[1])
-            )
             self.lora_A = conv_cls(
-                in_ch_a,
+                self.in_features,
                 rank,
                 kernel_size=kernel_size,
                 stride=stride,
@@ -808,9 +803,13 @@ class LoRALinear(nn.Module):
         else:
             base_out = self._run_base_layer(x)
 
-        if self.lora_A.weight.device != x.device:
-            self.lora_A = self.lora_A.to(device=x.device)
-            self.lora_B = self.lora_B.to(device=x.device)
+        if self.lora_A.weight.device != x.device or self.lora_B.weight.device != x.device:
+            raise RuntimeError(
+                f"[OmniLoRA] LoRALinear weights on device '{self.lora_A.weight.device}' / "
+                f"'{self.lora_B.weight.device}' do not match input tensor device '{x.device}'. "
+                "Refusing to re-allocate `lora_A`/`lora_B` inside forward() because doing so "
+                "severs optimizer parameter references."
+            )
 
         if self.is_conv and x.ndim >= 3:
             if isinstance(self.lora_A, (nn.Conv1d, nn.Conv2d, nn.Conv3d)) and x.ndim == self.lora_A.weight.ndim:

@@ -5,6 +5,45 @@ Versioning follows [Semantic Versioning](https://semver.org/) and is tracked via
 
 ---
 
+## [1.1.2] - 2026-11-22
+
+### Fixed
+- **Ideogram 4 / FP16 Autocast MRoPE & Additive Attention Mask Overflow (`NaN` at Step 1)**:
+  - Preserved `float32` precision for pure non-differentiable `float32` `matmul` / `@` / `bmm` / `mm` / `addmm` / `baddbmm` / `einsum` operations inside `_scoped_training_op_wrappers()` when `torch.amp.autocast(..., dtype=torch.float16)` is active (preventing large positional coordinates such as Ideogram 4's `IMAGE_POSITION_OFFSET = 65536 > 65504.0` from overflowing to `+inf`/`NaN` on FP16-only GPUs like Tesla T4 / RTX 20-series), with full `torch.Tensor` teardown on scope exit.
+  - Hardened `_wrapped_sdpa` FP32-to-FP16 floating-point `attn_mask` casting to clamp finite large negative sentinels (e.g. `-1e9`) into `[-1e4, 1e4]` while preserving explicit `-inf` entries.
+- **CPU-Only CI & Headless ComfyUI Import Safety**:
+  - Updated `ensure_comfy_importable()` (and test startup) to automatically set `comfy.cli_args.args.cpu = True` before `comfy.model_management` initializes when no PyTorch hardware accelerator is available, fixing `AssertionError: Torch not compiled with CUDA enabled` on CPU-only PyTorch / GitHub Actions CI runners.
+- **`--cloud-verify` Combined Final Verdict Banner**:
+  - Updated `run_cloud_verification_suite()` to flush `stderr`/`stdout` after `unittest` finishes and print an unambiguous combined `CLOUD VERIFICATION SUMMARY: PASS` / `FAILED` banner re-listing any active-backend real-forward failures so runs never end with a misleading trailing `OK`.
+
+---
+
+## [1.1.1] - 2026-11-22
+
+### Added
+- **Lifecycle Cleanup & CI Verification**:
+  - Added `uninstall_comfy_runtime_hooks()` (exported from `omni_lora.models`) for clean teardown of global PyTorch/ComfyUI training wrappers, plus diagnostic logging across ComfyUI cache eviction/unloading and cleanup exception paths.
+  - Added `.github/workflows/ci.yml` for automated CPU unit and real-model contract test runs on pushes and pull requests.
+  - Added regression test suites covering scoped training flags, zero-match external backbones, signature-agnostic `comfy_kitchen` wrappers, DML-safe markers, grouped/1D/3D Conv LoRA adapters, gradient accumulation parity, LoRA dropout train/eval isolation, periodic/manual/interrupt checkpoints, tracker HTTP routes, target module filters, and workflow/version parity.
+
+### Fixed
+- **`LoRATrainingPipeline.setup()` & `train_step()` `in_training` Flag Leak**:
+  - Scoped `comfy.model_management.in_training` with `_scoped_comfy_in_training` across `setup()` and `train_step()` so its prior value is always restored in `finally:`, even when calling `LoRATrainingPipeline` directly or when an exception occurs.
+- **LoRA Dropout Base-Layer Mode Isolation**:
+  - Preserved `.eval()` on each `LoRALinear.base_layer` immediately after enabling `.train()` on injected `LoRALinear` adapters in `LoRATrainingPipeline.setup()`, preventing frozen base layers from entering `.train()` mode.
+- **Grouped `Conv2d` LoRA Input Channel Mismatch**:
+  - Fixed `LoRALinear` grouped convolution fallback when `rank % groups != 0` (`eff_groups = 1`) to pass `self.in_features` instead of `weight.shape[1]` (`in_channels // raw_groups`) to `lora_A`.
+- **`.pt` LoRA Checkpoint Metadata Preservation**:
+  - Updated `_load_lora_safetensors_or_pt()` to read non-`.safetensors` `.pt` bundles via `torch.load(..., map_location="cpu", weights_only=True)` before `comfy.utils.load_torch_file()`, preserving top-level `"metadata"` (`omni_lora.steps`, `omni_lora.rank`, `omni_lora.alpha`, `omni_lora.trigger_word`) alongside `"state_dict"`.
+- **Training Op Wrapper, Device Safety, Cleanup & Dataset Hardening**:
+  - Restored pre-existing `mm.in_training` / `disable_comfy_compiler` states when `OmniLoRATrainer.train_lora()` errors during early setup; aborted on zero-target external backbones instead of falling back; made `comfy_kitchen` wrappers signature-agnostic; added `_omni_dml_safe` idempotency markers; raised explicitly on LoRA device mismatch instead of calling `.to()` and severing optimizer parameter references; ensured `cleanup()` unpatches module `__globals__` even with `gradient_checkpointing=False`; avoided writing interrupted checkpoints on step-1 errors; surfaced `load_lora_for_models` warnings; rejected mismatched `control_images` batch sizes and avoided stem collisions across nested dataset subfolders.
+- **Telemetry Store Persistence & Multi-Node Isolation**:
+  - Switched `OmniLoRATelemetryStore` checkpoint requests to an explicit `node_id` queue, skipped writing empty `.omni_lora_tracker_runs.json` files on import, and added automatic fallback to the system temp directory when the package folder is read-only.
+- **Example Workflows Updated to Latest Node Schemas**:
+  - Updated `omni_lora_basic_workflow.json`, `omni_lora_dual_network_workflow.json`, `omni_lora_masked_in_graph_workflow.json`, `omni_lora_resume_checkpoint_workflow.json`, and `omni_lora_staged_eval_workflow.json` with the latest `OmniLoRADatasetLoader` (`control_images`, `control_path`, `control_resize_mode`), `OmniLoRAPrecomputeConditioning` (`pass_control_to_clip`, `clip_vision_resolution`, `clip_prompt_template`), and `OmniLoRATrainer` (`control_mode`, `reference_latents_method`, `control_dropout`) inputs, widgets, and non-overlapping layouts.
+
+---
+
 ## [1.1.0] - 2026-11-21
 
 ### Added

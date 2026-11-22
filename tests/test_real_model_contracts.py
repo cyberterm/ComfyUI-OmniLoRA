@@ -1694,6 +1694,10 @@ class TestRealForwardEditModels(unittest.TestCase):
             concat_cases: List[Tuple[str, Any, Any, Any]] = []
             try:
                 hd_bf16 = RealForwardModelRegistry.build("hidream_i1", dtype=torch.bfloat16)
+                with torch.no_grad():
+                    for m_name, mod in hd_bf16.patcher.model.diffusion_model.named_modules():
+                        if "adaLN_modulation" in m_name and isinstance(getattr(mod, "bias", None), torch.Tensor):
+                            mod.bias.fill_(0.5)
                 concat_cases.append(("hidream_e1", hd_bf16.patcher, hd_bf16.vae, hd_bf16.clip))
             except (ImportError, AttributeError):
                 pass

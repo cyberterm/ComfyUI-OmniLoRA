@@ -84,7 +84,7 @@
       ],
       "size": [
         360,
-        390
+        460
       ],
       "flags": {},
       "order": 2,
@@ -99,6 +99,11 @@
           "name": "masks",
           "type": "MASK",
           "link": 8
+        },
+        {
+          "name": "control_images",
+          "type": "IMAGE",
+          "link": null
         }
       ],
       "outputs": [
@@ -133,7 +138,9 @@
         0.05,
         "a detailed studio portrait of ohwx_char",
         true,
-        0.1
+        0.1,
+        "",
+        "match_target"
       ]
     },
     {
@@ -141,7 +148,7 @@
       "type": "VAELoader",
       "pos": [
         460,
-        680
+        750
       ],
       "size": [
         360,
@@ -173,7 +180,7 @@
       "type": "CLIPLoader",
       "pos": [
         460,
-        800
+        870
       ],
       "size": [
         360,
@@ -207,11 +214,11 @@
       "type": "OmniLoRAPrecomputeConditioning",
       "pos": [
         890,
-        480
+        360
       ],
       "size": [
         360,
-        130
+        240
       ],
       "flags": {},
       "order": 5,
@@ -247,7 +254,10 @@
         "Node name for S&R": "OmniLoRAPrecomputeConditioning"
       },
       "widgets_values": [
-        true
+        true,
+        "auto",
+        384,
+        ""
       ]
     },
     {
@@ -260,7 +270,7 @@
       ],
       "size": [
         430,
-        780
+        880
       ],
       "flags": {},
       "order": 6,
@@ -337,7 +347,10 @@
         0.0,
         1.0,
         0.0,
-        false
+        false,
+        "auto",
+        "auto",
+        0.0
       ]
     },
     {
@@ -499,7 +512,7 @@
         40,
         30,
         380,
-        900
+        980
       ],
       "color": "#1e293b",
       "font_size": 20
@@ -510,7 +523,7 @@
         440,
         30,
         400,
-        900
+        980
       ],
       "color": "#1e293b",
       "font_size": 20
@@ -521,7 +534,7 @@
         870,
         30,
         400,
-        900
+        980
       ],
       "color": "#1e3a5f",
       "font_size": 20
@@ -532,7 +545,7 @@
         1300,
         30,
         470,
-        900
+        980
       ],
       "color": "#1f2937",
       "font_size": 20
@@ -543,7 +556,7 @@
         1800,
         30,
         720,
-        900
+        980
       ],
       "color": "#0f292e",
       "font_size": 20

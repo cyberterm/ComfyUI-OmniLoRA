@@ -65,7 +65,7 @@ register_omni_lora_routes()
 
 WEB_DIRECTORY = "./web"
 
-__version__ = "1.1.0"
+__version__ = "1.1.2"
 
 __all__ = [
     "NODE_CLASS_MAPPINGS",
