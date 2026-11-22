@@ -25,14 +25,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..diagnostics import report_exception
+
 
 def _has_any_torch_accelerator() -> bool:
     """Return True if any PyTorch hardware accelerator is available in this runtime."""
     try:
         if torch.cuda.is_available():
             return True
-    except Exception:
-        pass
+    except (RuntimeError, AttributeError) as exc:
+        report_exception(
+            "adapters.probe_cuda",
+            "CUDA availability probe failed",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="adapters",
+        )
     for attr in ("xpu", "npu", "hpu"):
         mod = getattr(torch, attr, None)
         if mod is not None:
@@ -40,34 +49,39 @@ def _has_any_torch_accelerator() -> bool:
                 is_avail = getattr(mod, "is_available", None)
                 if callable(is_avail) and is_avail():
                     return True
-            except Exception:
-                pass
+            except (RuntimeError, AttributeError) as exc:
+                report_exception(
+                    f"adapters.probe_{attr}",
+                    f"torch.{attr} availability probe failed",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
     try:
         mps = getattr(torch.backends, "mps", None)
         if mps is not None:
             is_avail = getattr(mps, "is_available", None)
             if callable(is_avail) and is_avail():
                 return True
-    except Exception:
-        pass
-    try:
-        import torch_directml  # type: ignore
-
-        is_avail = getattr(torch_directml, "is_available", None)
-        if callable(is_avail) and is_avail():
-            return True
-    except Exception:
-        pass
+    except (RuntimeError, AttributeError) as exc:
+        report_exception(
+            "adapters.probe_mps",
+            "MPS availability probe failed",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="adapters",
+        )
     return False
 
 
 def _configure_comfy_cpu_fallback_if_needed() -> None:
     """
-    On CPU-only PyTorch environments (such as headless GitHub Actions CI runners where
-    `--cpu` is not in `sys.argv`), set `comfy.cli_args.args.cpu = True` before
-    `comfy.model_management` is imported so `comfy.model_management.get_torch_device()`
-    uses `torch.device("cpu")` instead of raising `AssertionError: Torch not compiled
-    with CUDA enabled`.
+    On CPU-only PyTorch environments (where `--cpu` was not passed in `sys.argv`),
+    configure `comfy.cli_args.args.cpu = True` before `comfy.model_management` is imported
+    so `comfy.model_management.get_torch_device()` initializes CPU cleanly instead of raising
+    `AssertionError: Torch not compiled with CUDA enabled`.
     """
     if "comfy.model_management" in sys.modules:
         return
@@ -79,8 +93,17 @@ def _configure_comfy_cpu_fallback_if_needed() -> None:
         cli_args = getattr(comfy.cli_args, "args", None)
         if cli_args is not None and hasattr(cli_args, "cpu") and not getattr(cli_args, "cpu", False):
             cli_args.cpu = True
-    except Exception:
-        pass
+    except ImportError:
+        return
+    except (AttributeError, TypeError) as exc:
+        report_exception(
+            "adapters.comfy_cpu_fallback",
+            "Could not configure comfy.cli_args CPU fallback",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="adapters",
+        )
 
 
 def ensure_comfy_importable() -> bool:
@@ -97,8 +120,17 @@ def ensure_comfy_importable() -> bool:
         import comfy  # type: ignore # noqa: F401
         _configure_comfy_cpu_fallback_if_needed()
         return True
-    except Exception:
+    except ImportError:
         pass
+    except Exception as exc:
+        report_exception(
+            "adapters.import_comfy_direct",
+            "Direct import of comfy failed; searching sibling paths",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="adapters",
+        )
 
     here = Path(__file__).resolve()
     # Check standard custom_nodes hierarchy (`ComfyUI/custom_nodes/omni_lora/omni_lora/models/adapters.py`)
@@ -114,13 +146,20 @@ def ensure_comfy_importable() -> bool:
                     import comfy  # type: ignore # noqa: F401
                     _configure_comfy_cpu_fallback_if_needed()
                     return True
-                except Exception:
+                except Exception as exc:
+                    report_exception(
+                        "adapters.import_comfy_candidate",
+                        f"Failed to import comfy from candidate path '{candidate}'",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
                     return False
     return False
 
 
 from ..backends.base import (
-    install_dml_fp64_scalar_guards,
     is_inference_tensor,
     safe_to_device,
     sanitize_module_no_fp64,
@@ -637,8 +676,15 @@ class ComfyModelAdapter(BaseModelAdapter):
                 obj = self.comfy_model.get_model_object(name)
                 if obj is not None:
                     return obj
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception(
+                    f"adapters.get_comfy_object.{name}",
+                    f"get_model_object('{name}') failed",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
         return None
 
     def _infer_backbone_accepts_5d(self, backbone: nn.Module, default: bool = False) -> bool:
@@ -1069,8 +1115,15 @@ class ComfyModelAdapter(BaseModelAdapter):
                     adm_1d = torch.cat([torch.cos(t_vals), torch.sin(t_vals)], dim=-1).reshape(1, diff)
                     adm_batch = safe_to_device(adm_1d, device=y.device, dtype=y.dtype).repeat(y.shape[0], 1)
                     return torch.cat([y, adm_batch], dim=-1)
-                except Exception:
-                    pass
+                except (RuntimeError, ValueError, TypeError) as exc:
+                    report_exception(
+                        "adapters.synthesize_adm",
+                        "Sinusoidal ADM synthesis failed; falling back to zero-padding",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
             return F.pad(y, (0, diff))
         return y[..., :expected_v]
 
@@ -1298,7 +1351,15 @@ class ComfyModelAdapter(BaseModelAdapter):
         if had_stale:
             try:
                 inner_model.latent_shapes = None
-            except Exception:
+            except (AttributeError, TypeError) as exc:
+                report_exception(
+                    "adapters.clear_latent_shapes",
+                    "Could not temporarily clear inner_model.latent_shapes",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
                 had_stale = False
         try:
             yield
@@ -1306,8 +1367,16 @@ class ComfyModelAdapter(BaseModelAdapter):
             if had_stale:
                 try:
                     inner_model.latent_shapes = prev_shapes
-                except Exception:
-                    pass
+                except (AttributeError, TypeError) as exc:
+                    report_exception(
+                        "adapters.restore_latent_shapes",
+                        "Could not restore inner_model.latent_shapes on exit",
+                        exc,
+                        level=logging.WARNING,
+                        once=True,
+                        reraise_in_strict=True,
+                        logger_name="adapters",
+                    )
 
     def _validate_and_prepare_latents(
         self,
@@ -1328,14 +1397,28 @@ class ComfyModelAdapter(BaseModelAdapter):
                     with self._guard_single_stream_latent_shapes(self.inner_model):
                         latents = process_in(latents)
                     scaled_ok = True
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        "adapters.process_latent_in_pre",
+                        "inner_model.process_latent_in failed before channel adaptation; will retry after adaptation",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
             elif self.latent_format is not None and hasattr(self.latent_format, "process_in"):
                 try:
                     latents = self.latent_format.process_in(latents)
                     scaled_ok = True
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        "adapters.latent_format_process_in_pre",
+                        "latent_format.process_in failed before channel adaptation; will retry after adaptation",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
 
         expected_c = self._infer_backbone_latent_channels(backbone, fallback_channels=int(latents.shape[1]))
         actual_c = int(latents.shape[1])
@@ -1352,13 +1435,27 @@ class ComfyModelAdapter(BaseModelAdapter):
                 try:
                     with self._guard_single_stream_latent_shapes(self.inner_model):
                         latents = process_in(latents)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        "adapters.process_latent_in_post",
+                        "inner_model.process_latent_in failed after channel adaptation; using unscaled latents",
+                        exc,
+                        level=logging.WARNING,
+                        once=True,
+                        logger_name="adapters",
+                    )
             elif self.latent_format is not None and hasattr(self.latent_format, "process_in"):
                 try:
                     latents = self.latent_format.process_in(latents)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        "adapters.latent_format_process_in_post",
+                        "latent_format.process_in failed after channel adaptation; using unscaled latents",
+                        exc,
+                        level=logging.WARNING,
+                        once=True,
+                        logger_name="adapters",
+                    )
 
         accepts_5d = self._infer_backbone_accepts_5d(backbone, default=self.spec.supports_video_5d)
         if accepts_5d and latents.ndim == 4:
@@ -1582,7 +1679,15 @@ class ComfyModelAdapter(BaseModelAdapter):
             return None
         try:
             pdd_steps = int(getattr(final_layer, "pdd_steps", 1) or 1)
-        except Exception:
+        except (ValueError, TypeError) as exc:
+            report_exception(
+                "adapters.pdd_steps_parse",
+                "Could not parse final_layer.pdd_steps; defaulting to 1",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="adapters",
+            )
             pdd_steps = 1
         if pdd_steps <= 1:
             return None
@@ -1611,8 +1716,15 @@ class ComfyModelAdapter(BaseModelAdapter):
                 grid_vals = pdd_grid_fn(pdd_steps, shift_v)
                 if isinstance(grid_vals, (list, tuple)) and len(grid_vals) >= 2:
                     return [float(s) for s in grid_vals]
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception(
+                    "adapters.minimax_pdd_grid",
+                    "comfy.ldm.minimax.model.pdd_grid failed; using analytic schedule",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
         if abs(shift_v - 1.0) > 1e-6:
             return [
                 float(shift_v * (k / float(pdd_steps)) / (1.0 + (shift_v - 1.0) * (k / float(pdd_steps))))
@@ -1678,8 +1790,15 @@ class ComfyModelAdapter(BaseModelAdapter):
                         return "reference_latents"
                     if "concat_latent_image" in src:
                         return "concat_latent_image"
-                except Exception:
-                    pass
+                except (OSError, TypeError) as exc:
+                    report_exception(
+                        "adapters.inspect_extra_conds_src",
+                        "Could not inspect extra_conds source for control_mode resolution",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
 
         return "reference_latents"
 
@@ -1943,10 +2062,24 @@ class ComfyModelAdapter(BaseModelAdapter):
             except TypeError:
                 try:
                     backbone.reset_prefix_cache()
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                except Exception as exc:
+                    report_exception(
+                        "adapters.reset_prefix_cache_noarg",
+                        "backbone.reset_prefix_cache() failed",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
+            except Exception as exc:
+                report_exception(
+                    "adapters.reset_prefix_cache",
+                    "backbone.reset_prefix_cache(False) failed",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
 
         mm_mod_for_train = sys.modules.get("comfy.model_management")
         prev_mm_in_training: Optional[bool] = None
@@ -1955,7 +2088,15 @@ class ComfyModelAdapter(BaseModelAdapter):
             if not prev_mm_in_training:
                 try:
                     mm_mod_for_train.in_training = True
-                except Exception:
+                except Exception as exc:
+                    report_exception(
+                        "adapters.comfy_in_training_enter",
+                        "Failed to set comfy.model_management.in_training = True",
+                        exc,
+                        level=logging.WARNING,
+                        once=True,
+                        logger_name="adapters",
+                    )
                     mm_mod_for_train = None
 
         minimax_mod = sys.modules.get("comfy.ldm.minimax.model")
@@ -1999,8 +2140,15 @@ class ComfyModelAdapter(BaseModelAdapter):
                         return torch.cat(pieces, dim=0) if pieces else x
                     _omni_mod_gate._omni_autograd_safe = True  # type: ignore[attr-defined]
                     setattr(minimax_mod, "_mod_gate", _omni_mod_gate)
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception(
+                    "adapters.minimax_autograd_patch",
+                    "Failed to patch MiniMax H3 in-place modulation helpers",
+                    exc,
+                    level=logging.WARNING,
+                    once=True,
+                    logger_name="adapters",
+                )
 
         try:
             yield
@@ -2008,8 +2156,16 @@ class ComfyModelAdapter(BaseModelAdapter):
             if mm_mod_for_train is not None and prev_mm_in_training is False:
                 try:
                     mm_mod_for_train.in_training = False
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        "adapters.comfy_in_training_exit",
+                        "Failed to restore comfy.model_management.in_training = False",
+                        exc,
+                        level=logging.WARNING,
+                        once=True,
+                        reraise_in_strict=True,
+                        logger_name="adapters",
+                    )
 
     def _forward_backbone(
         self,
@@ -2035,7 +2191,15 @@ class ComfyModelAdapter(BaseModelAdapter):
             from ..pipelines.lora_trainer import _scoped_training_op_wrappers
 
             op_ctx: Any = _scoped_training_op_wrappers()
-        except Exception:
+        except Exception as exc:
+            report_exception(
+                "adapters.scoped_training_op_wrappers",
+                "Could not acquire scoped training op wrappers; continuing without op wrappers",
+                exc,
+                level=logging.WARNING,
+                once=True,
+                logger_name="adapters",
+            )
             op_ctx = contextlib.nullcontext()
         with op_ctx, self._comfy_training_runtime_context(backbone):
             return self._forward_backbone_impl(
@@ -2194,8 +2358,15 @@ class ComfyModelAdapter(BaseModelAdapter):
                                 device=noisy_latents.device,
                                 dtype=noisy_latents.dtype,
                             )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        report_exception(
+                            "adapters.encode_adm",
+                            f"{type(self.inner_model).__name__}.encode_adm failed; continuing without adm_encoded",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="adapters",
+                        )
 
                 has_preprocess_text = (
                     hasattr(backbone, "preprocess_text_embeds")
@@ -2277,9 +2448,25 @@ class ComfyModelAdapter(BaseModelAdapter):
                             try:
                                 processed = v.process_cond(batch_size=bsz, device=noisy_latents.device)
                                 val = getattr(processed, "cond", processed)
-                            except Exception:
+                            except Exception as exc:
+                                report_exception(
+                                    f"adapters.process_cond_fallback.{k}",
+                                    f"process_cond failed for conditioning key '{k}'; using raw .cond",
+                                    exc,
+                                    level=logging.DEBUG,
+                                    once=True,
+                                    logger_name="adapters",
+                                )
                                 val = getattr(v, "cond", v)
-                        except Exception:
+                        except Exception as exc:
+                            report_exception(
+                                f"adapters.process_cond.{k}",
+                                f"process_cond failed for conditioning key '{k}'; using raw .cond",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="adapters",
+                            )
                             val = getattr(v, "cond", v)
                     else:
                         val = getattr(v, "cond", v)
@@ -2393,8 +2580,15 @@ class ComfyModelAdapter(BaseModelAdapter):
                 if self.latent_format is not None and hasattr(self.latent_format, "process_in"):
                     try:
                         ct = self.latent_format.process_in(ct)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        report_exception(
+                            "adapters.control_latent_process_in",
+                            "latent_format.process_in failed on fallback control latent; using raw control latent",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="adapters",
+                        )
                 scaled_ctrls.append(ct)
             if resolved_ctrl_mode == "concat_latent_image":
                 if "image_cond" in param_names and "image_cond" not in kwargs:
@@ -2572,19 +2766,12 @@ class ComfyModelAdapter(BaseModelAdapter):
             and "guidance" in param_names
             and "guidance" not in kwargs
         ):
-            if noisy_latents.device.type in ("privateuseone", "dml"):
-                kwargs["guidance"] = safe_to_device(
-                    torch.full((noisy_latents.shape[0],), self.guidance_scale, dtype=torch.float32),
-                    device=noisy_latents.device,
-                    dtype=noisy_latents.dtype,
-                )
-            else:
-                kwargs["guidance"] = torch.full(
-                    (noisy_latents.shape[0],),
-                    self.guidance_scale,
-                    device=noisy_latents.device,
-                    dtype=noisy_latents.dtype,
-                )
+            kwargs["guidance"] = torch.full(
+                (noisy_latents.shape[0],),
+                self.guidance_scale,
+                device=noisy_latents.device,
+                dtype=noisy_latents.dtype,
+            )
 
         # 5. Apply `c_concat` and pad any extra input channels required by Inpaint / I2V / Control / Edit models
         noisy_latents = self._prepare_concat_input_channels(
@@ -2601,8 +2788,15 @@ class ComfyModelAdapter(BaseModelAdapter):
                 processed_t = self.inner_model.process_timestep(timesteps, x=noisy_latents, **kwargs)
                 if isinstance(processed_t, torch.Tensor):
                     timesteps = processed_t.to(device=noisy_latents.device, dtype=timesteps.dtype)
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception(
+                    "adapters.process_timestep",
+                    f"{type(self.inner_model).__name__}.process_timestep failed; using raw timesteps",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
 
         # 7. Always populate `transformer_options` with `sample_sigmas`, `sigmas`, and patch registries
         # whenever `transformer_options` is accepted by `backbone.forward` / `_forward`
@@ -2619,135 +2813,144 @@ class ComfyModelAdapter(BaseModelAdapter):
         for pos_key in ("x", "timestep", "timesteps"):
             kwargs.pop(pos_key, None)
 
-        is_dml_dev = noisy_latents.device.type in ("privateuseone", "dml")
-        dml_infer_ctx = (
-            torch.inference_mode(False)
-            if (is_dml_dev and torch.is_inference_mode_enabled())
-            else contextlib.nullcontext()
-        )
-        with dml_infer_ctx:
-            if is_inference_tensor(noisy_latents):
-                noisy_latents = noisy_latents.detach().clone()
-            if is_inference_tensor(timesteps):
-                timesteps = timesteps.detach().clone()
-            if isinstance(prompt_embeds, torch.Tensor) and is_inference_tensor(prompt_embeds):
-                prompt_embeds = prompt_embeds.detach().clone()
+        if is_inference_tensor(noisy_latents):
+            noisy_latents = noisy_latents.detach().clone()
+        if is_inference_tensor(timesteps):
+            timesteps = timesteps.detach().clone()
+        if isinstance(prompt_embeds, torch.Tensor) and is_inference_tensor(prompt_embeds):
+            prompt_embeds = prompt_embeds.detach().clone()
 
-            for k, v in list(kwargs.items()):
-                if isinstance(v, torch.Tensor) and is_inference_tensor(v):
-                    kwargs[k] = v.detach().clone()
-                elif isinstance(v, list) and any(isinstance(t, torch.Tensor) and is_inference_tensor(t) for t in v):
-                    kwargs[k] = [
-                        (t.detach().clone() if (isinstance(t, torch.Tensor) and is_inference_tensor(t)) else t)
-                        for t in v
-                    ]
+        for k, v in list(kwargs.items()):
+            if isinstance(v, torch.Tensor) and is_inference_tensor(v):
+                kwargs[k] = v.detach().clone()
+            elif isinstance(v, list) and any(isinstance(t, torch.Tensor) and is_inference_tensor(t) for t in v):
+                kwargs[k] = [
+                    (t.detach().clone() if (isinstance(t, torch.Tensor) and is_inference_tensor(t)) else t)
+                    for t in v
+                ]
 
-            if torch.is_grad_enabled() and not noisy_latents.requires_grad:
-                noisy_latents = noisy_latents.detach().requires_grad_(True)
+        if torch.is_grad_enabled() and not noisy_latents.requires_grad:
+            noisy_latents = noisy_latents.detach().requires_grad_(True)
 
-            backbone_input: Any = noisy_latents
-            latent_shapes = kwargs.pop("latent_shapes", None)
-            if latent_shapes is not None:
+        backbone_input: Any = noisy_latents
+        latent_shapes = kwargs.pop("latent_shapes", None)
+        if latent_shapes is not None:
+            try:
+                import comfy.utils as _cu  # type: ignore
+
+                if hasattr(_cu, "unpack_latents"):
+                    backbone_input = _cu.unpack_latents(noisy_latents, latent_shapes)
+            except Exception as exc:
+                report_exception(
+                    "adapters.unpack_latents",
+                    "comfy.utils.unpack_latents failed; passing packed latents directly",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
+                backbone_input = noisy_latents
+        elif isinstance(backbone_input, torch.Tensor) and (
+            callable(getattr(backbone, "separate_audio_and_video_latents", None))
+            or (
+                getattr(backbone, "audio_patchify_proj", None) is not None
+                and getattr(backbone, "a_patchifier", None) is not None
+            )
+        ):
+            # Optional-audio dual-stream AV backbones (e.g. `LTXAVModel` for LTX 2.0 / 2.3 / 2.4 / 2.5)
+            # expect `x` as a sequence `[video_x]` or `[video_x, audio_x]` and index `vx = x[0]`
+            # inside `separate_audio_and_video_latents`. Passing a single-element list `[video_in]`
+            # preserves the 5D batch axis and activates the native video-only path (`ax.numel() == 0`).
+            video_in = backbone_input.unsqueeze(2) if backbone_input.ndim == 4 else backbone_input
+            backbone_input = [video_in]
+        elif (
+            isinstance(backbone_input, torch.Tensor)
+            and isinstance(getattr(backbone, "audio_latents_dim", None), int)
+            and int(getattr(backbone, "audio_latents_dim", 0)) > 0
+            and getattr(backbone, "audio_patch_proj", None) is not None
+        ):
+            # Required-joint-audio dual-stream backbones (e.g. `MiniMaxH3Model`, whereas
+            # `MiniMaxH3ImageModel` sets `audio_latents_dim = None` and takes a single tensor)
+            # unpack `video_x, audio_x = x[0], x[1]` with `audio_t > 0`. Synthesize a companion
+            # flow-matched silent audio latent stream `sigma_a * randn(...)` using the model's
+            # `time_shift_sigma(sigma_v, shift_v, shift_a)` schedule so joint attention stays
+            # in-distribution across all timesteps.
+            video_in = backbone_input.unsqueeze(2) if backbone_input.ndim == 4 else backbone_input
+            audio_c = int(getattr(backbone, "audio_latents_dim", 32))
+            t_tokens = int(video_in.shape[2]) if video_in.ndim >= 5 else 1
+            frames_per_token = (1, 4, 4, 4, 4)
+            frame_count = sum(frames_per_token[i % len(frames_per_token)] for i in range(max(1, t_tokens)))
+            audio_t = max(1, int(round(frame_count * (5.0 / 3.0))))
+            to_dict = kwargs.get("transformer_options") if isinstance(kwargs.get("transformer_options"), dict) else {}
+            shift_v = float(
+                to_dict.get("minimax_h3_sigma_shift_video", getattr(backbone, "sigma_shift_video", 1.0)) or 1.0
+            )
+            shift_a = float(
+                to_dict.get("minimax_h3_sigma_shift_audio", getattr(backbone, "sigma_shift_audio", 1.0)) or 1.0
+            )
+            if isinstance(sigma, torch.Tensor):
+                sigma_v = sigma.detach().to(device=video_in.device, dtype=torch.float32).reshape(-1)
+            else:
+                sigma_v = timesteps.detach().to(device=video_in.device, dtype=torch.float32).reshape(-1) / 1000.0
+            sigma_v = sigma_v.clamp(0.0, 1.0)
+            vid_bsz = int(video_in.shape[0])
+            if sigma_v.numel() == 1 and vid_bsz > 1:
+                sigma_v = sigma_v.expand(vid_bsz)
+            elif sigma_v.numel() > vid_bsz:
+                sigma_v = sigma_v[:vid_bsz]
+            base_s = sigma_v / (shift_v + sigma_v * (1.0 - shift_v)).clamp(min=1e-6)
+            sigma_a = (shift_a * base_s / (1.0 + (shift_a - 1.0) * base_s).clamp(min=1e-6)).clamp(0.0, 1.0)
+            dummy_audio = (
+                torch.randn(
+                    (vid_bsz, audio_c, 2, audio_t),
+                    device=video_in.device,
+                    dtype=torch.float32,
+                )
+                * sigma_a.view(-1, 1, 1, 1)
+            ).to(dtype=video_in.dtype)
+            backbone_input = [video_in, dummy_audio]
+
+        if kwargs:
+            try:
+                out = backbone(backbone_input, timesteps, **kwargs)
+            except TypeError:
+                if param_names:
+                    filtered_kw = {k: v for k, v in kwargs.items() if k in param_names}
+                    out = backbone(backbone_input, timesteps, **filtered_kw)
+                else:
+                    raise
+        else:
+            out = backbone(backbone_input, timesteps, prompt_embeds)
+
+        if isinstance(out, (tuple, list)):
+            if (
+                latent_shapes is not None
+                and len(out) > 1
+                and all(isinstance(t, torch.Tensor) for t in out)
+            ):
                 try:
                     import comfy.utils as _cu  # type: ignore
 
-                    if hasattr(_cu, "unpack_latents"):
-                        backbone_input = _cu.unpack_latents(noisy_latents, latent_shapes)
-                except Exception:
-                    backbone_input = noisy_latents
-            elif isinstance(backbone_input, torch.Tensor) and (
-                callable(getattr(backbone, "separate_audio_and_video_latents", None))
-                or (
-                    getattr(backbone, "audio_patchify_proj", None) is not None
-                    and getattr(backbone, "a_patchifier", None) is not None
-                )
-            ):
-                # Optional-audio dual-stream AV backbones (e.g. `LTXAVModel` for LTX 2.0 / 2.3 / 2.4 / 2.5)
-                # expect `x` as a sequence `[video_x]` or `[video_x, audio_x]` and index `vx = x[0]`
-                # inside `separate_audio_and_video_latents`. Passing a single-element list `[video_in]`
-                # preserves the 5D batch axis and activates the native video-only path (`ax.numel() == 0`).
-                video_in = backbone_input.unsqueeze(2) if backbone_input.ndim == 4 else backbone_input
-                backbone_input = [video_in]
-            elif (
-                isinstance(backbone_input, torch.Tensor)
-                and isinstance(getattr(backbone, "audio_latents_dim", None), int)
-                and int(getattr(backbone, "audio_latents_dim", 0)) > 0
-                and getattr(backbone, "audio_patch_proj", None) is not None
-            ):
-                # Required-joint-audio dual-stream backbones (e.g. `MiniMaxH3Model`, whereas
-                # `MiniMaxH3ImageModel` sets `audio_latents_dim = None` and takes a single tensor)
-                # unpack `video_x, audio_x = x[0], x[1]` with `audio_t > 0`. Synthesize a companion
-                # flow-matched silent audio latent stream `sigma_a * randn(...)` using the model's
-                # `time_shift_sigma(sigma_v, shift_v, shift_a)` schedule so joint attention stays
-                # in-distribution across all timesteps.
-                video_in = backbone_input.unsqueeze(2) if backbone_input.ndim == 4 else backbone_input
-                audio_c = int(getattr(backbone, "audio_latents_dim", 32))
-                t_tokens = int(video_in.shape[2]) if video_in.ndim >= 5 else 1
-                frames_per_token = (1, 4, 4, 4, 4)
-                frame_count = sum(frames_per_token[i % len(frames_per_token)] for i in range(max(1, t_tokens)))
-                audio_t = max(1, int(round(frame_count * (5.0 / 3.0))))
-                to_dict = kwargs.get("transformer_options") if isinstance(kwargs.get("transformer_options"), dict) else {}
-                shift_v = float(
-                    to_dict.get("minimax_h3_sigma_shift_video", getattr(backbone, "sigma_shift_video", 1.0)) or 1.0
-                )
-                shift_a = float(
-                    to_dict.get("minimax_h3_sigma_shift_audio", getattr(backbone, "sigma_shift_audio", 1.0)) or 1.0
-                )
-                if isinstance(sigma, torch.Tensor):
-                    sigma_v = sigma.detach().to(device=video_in.device, dtype=torch.float32).reshape(-1)
-                else:
-                    sigma_v = timesteps.detach().to(device=video_in.device, dtype=torch.float32).reshape(-1) / 1000.0
-                sigma_v = sigma_v.clamp(0.0, 1.0)
-                vid_bsz = int(video_in.shape[0])
-                if sigma_v.numel() == 1 and vid_bsz > 1:
-                    sigma_v = sigma_v.expand(vid_bsz)
-                elif sigma_v.numel() > vid_bsz:
-                    sigma_v = sigma_v[:vid_bsz]
-                base_s = sigma_v / (shift_v + sigma_v * (1.0 - shift_v)).clamp(min=1e-6)
-                sigma_a = (shift_a * base_s / (1.0 + (shift_a - 1.0) * base_s).clamp(min=1e-6)).clamp(0.0, 1.0)
-                dummy_audio = (
-                    torch.randn(
-                        (vid_bsz, audio_c, 2, audio_t),
-                        device=video_in.device,
-                        dtype=torch.float32,
-                    )
-                    * sigma_a.view(-1, 1, 1, 1)
-                ).to(dtype=video_in.dtype)
-                backbone_input = [video_in, dummy_audio]
-
-            if kwargs:
-                try:
-                    out = backbone(backbone_input, timesteps, **kwargs)
-                except TypeError:
-                    if param_names:
-                        filtered_kw = {k: v for k, v in kwargs.items() if k in param_names}
-                        out = backbone(backbone_input, timesteps, **filtered_kw)
+                    if hasattr(_cu, "pack_latents"):
+                        out = _cu.pack_latents(list(out))[0]
                     else:
-                        raise
-            else:
-                out = backbone(backbone_input, timesteps, prompt_embeds)
-
-            if isinstance(out, (tuple, list)):
-                if (
-                    latent_shapes is not None
-                    and len(out) > 1
-                    and all(isinstance(t, torch.Tensor) for t in out)
-                ):
-                    try:
-                        import comfy.utils as _cu  # type: ignore
-
-                        if hasattr(_cu, "pack_latents"):
-                            out = _cu.pack_latents(list(out))[0]
-                        else:
-                            out = out[0]
-                    except Exception:
                         out = out[0]
-                else:
+                except Exception as exc:
+                    report_exception(
+                        "adapters.pack_latents",
+                        "comfy.utils.pack_latents failed on multi-stream output; using out[0]",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
                     out = out[0]
-            elif isinstance(out, dict):
-                out = out.get("sample", next(iter(out.values())))
+            else:
+                out = out[0]
+        elif isinstance(out, dict):
+            out = out.get("sample", next(iter(out.values())))
 
-            return out
+        return out
 
     @classmethod
     def _align_prediction_to_target(cls, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -2798,11 +3001,7 @@ class ComfyModelAdapter(BaseModelAdapter):
         `sampling` is a `ModelSamplingDiscrete` whose `log_sigmas` buffer resides on CPU.
         """
         log_sigmas = getattr(sampling, "log_sigmas", None)
-        if (
-            isinstance(log_sigmas, torch.Tensor)
-            and log_sigmas.device != device
-            and device.type not in ("privateuseone", "dml")
-        ):
+        if isinstance(log_sigmas, torch.Tensor) and log_sigmas.device != device:
             if (
                 self._cached_log_sigmas is None
                 or self._cached_log_sigmas.device != device
@@ -2817,8 +3016,15 @@ class ComfyModelAdapter(BaseModelAdapter):
                 finally:
                     sampling.log_sigmas = orig_log_sigmas
                 return safe_to_device(t_out, device=device, dtype=dtype)
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception(
+                    "adapters.device_timesteps",
+                    "On-device sampling.timestep(sigma) failed; falling back to default sampling.timestep",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
         return safe_to_device(sampling.timestep(sigma), device=device, dtype=dtype)
 
     def compute_training_loss(
@@ -2828,8 +3034,6 @@ class ComfyModelAdapter(BaseModelAdapter):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        if device.type in ("privateuseone", "dml") and dtype == torch.bfloat16:
-            dtype = torch.float16
         raw_latents_in = batch["latents"]
         if (
             self._requires_batch_size_one_for_batch(backbone, batch)
@@ -2979,8 +3183,7 @@ class ComfyModelAdapter(BaseModelAdapter):
                 xc = noisy_latents
             else:
                 xc = (noisy_latents / torch.sqrt(1.0 + sigma_b * sigma_b)).to(dtype=dtype)
-            t_dtype = dtype if device.type in ("privateuseone", "dml") else torch.float32
-            timesteps = self._compute_device_timesteps(sampling, sigma, device=device, dtype=t_dtype).view(bsz)
+            timesteps = self._compute_device_timesteps(sampling, sigma, device=device, dtype=torch.float32).view(bsz)
 
             if self.spec.objective_type == "ddpm_eps":
                 target = noise
@@ -3102,11 +3305,7 @@ class ComfyModelAdapter(BaseModelAdapter):
         # Optional spatial mask / alpha-channel loss weighting (`loss_mask` in [0, 1])
         raw_loss_mask = batch.get("loss_mask")
         if isinstance(raw_loss_mask, torch.Tensor) and raw_loss_mask.numel() > 0 and loss_elem.ndim >= 4:
-            mask_dev = (
-                torch.device("cpu")
-                if (raw_loss_mask.device.type == "cpu" or device.type in ("privateuseone", "dml"))
-                else device
-            )
+            mask_dev = torch.device("cpu") if raw_loss_mask.device.type == "cpu" else device
             m = raw_loss_mask.to(device=mask_dev, dtype=torch.float32)
             if m.ndim == 2:
                 m = m.unsqueeze(0).unsqueeze(0)
@@ -3396,8 +3595,6 @@ def install_comfy_runtime_hooks() -> None:
     3. `torch.nn.functional.rms_norm` and `layer_norm` automatically adapt integer-multiple
        multi-layer conditioning embeddings (`4096 <-> 53248 = 13 * 4096`).
     """
-    install_dml_fp64_scalar_guards()
-
     def _pure_fp32_rms_norm(
         x: torch.Tensor,
         normalized_shape: Any,
@@ -3414,10 +3611,14 @@ def install_comfy_runtime_hooks() -> None:
             normed = normed * safe_to_device(weight, device=x.device, dtype=x.dtype)
         return normed
 
-    # 1. Install RMSNorm / LayerNorm integer-multiple conditioning width adapter + DirectML fallbacks
-    # Never overwrite hardened `_omni_dml_safe` wrappers installed by `LoRATrainingPipeline`.
+    # 1. Install RMSNorm integer-multiple conditioning width adapter + FP32 fallback.
+    # Never overwrite hardened `_omni_op_safe` wrappers installed by `LoRATrainingPipeline`.
     try:
-        if hasattr(F, "rms_norm") and not getattr(F.rms_norm, "_omni_dml_safe", False):
+        if (
+            hasattr(F, "rms_norm")
+            and not getattr(F.rms_norm, "_omni_op_safe", False)
+            and not getattr(F.rms_norm, "_omni_runtime_hook", False)
+        ):
             orig_f_rms_norm = getattr(F, "_omni_orig_rms_norm", F.rms_norm)
             setattr(F, "_omni_orig_rms_norm", orig_f_rms_norm)
 
@@ -3428,16 +3629,19 @@ def install_comfy_runtime_hooks() -> None:
                 eps: Optional[float] = None,
             ) -> torch.Tensor:
                 adapted = _adapt_norm_input_last_dim(input, normalized_shape)
-                if getattr(adapted.device, "type", "cpu") in ("privateuseone", "dml"):
-                    return _pure_fp32_rms_norm(adapted, normalized_shape, weight=weight, eps=eps)
                 try:
                     return orig_f_rms_norm(adapted, normalized_shape, weight=weight, eps=eps)
                 except (RuntimeError, NotImplementedError):
                     return _pure_fp32_rms_norm(adapted, normalized_shape, weight=weight, eps=eps)
 
+            setattr(_omni_f_rms_norm, "_omni_runtime_hook", True)
             F.rms_norm = _omni_f_rms_norm
 
-        if hasattr(torch, "rms_norm") and not getattr(torch.rms_norm, "_omni_dml_safe", False):
+        if (
+            hasattr(torch, "rms_norm")
+            and not getattr(torch.rms_norm, "_omni_op_safe", False)
+            and not getattr(torch.rms_norm, "_omni_runtime_hook", False)
+        ):
             orig_t_rms_norm = getattr(torch, "_omni_orig_rms_norm", torch.rms_norm)
             setattr(torch, "_omni_orig_rms_norm", orig_t_rms_norm)
 
@@ -3448,177 +3652,13 @@ def install_comfy_runtime_hooks() -> None:
                 eps: Optional[float] = None,
             ) -> torch.Tensor:
                 adapted = _adapt_norm_input_last_dim(input, normalized_shape)
-                if getattr(adapted.device, "type", "cpu") in ("privateuseone", "dml"):
-                    return _pure_fp32_rms_norm(adapted, normalized_shape, weight=weight, eps=eps)
                 try:
                     return orig_t_rms_norm(adapted, normalized_shape, weight, eps)
                 except (RuntimeError, NotImplementedError):
                     return _pure_fp32_rms_norm(adapted, normalized_shape, weight=weight, eps=eps)
 
+            setattr(_omni_t_rms_norm, "_omni_runtime_hook", True)
             torch.rms_norm = _omni_t_rms_norm  # type: ignore[assignment]
-
-        if hasattr(F, "pixel_unshuffle") and not getattr(F.pixel_unshuffle, "_omni_dml_safe", False):
-            orig_pixel_unshuffle = getattr(F, "_omni_orig_pixel_unshuffle", F.pixel_unshuffle)
-            setattr(F, "_omni_orig_pixel_unshuffle", orig_pixel_unshuffle)
-
-            def _omni_pixel_unshuffle_5d(tensor: torch.Tensor, downscale_factor: int) -> torch.Tensor:
-                ctx = (
-                    torch.inference_mode(False)
-                    if torch.is_inference_mode_enabled()
-                    else contextlib.nullcontext()
-                )
-                with ctx:
-                    r = int(downscale_factor)
-                    b, c, h, w = tensor.shape
-                    if is_inference_tensor(tensor) or not tensor.is_contiguous() or tensor.storage_offset() != 0:
-                        tensor = tensor.clone()
-                    # Merge (B * C) so intermediate tensor is 5D (within DirectML's 5D tensor descriptor limit), never 6D
-                    x_5d = tensor.reshape(b * c, h // r, r, w // r, r).permute(0, 2, 4, 1, 3).contiguous()
-                    return x_5d.reshape(b, c * r * r, h // r, w // r)
-
-            def _omni_pixel_unshuffle(input: torch.Tensor, downscale_factor: int) -> torch.Tensor:
-                if (
-                    isinstance(input, torch.Tensor)
-                    and getattr(input.device, "type", "cpu") in ("privateuseone", "dml")
-                    and input.ndim == 4
-                ):
-                    return _omni_pixel_unshuffle_5d(input, downscale_factor)
-                try:
-                    return orig_pixel_unshuffle(input, downscale_factor)
-                except (RuntimeError, NotImplementedError):
-                    if isinstance(input, torch.Tensor) and input.ndim == 4:
-                        return _omni_pixel_unshuffle_5d(input, downscale_factor)
-                    raise
-
-            setattr(_omni_pixel_unshuffle, "_omni_dml_safe", True)
-            F.pixel_unshuffle = _omni_pixel_unshuffle
-
-        if hasattr(F, "pixel_shuffle") and not getattr(F.pixel_shuffle, "_omni_dml_safe", False):
-            orig_pixel_shuffle = getattr(F, "_omni_orig_pixel_shuffle", F.pixel_shuffle)
-            setattr(F, "_omni_orig_pixel_shuffle", orig_pixel_shuffle)
-
-            def _omni_pixel_shuffle_5d(tensor: torch.Tensor, upscale_factor: int) -> torch.Tensor:
-                ctx = (
-                    torch.inference_mode(False)
-                    if torch.is_inference_mode_enabled()
-                    else contextlib.nullcontext()
-                )
-                with ctx:
-                    r = int(upscale_factor)
-                    b, c_in, h, w = tensor.shape
-                    c_out = c_in // (r * r)
-                    if is_inference_tensor(tensor) or not tensor.is_contiguous() or tensor.storage_offset() != 0:
-                        tensor = tensor.clone()
-                    # Merge (B * C_out) so intermediate tensor is 5D (within DirectML's 5D tensor descriptor limit), never 6D
-                    x_5d = tensor.reshape(b * c_out, r, r, h, w).permute(0, 3, 1, 4, 2).contiguous()
-                    return x_5d.reshape(b, c_out, h * r, w * r)
-
-            def _omni_pixel_shuffle(input: torch.Tensor, upscale_factor: int) -> torch.Tensor:
-                if (
-                    isinstance(input, torch.Tensor)
-                    and getattr(input.device, "type", "cpu") in ("privateuseone", "dml")
-                    and input.ndim == 4
-                ):
-                    return _omni_pixel_shuffle_5d(input, upscale_factor)
-                try:
-                    return orig_pixel_shuffle(input, upscale_factor)
-                except (RuntimeError, NotImplementedError):
-                    if isinstance(input, torch.Tensor) and input.ndim == 4:
-                        return _omni_pixel_shuffle_5d(input, upscale_factor)
-                    raise
-
-            setattr(_omni_pixel_shuffle, "_omni_dml_safe", True)
-            F.pixel_shuffle = _omni_pixel_shuffle
-
-        if hasattr(F, "conv3d") and not getattr(F.conv3d, "_omni_dml_safe", False):
-            orig_conv3d = getattr(F, "_omni_orig_conv3d", F.conv3d)
-            setattr(F, "_omni_orig_conv3d", orig_conv3d)
-
-            def _omni_conv3d(
-                input: torch.Tensor,
-                weight: torch.Tensor,
-                bias: Optional[torch.Tensor] = None,
-                stride: Any = 1,
-                padding: Any = 0,
-                dilation: Any = 1,
-                groups: int = 1,
-            ) -> torch.Tensor:
-                if (
-                    isinstance(input, torch.Tensor)
-                    and getattr(input.device, "type", "cpu") in ("privateuseone", "dml")
-                    and input.ndim == 5
-                    and isinstance(weight, torch.Tensor)
-                    and weight.ndim == 5
-                    and isinstance(padding, (int, tuple, list))
-                ):
-                    ctx = (
-                        torch.inference_mode(False)
-                        if torch.is_inference_mode_enabled()
-                        else contextlib.nullcontext()
-                    )
-                    with ctx:
-                        if is_inference_tensor(input) or not input.is_contiguous() or input.storage_offset() != 0:
-                            input = input.clone()
-                        if weight.device != input.device or weight.dtype != input.dtype:
-                            weight = safe_to_device(weight, device=input.device, dtype=input.dtype)
-                        if is_inference_tensor(weight) or not weight.is_contiguous() or weight.storage_offset() != 0:
-                            weight = weight.clone()
-                        if isinstance(bias, torch.Tensor):
-                            if bias.device != input.device or bias.dtype != input.dtype:
-                                bias = safe_to_device(bias, device=input.device, dtype=input.dtype)
-                            if is_inference_tensor(bias) or not bias.is_contiguous() or bias.storage_offset() != 0:
-                                bias = bias.clone()
-                        s_tup = (stride, stride, stride) if isinstance(stride, int) else tuple(stride)
-                        p_tup = (padding, padding, padding) if isinstance(padding, int) else tuple(padding)
-                        d_tup = (dilation, dilation, dilation) if isinstance(dilation, int) else tuple(dilation)
-                        s_t, s_h, s_w = int(s_tup[0]), int(s_tup[1]), int(s_tup[2])
-                        p_t, p_h, p_w = int(p_tup[0]), int(p_tup[1]), int(p_tup[2])
-                        d_t, d_h, d_w = int(d_tup[0]), int(d_tup[1]), int(d_tup[2])
-                        k_t = int(weight.shape[2])
-                        b, c, t_len, h, w = input.shape
-                        if k_t == 1 and s_t == 1 and p_t == 0:
-                            x_2d = input.permute(0, 2, 1, 3, 4).contiguous().reshape(b * t_len, c, h, w)
-                            w_2d = weight.squeeze(2).clone()
-                            out_2d = F.conv2d(
-                                x_2d,
-                                w_2d,
-                                bias=bias,
-                                stride=(s_h, s_w),
-                                padding=(p_h, p_w),
-                                dilation=(d_h, d_w),
-                                groups=groups,
-                            )
-                            _, out_c, out_h, out_w = out_2d.shape
-                            return out_2d.reshape(b, t_len, out_c, out_h, out_w).permute(0, 2, 1, 3, 4).contiguous()
-                        if p_t > 0:
-                            input = F.pad(input, (0, 0, 0, 0, p_t, p_t))
-                        t_padded = int(input.shape[2])
-                        eff_k_t = (k_t - 1) * d_t + 1
-                        t_out_len = max(1, (t_padded - eff_k_t) // s_t + 1)
-                        frames: List[torch.Tensor] = []
-                        for t_idx in range(t_out_len):
-                            t_start = t_idx * s_t
-                            acc: Optional[torch.Tensor] = None
-                            for kt_idx in range(k_t):
-                                x_slice = input[:, :, t_start + kt_idx * d_t, :, :].clone()
-                                w_slice = weight[:, :, kt_idx, :, :].clone()
-                                conv_step = F.conv2d(
-                                    x_slice,
-                                    w_slice,
-                                    bias=bias if kt_idx == 0 else None,
-                                    stride=(s_h, s_w),
-                                    padding=(p_h, p_w),
-                                    dilation=(d_h, d_w),
-                                    groups=groups,
-                                )
-                                acc = conv_step if acc is None else (acc + conv_step)
-                            assert acc is not None
-                            frames.append(acc.unsqueeze(2))
-                        return torch.cat(frames, dim=2)
-                return orig_conv3d(input, weight, bias, stride, padding, dilation, groups)
-
-            setattr(_omni_conv3d, "_omni_dml_safe", True)
-            F.conv3d = _omni_conv3d
     except Exception as exc:
         logging.debug(f"[OmniLoRA] Could not install torch/F runtime hooks: {exc}")
 
@@ -3703,8 +3743,15 @@ def install_comfy_runtime_hooks() -> None:
                             full_w = raw_k[: -len(".weight")]
                             res_map.setdefault(short_w, raw_k)
                             res_map.setdefault(full_w, raw_k)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        "adapters.lora_keys_unet_alias",
+                        "Failed while adding short/full weight aliases in model_lora_keys_unet hook",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
                 return res_map
 
             comfy.lora.model_lora_keys_unet = _omni_model_lora_keys_unet
@@ -3748,7 +3795,15 @@ def install_comfy_runtime_hooks() -> None:
             return
         try:
             setattr(mg_target, "_omni_aimdo_patched", True)
-        except Exception:
+        except (AttributeError, TypeError) as exc:
+            report_exception(
+                "adapters.aimdo_patch_marker",
+                f"Could not mark {mg_target} as aimdo-patched",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="adapters",
+            )
             return
 
         if hasattr(mg_target, "_call"):
@@ -3769,8 +3824,15 @@ def install_comfy_runtime_hooks() -> None:
                         raise
 
                 setattr(mg_target, "_call", _safe_aimdo_call)
-            except Exception:
-                pass
+            except (AttributeError, TypeError) as exc:
+                report_exception(
+                    "adapters.aimdo_patch_call",
+                    f"Could not patch {mg_target}._call",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
 
         for method_name in ("iterate", "push", "pop", "begin", "end", "pause", "resume"):
             if not hasattr(mg_target, method_name):
@@ -3795,14 +3857,31 @@ def install_comfy_runtime_hooks() -> None:
                     return _wrapped
 
                 setattr(mg_target, method_name, _make_safe_mg_method(orig_m))
-            except Exception:
-                pass
+            except (AttributeError, TypeError) as exc:
+                report_exception(
+                    f"adapters.aimdo_patch_{method_name}",
+                    f"Could not patch {mg_target}.{method_name}",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
 
     _aimdo_mg = sys.modules.get("comfy_aimdo.malloc_graph")
     if _aimdo_mg is None:
         try:
             import comfy_aimdo.malloc_graph as _aimdo_mg  # type: ignore
-        except Exception:
+        except ImportError:
+            _aimdo_mg = None
+        except Exception as exc:
+            report_exception(
+                "adapters.import_aimdo_mg",
+                "Unexpected error importing comfy_aimdo.malloc_graph",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="adapters",
+            )
             _aimdo_mg = None
     if _aimdo_mg is not None:
         _patch_malloc_graph_obj(getattr(_aimdo_mg, "MallocGraph", None))
@@ -3812,7 +3891,17 @@ def install_comfy_runtime_hooks() -> None:
     if _mp is None:
         try:
             import comfy.model_prefetch as _mp  # type: ignore
-        except Exception:
+        except ImportError:
+            _mp = None
+        except Exception as exc:
+            report_exception(
+                "adapters.import_model_prefetch",
+                "Unexpected error importing comfy.model_prefetch",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="adapters",
+            )
             _mp = None
 
     if _mp is not None:
@@ -3905,8 +3994,15 @@ def install_comfy_runtime_hooks() -> None:
                             ):
                                 kwargs = dict(kwargs)
                                 kwargs[ck] = _adapt_context_width(ct, exp_dim, model_name=type(dm).__name__ if dm is not None else None)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        "adapters.extra_conds_context_width",
+                        "Context-width adaptation hook in BaseModel.extra_conds failed; passing kwargs unchanged",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
                 return _orig_extra_conds(self, **kwargs)
 
             setattr(base_cls, "extra_conds", _omni_extra_conds)
@@ -4043,8 +4139,15 @@ def install_comfy_runtime_hooks() -> None:
                                     new_weights[0] = reshaped_up
                                     new_weights[1] = padded_down
                                     self.weights = tuple(new_weights) if isinstance(w_tuple, tuple) else new_weights
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            report_exception(
+                                "adapters.lora_adapter_conv_upgrade",
+                                f"2D->ND conv LoRA weight upgrade failed for key '{key}'; deferring to original calculate_weight",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="adapters",
+                            )
                         return orig_fn(self, weight, key, *args, **kwargs)
 
                     return _omni_ad_calculate_weight
@@ -4165,7 +4268,17 @@ def install_comfy_runtime_hooks() -> None:
         if comfy_attn is None and "comfy.ldm" in sys.modules:
             try:
                 import comfy.ldm.modules.attention as comfy_attn  # type: ignore
-            except Exception:
+            except ImportError:
+                comfy_attn = None
+            except Exception as exc:
+                report_exception(
+                    "adapters.import_comfy_attn",
+                    "Could not import comfy.ldm.modules.attention",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
                 comfy_attn = None
 
         if comfy_attn is not None:
@@ -4201,8 +4314,15 @@ def install_comfy_runtime_hooks() -> None:
                         safe_c = _make_safe_container(orig_container)
                         try:
                             setattr(orig_fn, "container_function", safe_c)
-                        except Exception:
-                            pass
+                        except (AttributeError, TypeError) as exc:
+                            report_exception(
+                                f"adapters.attn_container_patch.{fn_name}",
+                                f"Could not patch container_function on {fn_name}",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="adapters",
+                            )
 
                     def _make_safe_attn_fn(orig_f: Any) -> Any:
                         @functools.wraps(orig_f)
@@ -4246,18 +4366,40 @@ def install_comfy_runtime_hooks() -> None:
                     for attr_n in ("optimized_attention", "optimized_attention_masked"):
                         try:
                             cur_ref = getattr(mod_obj, attr_n, None)
-                        except Exception:
+                        except Exception as exc:
+                            report_exception(
+                                "adapters.attn_rebind_getattr",
+                                f"Could not inspect {mod_name}.{attr_n} during attention hook install",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="adapters",
+                            )
                             continue
                         pair = replaced_map.get(id(cur_ref))
                         if pair is not None:
                             try:
                                 setattr(mod_obj, attr_n, pair[1])
-                            except Exception:
-                                pass
+                            except (AttributeError, TypeError) as exc:
+                                report_exception(
+                                    "adapters.attn_rebind_setattr",
+                                    f"Could not rebind {mod_name}.{attr_n} during attention hook install",
+                                    exc,
+                                    level=logging.DEBUG,
+                                    once=True,
+                                    logger_name="adapters",
+                                )
 
             setattr(comfy_attn, "_omni_attn_hooks_installed", True)
-    except Exception:
-        pass
+    except Exception as exc:
+        report_exception(
+            "adapters.install_attn_hooks",
+            "Failed to install ComfyUI training-safe attention hooks",
+            exc,
+            level=logging.WARNING,
+            once=True,
+            logger_name="adapters",
+        )
 
     try:
         import functools as _ft
@@ -4558,12 +4700,7 @@ def uninstall_comfy_runtime_hooks() -> None:
     for target_obj, attr_pairs in (
         (
             F,
-            (
-                ("rms_norm", "_omni_orig_rms_norm"),
-                ("pixel_unshuffle", "_omni_orig_pixel_unshuffle"),
-                ("pixel_shuffle", "_omni_orig_pixel_shuffle"),
-                ("conv3d", "_omni_orig_conv3d"),
-            ),
+            (("rms_norm", "_omni_orig_rms_norm"),),
         ),
         (
             torch,
@@ -4579,8 +4716,15 @@ def uninstall_comfy_runtime_hooks() -> None:
                     logging.debug(f"[OmniLoRA] Could not restore {target_obj}.{attr_name}: {exc}")
                 try:
                     delattr(target_obj, stash_attr)
-                except Exception:
-                    pass
+                except (AttributeError, TypeError) as exc:
+                    report_exception(
+                        f"adapters.uninstall_del_{stash_attr}",
+                        f"Could not delete stash attr {stash_attr} from {target_obj}",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
 
     # 2. Restore `comfy.lora` and `comfy.sd` LoRA key & text-encoder hooks
     comfy_lora = sys.modules.get("comfy.lora")
@@ -4594,8 +4738,15 @@ def uninstall_comfy_runtime_hooks() -> None:
                 if hasattr(comfy_lora, marker):
                     try:
                         delattr(comfy_lora, marker)
-                    except Exception:
-                        pass
+                    except (AttributeError, TypeError) as exc:
+                        report_exception(
+                            f"adapters.uninstall_comfy_lora_{marker}",
+                            f"Could not delete {marker} from comfy.lora",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="adapters",
+                        )
 
     comfy_sd = sys.modules.get("comfy.sd")
     if comfy_sd is not None:
@@ -4611,8 +4762,15 @@ def uninstall_comfy_runtime_hooks() -> None:
                     logging.debug(f"[OmniLoRA] Could not restore comfy.sd.{attr_name}: {exc}")
                 try:
                     delattr(comfy_sd, stash_attr)
-                except Exception:
-                    pass
+                except (AttributeError, TypeError) as exc:
+                    report_exception(
+                        f"adapters.uninstall_comfy_sd_{stash_attr}",
+                        f"Could not delete {stash_attr} from comfy.sd",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
 
     # 3. Restore `comfy_aimdo.malloc_graph` & `comfy.model_prefetch`
     def _unpatch_malloc_graph_obj(mg_target: Any) -> None:
@@ -4640,8 +4798,15 @@ def uninstall_comfy_runtime_hooks() -> None:
         if "_omni_aimdo_patched" in target_dict:
             try:
                 delattr(mg_target, "_omni_aimdo_patched")
-            except Exception:
-                pass
+            except (AttributeError, TypeError) as exc:
+                report_exception(
+                    "adapters.uninstall_aimdo_marker",
+                    f"Could not delete _omni_aimdo_patched from {mg_target}",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
 
     aimdo_mg = sys.modules.get("comfy_aimdo.malloc_graph")
     if aimdo_mg is not None:
@@ -4673,8 +4838,15 @@ def uninstall_comfy_runtime_hooks() -> None:
                 if hasattr(base_cls, marker):
                     try:
                         delattr(base_cls, marker)
-                    except Exception:
-                        pass
+                    except (AttributeError, TypeError) as exc:
+                        report_exception(
+                            f"adapters.uninstall_extra_conds_{marker}",
+                            f"Could not delete {marker} from BaseModel",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="adapters",
+                        )
 
     # 5. Restore `comfy.weight_adapter` LoRA adapter `calculate_weight`
     cwa_mod = sys.modules.get("comfy.weight_adapter")
@@ -4696,8 +4868,15 @@ def uninstall_comfy_runtime_hooks() -> None:
                     if hasattr(lora_ad_cls, marker):
                         try:
                             delattr(lora_ad_cls, marker)
-                        except Exception:
-                            pass
+                        except (AttributeError, TypeError) as exc:
+                            report_exception(
+                                f"adapters.uninstall_calc_weight_{marker}",
+                                f"Could not delete {marker} from {lora_ad_cls}",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="adapters",
+                            )
 
     # 6. Restore `comfy.ldm.modules.attention` backends & rebound module aliases
     comfy_attn = sys.modules.get("comfy.ldm.modules.attention")
@@ -4711,8 +4890,16 @@ def uninstall_comfy_runtime_hooks() -> None:
                 if orig_c is not None:
                     try:
                         setattr(orig_fn, "container_function", orig_c)
-                    except Exception:
-                        pass
+                    except (AttributeError, TypeError) as exc:
+                        report_exception(
+                            "adapters.uninstall_attn_container",
+                            "Could not restore attention container_function",
+                            exc,
+                            level=logging.WARNING,
+                            once=True,
+                            reraise_in_strict=True,
+                            logger_name="adapters",
+                        )
 
             for fn_name in (
                 "attention_comfy_kitchen_int8",
@@ -4727,8 +4914,16 @@ def uninstall_comfy_runtime_hooks() -> None:
                 if orig_fn is not None and orig_fn is not cur_fn:
                     try:
                         setattr(comfy_attn, fn_name, orig_fn)
-                    except Exception:
-                        pass
+                    except (AttributeError, TypeError) as exc:
+                        report_exception(
+                            f"adapters.uninstall_attn_{fn_name}",
+                            f"Could not restore comfy.ldm.modules.attention.{fn_name}",
+                            exc,
+                            level=logging.WARNING,
+                            once=True,
+                            reraise_in_strict=True,
+                            logger_name="adapters",
+                        )
 
             reg_map = getattr(comfy_attn, "REGISTERED_ATTENTION_FUNCTIONS", None)
             if isinstance(reg_map, dict):
@@ -4743,8 +4938,16 @@ def uninstall_comfy_runtime_hooks() -> None:
                 if orig_fn is not None:
                     try:
                         setattr(comfy_attn, global_attr, orig_fn)
-                    except Exception:
-                        pass
+                    except (AttributeError, TypeError) as exc:
+                        report_exception(
+                            f"adapters.uninstall_attn_{global_attr}",
+                            f"Could not restore comfy.ldm.modules.attention.{global_attr}",
+                            exc,
+                            level=logging.WARNING,
+                            once=True,
+                            reraise_in_strict=True,
+                            logger_name="adapters",
+                        )
 
             for mod_name, mod_obj in list(sys.modules.items()):
                 if not isinstance(mod_name, str) or not mod_name.startswith("comfy.") or mod_obj is None:
@@ -4752,21 +4955,43 @@ def uninstall_comfy_runtime_hooks() -> None:
                 for attr_n in ("optimized_attention", "optimized_attention_masked"):
                     try:
                         cur_ref = getattr(mod_obj, attr_n, None)
-                    except Exception:
+                    except Exception as exc:
+                        report_exception(
+                            "adapters.uninstall_attn_rebind_getattr",
+                            f"Could not inspect {mod_name}.{attr_n} during attention hook uninstall",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="adapters",
+                        )
                         continue
                     orig_fn = reverse_map.get(id(cur_ref))
                     if orig_fn is not None:
                         try:
                             setattr(mod_obj, attr_n, orig_fn)
-                        except Exception:
-                            pass
+                        except (AttributeError, TypeError) as exc:
+                            report_exception(
+                                "adapters.uninstall_attn_rebind_setattr",
+                                f"Could not restore {mod_name}.{attr_n} during attention hook uninstall",
+                                exc,
+                                level=logging.WARNING,
+                                once=True,
+                                logger_name="adapters",
+                            )
 
         for marker in ("_omni_replaced_attn_map", "_omni_attn_hooks_installed"):
             if hasattr(comfy_attn, marker):
                 try:
                     delattr(comfy_attn, marker)
-                except Exception:
-                    pass
+                except (AttributeError, TypeError) as exc:
+                    report_exception(
+                        f"adapters.uninstall_attn_{marker}",
+                        f"Could not delete {marker} from comfy.ldm.modules.attention",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
 
     # 7. Restore `comfy_kitchen` & `comfy.quant_ops.ck` training-safe wrappers
     ck_targets: List[Any] = []
@@ -4831,8 +5056,15 @@ def _rebind_comfy_attention_modules(root: Optional[nn.Module]) -> None:
             if pair is not None:
                 try:
                     setattr(obj, "function", pair[1])
-                except Exception:
-                    pass
+                except (AttributeError, TypeError) as exc:
+                    report_exception(
+                        "adapters.rebind_comfy_attn_fn",
+                        f"Could not rebind ComfyAttention.function on {type(obj).__name__}",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
             elif isinstance(fn, functools.partial):
                 inner_pair = replaced_map.get(id(fn.func))
                 if inner_pair is not None:
@@ -4840,8 +5072,15 @@ def _rebind_comfy_attention_modules(root: Optional[nn.Module]) -> None:
                         new_partial = functools.partial(inner_pair[1], *fn.args, **(fn.keywords or {}))
                         setattr(new_partial, "_omni_train_attn_safe", True)
                         setattr(obj, "function", new_partial)
-                    except Exception:
-                        pass
+                    except (AttributeError, TypeError) as exc:
+                        report_exception(
+                            "adapters.rebind_comfy_attn_partial",
+                            f"Could not rebind partial ComfyAttention.function on {type(obj).__name__}",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="adapters",
+                        )
 
 
 def unwrap_comfy_diffusion_model(
@@ -4865,8 +5104,17 @@ def unwrap_comfy_diffusion_model(
                 mm.load_models_gpu([comfy_model], memory_required=mem_req_bytes)
             except TypeError:
                 mm.load_models_gpu([comfy_model])
-        except Exception:
+        except ImportError:
             pass
+        except Exception as exc:
+            report_exception(
+                "adapters.load_models_gpu",
+                "comfy.model_management.load_models_gpu failed while unwrapping diffusion_model",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="adapters",
+            )
 
     candidates: List[Any] = []
     if hasattr(comfy_model, "get_model_object") and callable(comfy_model.get_model_object):
@@ -4874,8 +5122,15 @@ def unwrap_comfy_diffusion_model(
             dm = comfy_model.get_model_object("diffusion_model")
             if dm is not None:
                 candidates.append(dm)
-        except Exception:
-            pass
+        except Exception as exc:
+            report_exception(
+                "adapters.unwrap_get_model_object",
+                "get_model_object('diffusion_model') failed while unwrapping model",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="adapters",
+            )
 
     if hasattr(comfy_model, "model"):
         inner = comfy_model.model
@@ -5134,8 +5389,17 @@ def resolve_comfy_native_architecture(
                 detected_cfg = _cmd.model_config_from_unet(sd, "", use_base_if_no_match=False)
                 if detected_cfg is not None:
                     model_cfg = detected_cfg
-        except Exception:
+        except ImportError:
             pass
+        except Exception as exc:
+            report_exception(
+                "adapters.model_config_from_unet",
+                "comfy.model_detection.model_config_from_unet failed during architecture resolution",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="adapters",
+            )
 
         if model_cfg is None and result["canonical_id"] is not None:
             try:
@@ -5150,8 +5414,17 @@ def resolve_comfy_native_architecture(
                         base_ucfg["disable_unet_model_creation"] = True
                         model_cfg = sm_cls(base_ucfg)
                         break
-            except Exception:
+            except ImportError:
                 pass
+            except Exception as exc:
+                report_exception(
+                    "adapters.supported_models_lookup",
+                    "comfy.supported_models lookup failed during architecture resolution",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
 
     if model_cfg is not None:
         result["model_config"] = model_cfg
@@ -5168,13 +5441,27 @@ def resolve_comfy_native_architecture(
             if isinstance(lf, type):
                 try:
                     result["latent_format"] = lf()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        "adapters.instantiate_latent_format",
+                        f"Could not instantiate latent_format class {lf.__name__}",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="adapters",
+                    )
         if result["model_type"] is None and hasattr(model_cfg, "model_type") and callable(model_cfg.model_type):
             try:
                 result["model_type"] = model_cfg.model_type({})
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception(
+                    "adapters.resolve_model_type",
+                    f"Could not query model_type() on {cfg_cls_name}",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="adapters",
+                )
         mapped = _COMFY_SUPPORTED_MODEL_CANONICAL_MAP.get(cfg_cls_name.lower())
         if mapped:
             result["canonical_id"] = mapped
@@ -5200,8 +5487,17 @@ def resolve_comfy_native_architecture(
         if result["model_sampling"] is None and model_cfg is not None:
             m_type = result["model_type"] if result["model_type"] is not None else _cmb.ModelType.EPS
             result["model_sampling"] = _cmb.model_sampling(model_cfg, m_type)
-    except Exception:
+    except ImportError:
         pass
+    except Exception as exc:
+        report_exception(
+            "adapters.inspect_model_base",
+            "comfy.model_base inspection failed during architecture resolution",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="adapters",
+        )
 
     # 4. Check `unet_config["image_model"]` or `unet_config["audio_model"]` populated by ComfyUI's `supported_models.py`
     ucfg = result["unet_config"]
@@ -5322,7 +5618,17 @@ def discover_universal_target_modules(
                         paths.add(clean_w[: -len(".weight")].removeprefix("diffusion_model."))
                 if paths:
                     comfy_valid_paths = paths
-        except Exception:
+        except ImportError:
+            comfy_valid_paths = None
+        except Exception as exc:
+            report_exception(
+                "adapters.discover_comfy_lora_keys",
+                "comfy.lora.model_lora_keys_unet failed during target discovery; using structural classification",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="adapters",
+            )
             comfy_valid_paths = None
 
     block_module_ids = _collect_repeating_block_module_ids(backbone)

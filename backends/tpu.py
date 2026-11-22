@@ -5,9 +5,11 @@ Google Cloud TPU Hardware Backend (`torch_xla` / `xla:0` — TPU v5e-1, v4, v5p,
 from __future__ import annotations
 
 import contextlib
+import logging
 from typing import Any, Dict, Iterator, Tuple
 import torch
 
+from ..diagnostics import report_exception
 from .base import (
     DeviceCapabilities,
     HardwareBackend,
@@ -47,13 +49,16 @@ class TPUBackend(HardwareBackend):
                 try:
                     if int(torch_xla.device_count()) > 0:
                         return True
-                except Exception:
-                    pass
+                except (RuntimeError, ValueError, TypeError) as exc:
+                    report_exception("tpu.device_count_avail", "torch_xla.device_count() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.tpu")
             if hasattr(xm, "get_xla_supported_devices"):
                 devs = xm.get_xla_supported_devices()
                 return bool(devs and len(devs) > 0)
             return True
-        except Exception:
+        except ImportError:
+            return False
+        except Exception as exc:
+            report_exception("tpu.is_available", "TPU availability probe failed", exc, level=logging.DEBUG, once=True, logger_name="backends.tpu")
             return False
 
     def _valid_device_index(self) -> int:
@@ -69,8 +74,8 @@ class TPUBackend(HardwareBackend):
                 devs = xm.get_xla_supported_devices()
                 if devs:
                     return max(0, min(int(self.device_index), len(devs) - 1))
-        except Exception:
-            pass
+        except Exception as exc:
+            report_exception("tpu.valid_device_index", "TPU device index query failed", exc, level=logging.DEBUG, once=True, logger_name="backends.tpu")
         return 0
 
     def configure_environment(self) -> Dict[str, str]:
@@ -125,8 +130,8 @@ class TPUBackend(HardwareBackend):
                         dev_name = f"Google Cloud TPU ({attrs['name']})"
                 elif hw_kind:
                     dev_name = f"Google Cloud {hw_kind} ({total_mb / 1024.0:.0f}GB HBM)"
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception("tpu.capabilities_probe", "TPU capabilities query failed; using defaults", exc, level=logging.DEBUG, once=True, logger_name="backends.tpu")
             if total_mb == 16384.0:
                 comfy_mem = query_comfy_device_memory_mb(dev)
                 if comfy_mem is not None and comfy_mem[0] > 0:
@@ -184,8 +189,8 @@ class TPUBackend(HardwareBackend):
                     xm.mark_step()
                 if hasattr(xm, "wait_device_ops"):
                     xm.wait_device_ops()
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception("tpu.synchronize", "TPU synchronize/mark_step failed", exc, level=logging.DEBUG, once=True, logger_name="backends.tpu")
 
     def empty_cache(self) -> None:
         if self.is_available():
@@ -225,8 +230,8 @@ class TPUBackend(HardwareBackend):
                     peak = round(max(allocated, peak_b / (1024**2)), 2)
                     if limit_b > 0:
                         total = round(limit_b / (1024**2), 1)
-        except Exception:
-            pass
+        except Exception as exc:
+            report_exception("tpu.memory_snapshot", "TPU memory info query failed", exc, level=logging.DEBUG, once=True, logger_name="backends.tpu")
 
         free_mb = round(max(0.0, total - allocated), 1)
         comfy_mem = query_comfy_device_memory_mb(dev)
@@ -247,6 +252,6 @@ class TPUBackend(HardwareBackend):
                 _, xm = _import_torch_xla()
                 if hasattr(xm, "set_rng_state"):
                     xm.set_rng_state(seed, str(self.get_device()))
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception("tpu.manual_seed_all", "TPU set_rng_state() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.tpu")
 

@@ -5,6 +5,32 @@ Versioning follows [Semantic Versioning](https://semver.org/) and is tracked via
 
 ---
 
+## [1.1.4] - 2026-11-23
+
+### Added
+- **Shared Diagnostics & Recoverable Exception Framework (`omni_lora/diagnostics.py`)**:
+  - Added `get_logger()`, thread-safe memory-bounded `log_once()`, `clear_log_once_cache()`, `strict_errors_enabled()`, and `report_exception()` so recoverable fallbacks never swallow errors blindly or spam hot loops.
+  - Added `OMNILORA_STRICT_ERRORS=1` environment switch to re-raise unexpected exceptions at critical cleanup and state-restoration boundaries during CI or debugging.
+- **Repo-Wide AST Silent-Exception Regression Guard & Numerical Parity Tests**:
+  - Added `test_diagnostics_and_repo_wide_silent_exception_guard` enforcing zero bare `except:` and zero silent `except Exception: pass` handlers across all production Python files.
+  - Added `test_optimizer_reference_equivalence_and_quantized_backward_parity` verifying step-for-step numerical equivalence for `PureFP32Adafactor` (2D factored + 1D unfactored), FP32-master `RAdamW` / `AdamW` / `SGD`, and quantized `LoRALinear` (`int8_qlora` / `fp8_e4m3fn`) forward/backward gradients (`dx`, `lora_A`, `lora_B`) against dense dequantized references.
+
+### Fixed
+- **Genuine `RAdamW` Execution With `warmup_steps > 0`**:
+  - Removed the silent `has_lr_warmup` fallback to `AdamW` in `LoRATrainingPipeline._build_fp32_safe_optimizer()` and `_fp32_master_step()` so selecting `optimizer="radamw"` always runs genuine `torch.optim.RAdam(..., betas=(0.9, 0.99), decoupled_weight_decay=True)` regardless of `warmup_steps`.
+- **Repo-Wide Exception Hygiene (209 $\rightarrow$ 0 silent `except Exception: pass`)**:
+  - Audited and hardened all exception handlers across `pipelines/lora_trainer.py`, `lora/layers.py`, `models/adapters.py`, `nodes.py`, `backends/*.py`, `dataset.py`, and `tracker_store.py`: upgraded state-restoration and weight-uninject failures to `WARNING` (+ `reraise_in_strict=True`), surfaced malformed dataset caption metadata / unreadable directory warnings, and narrowed hardware/ComfyUI probing fallbacks to specific exception types with deduplicated `DEBUG` logging.
+
+### Removed
+- **Legacy Windows DirectML (`dml` / `torch-directml`) Backend & PyTorch 2.4 Workarounds**:
+  - Removed `backends/dml.py` (`DirectMLBackend`), the `"dml"` option from `BACKEND_REGISTRY`, `AUTO_PROBE_ORDER`, and `OmniLoRATrainer`'s `backend` dropdown, and ~1,100 lines of `privateuseone`-specific monkey-patches (`install_dml_fp64_scalar_guards()` global `torch.Tensor` operator hooks, 5D `pixel_unshuffle`/`pixel_shuffle`/`conv3d` fallbacks, `_pure_fp32_sdpa`, and `_unify_16bit_seq_tensors`).
+  - `torch-directml` is frozen on PyTorch 2.4 and incompatible with modern ComfyUI / `comfy_kitchen` custom ops; Windows GPUs are now served by native PyTorch backends (`cuda` for NVIDIA, `xpu` for Intel Arc, and `rocm` for AMD).
+
+### Documentation
+- Refined VRAM budgeting terminology in `README.md` to **Analytical VRAM Ledger** with explicit dynamic OOM self-healing context, added a **Verification Scope** callout and hardware **Status** column distinguishing actively hardware-tested vs. community-tested backends, and documented `OMNILORA_STRICT_ERRORS=1`.
+
+---
+
 ## [1.1.2] - 2026-11-22
 
 ### Fixed

@@ -1,8 +1,8 @@
 # ComfyUI-OmniLoRA
 
-**Universal in-graph LoRA training nodes for ComfyUI across CUDA, Intel Arc XPU, ROCm, TPU, MPS, DirectML & CPU. Supports any ComfyUI model, quantized backbones (FP8/INT8/GGUF), deterministic VRAM budgeting & CPU layer streaming.**
+**Universal in-graph LoRA training nodes for ComfyUI across CUDA, Intel Arc XPU, ROCm, TPU, MPS & CPU. Supports any ComfyUI model, quantized backbones (FP8/INT8/GGUF), analytical VRAM budgeting & automatic CPU layer streaming.**
 
-Train LoRAs directly inside your ComfyUI workflow — for standard **text-to-image/video** or paired **image-editing / control-folder** datasets — using the models, VAEs, and text encoders you already have on canvas. Works out of the box with **Flux (1 / Kontext / 2 / 3 Klein), Qwen-Image (1.0 / 2.1), Wan (2.1 / 2.2 Video & Image), SDXL, SD 3.5, SD 1.5, Chroma, Bria FIBO 2.0, HiDream (I1 / E1), MOSS-Image, OmniGen2, HunyuanVideo, LTX-Video & LTX-AV (2.0 / 2.5), MiniMax H3 (Video & Image), Lumina 2 / Z-Image, AuraFlow / Sana**, and quantized **FP8 / INT8 / GGUF / bitsandbytes** checkpoints across **NVIDIA CUDA, Intel Arc XPU, AMD ROCm, Apple Silicon MPS, Windows DirectML, Cloud TPU, Ascend NPU, Gaudi HPU, and CPU**.
+Train LoRAs directly inside your ComfyUI workflow — for standard **text-to-image/video** or paired **image-editing / control-folder** datasets — using the models, VAEs, and text encoders you already have on canvas. Works out of the box with **Flux (1 / Kontext / 2 / 3 Klein), Qwen-Image (1.0 / 2.1), Wan (2.1 / 2.2 Video & Image), SDXL, SD 3.5, SD 1.5, Chroma, Bria FIBO 2.0, HiDream (I1 / E1), MOSS-Image, OmniGen2, HunyuanVideo, LTX-Video & LTX-AV (2.0 / 2.5), MiniMax H3 (Video & Image), Lumina 2 / Z-Image, AuraFlow / Sana**, and quantized **FP8 / INT8 / GGUF / bitsandbytes** checkpoints across **NVIDIA CUDA, Intel Arc XPU, AMD ROCm, Apple Silicon MPS, Cloud TPU, Ascend NPU, Gaudi HPU, and CPU**.
 
 ---
 
@@ -87,9 +87,9 @@ ComfyUI includes an experimental built-in `TrainLoraNode` (`comfy_extras/nodes_t
 
 1. **Two-Stage VAE & CLIP Pre-Caching + Full VRAM Eviction**: Encodes your dataset through the VAE first (one image at a time), unloads the VAE from VRAM, encodes deduplicated prompts through CLIP, and unloads CLIP to CPU RAM *before* loading the diffusion backbone. All 100% of free VRAM goes to the UNet/DiT.
 2. **Train Directly on Quantized & GGUF Models**: Train LoRAs on top of **FP8** (`float8_e4m3fn` / `float8_e5m2`), ComfyUI **`QuantizedTensor`** (`int8_tensorwise`, `convrot`), **`ComfyUI-GGUF`** (`GGMLTensor` Q4_K_M / Q5_K / Q8_0 via on-the-fly GPU dequantization), and **`bitsandbytes`** (`NF4` / `INT8` on CUDA) without upcasting the frozen backbone to FP32.
-3. **Deterministic VRAM Ledger & Automatic CPU Layer Streaming**: Before Step 1, OmniLoRA inspects the live LoRA-injected model graph to calculate exact byte requirements for optimizer states (`opt`), peak single-block backward activations (`act`), and checkpointed block inputs (`ckpt_in`). Frozen base layers that fit stay in VRAM; remaining layers stream on-demand from pinned CPU RAM into a reusable 2-layer GPU staging buffer.
+3. **Analytical VRAM Ledger & Automatic CPU Layer Streaming**: Before Step 1, OmniLoRA inspects the live LoRA-injected model graph to compute a bottom-up byte budget for optimizer states (`opt`), peak single-block backward activations (`act`), and checkpointed block inputs (`ckpt_in`). Frozen base layers that fit stay in VRAM; remaining layers stream on-demand from pinned CPU RAM into a reusable 2-layer GPU staging buffer, backed by automatic mid-step OOM demotion if driver overhead or allocator fragmentation spikes.
 4. **Universal Runtime Model Introspection (`model_architecture="auto"`)**: Queries ComfyUI's live `ModelPatcher`, `BaseModel`, `latent_format`, `model_sampling`, and `extra_conds` directly. Automatically handles 4D images, 5D video (`[B, C, T, H, W]`), $2\times2$ patch-packed latents (`16ch <-> 64ch`), `c_concat` Inpaint/I2V/Control channels, Rectified Flow / Flow-Map `sample_sigmas` / V-Prediction / EDM / EPS schedules, and multi-axis RoPE conditioning.
-5. **Multi-Vendor Hardware Native (100% FP64-Free)**: Zero custom CUDA-only C++ extensions, zero `xformers` dependencies, and strict `float64` sanitization so GPUs without hardware FP64 or with 4 GiB single-allocation limits (**Intel Arc XPU**, **AMD ROCm**, **Apple MPS**, **Windows DirectML**) train at full native speed.
+5. **Multi-Vendor Hardware Native (100% FP64-Free)**: Zero custom CUDA-only C++ extensions, zero `xformers` dependencies, and strict `float64` sanitization so GPUs without hardware FP64 or with 4 GiB single-allocation limits (**Intel Arc XPU**, **AMD ROCm**, **Apple MPS**) train at full native speed.
 
 ---
 
@@ -129,7 +129,7 @@ Injects trainable LoRA layers into the connected `MODEL`, executes the training 
 | Parameter | Default | Description |
 | :--- | :--- | :--- |
 | `model_architecture` | `"auto"` | Introspects the connected ComfyUI `MODEL` automatically. |
-| `backend` | `"auto"` | Auto-probes `xpu` $\rightarrow$ `rocm` $\rightarrow$ `cuda` $\rightarrow$ `tpu` $\rightarrow$ `npu` $\rightarrow$ `hpu` $\rightarrow$ `dml` $\rightarrow$ `mps` $\rightarrow$ `cpu` (or force a specific backend). |
+| `backend` | `"auto"` | Auto-probes `xpu` $\rightarrow$ `rocm` $\rightarrow$ `cuda` $\rightarrow$ `tpu` $\rightarrow$ `npu` $\rightarrow$ `hpu` $\rightarrow$ `mps` $\rightarrow$ `cpu` (or force a specific backend). |
 | `reserve_vram_gb` | `0.0` | Extra GPU VRAM (in GB) to leave free for your OS / monitor display driver (`0.5 – 1.5` recommended on display GPUs). |
 | `optimizer` | `"radamw"` | `"radamw"` (Rectified AdamW), `"adamw"`, `"adafactor"` (~75–85% less optimizer VRAM), or `"sgd"` (Nesterov momentum). |
 | `rank` / `alpha` | `32` / `32.0` | LoRA rank $r$ and scaling factor $\alpha$ (automatically inherited if `initial_lora` is connected). |
@@ -190,7 +190,7 @@ When `Trainer 2` receives a `MODEL` output from `Trainer 1` (even without `initi
 Train instruction-based or paired image-to-image editing LoRAs on **any** ComfyUI edit architecture — including token-concatenated `reference_latents` DiTs (**Flux.1 Kontext**, **Flux 2 / 3 Klein**, **Qwen-Image-Edit 1.0 / 2.1**, **OmniGen2**, **Boogu**, **MOSS-Image**, **FIBO 2.0**, **Krea 2**, **JoyImage**, **Mage-Flow**) and channel-concatenated / `image_cond` models (**HiDream-E1**, **SD1.5 / SDXL InstructPix2Pix**, **Flux Fill / Control**, **Wan I2V**) — without hardcoding model-specific prompts or checklists:
 1. **Prepare two paired folders**: Put edited **target ("after")** images and `.txt` edit instructions in `dataset_path`, and put matching **control ("before")** images in `control_path` with matching filename stems (any extension, e.g. `001.png` $\leftrightarrow$ `001.jpg`, or mirrored subfolders `sub/002.png` $\leftrightarrow$ `sub/002.webp`). `control_resize_mode = "preserve_aspect"` preserves native control aspect ratios on `reference_latents` DiTs and automatically aligns spatial dimensions on `concat_latent_image` models.
 2. **Pre-cache (`OmniLoRAPrecomputeConditioning`)**: Target and control images are encoded sequentially through the `VAE` (target scaled, control kept raw unscaled for ComfyUI's native `extra_conds`). If your connected `CLIP` is a VLM text encoder (such as Qwen-VL, Mistral/Flux 2, Boogu, or OmniGen2), `pass_control_to_clip = "auto"` automatically passes the resized control image (`clip_vision_resolution = 384`) into `clip.tokenize(..., images=[...])` — and synchronizes horizontal flips across target latent, control latent, and VLM tokens when `random_flip = True`.
-3. **Train (`OmniLoRATrainer`)**: Leave `control_mode = "auto"` and `reference_latents_method = "auto"` to defer to ComfyUI's native model structure (or override explicitly at any time), and optionally enable `control_dropout` (e.g. `0.05–0.10`) for stronger CFG behavior. The deterministic VRAM ledger automatically accounts for doubled visual sequence length on `reference_latents` DiTs.
+3. **Train (`OmniLoRATrainer`)**: Leave `control_mode = "auto"` and `reference_latents_method = "auto"` to defer to ComfyUI's native model structure (or override explicitly at any time), and optionally enable `control_dropout` (e.g. `0.05–0.10`) for stronger CFG behavior. The analytical VRAM ledger automatically accounts for doubled visual sequence length on `reference_latents` DiTs.
 4. **Template**: Start immediately with [`example_workflows/omni_lora_image_edit_workflow.json`](./example_workflows/omni_lora_image_edit_workflow.json).
 
 ---
@@ -199,7 +199,9 @@ Train instruction-based or paired image-to-image editing LoRAs on **any** ComfyU
 
 Because `ComfyModelAdapter` routes forward passes through ComfyUI's own `BaseModel._apply_model`, `model_sampling`, `latent_format`, and `extra_conds`, any checkpoint or GGUF/FP8 model supported by ComfyUI works with `model_architecture="auto"`.
 
-The unmocked real-forward verification suite (`python -m omni_lora.tests.test_framework --cloud-verify`) tests **44 real `comfy.ldm.*` + `comfy.model_base.*` Image & Video architectures** directly on your active hardware backend alongside a 7-invariant FP32 + BF16 contract suite and a **14-architecture FP32 + BF16 unmocked image-editing suite** (layer targeting, zero dead layers, gradient-checkpointing parity, `batch_size > 1`, `preserve_aspect` control framing, ComfyUI `ModelPatcher` / `LoraLoader` parity, and clean base-weight restoration):
+> **Verification Scope**: The 44-architecture suite below verifies **unmocked real `comfy.ldm.*` + `comfy.model_base.*` contract execution** (architecture detection, layer targeting, zero dead layers, real forward/backward gradients, gradient-checkpointing parity, `batch_size > 1`, ComfyUI `ModelPatcher` / `LoraLoader` key parity, and clean base-weight restoration) directly on your active hardware backend. End-to-end multi-hundred-step real-checkpoint benchmarks across flagship models are planned for `v2.0.0`.
+
+The unmocked real-forward verification suite (`python -m omni_lora.tests.test_framework --cloud-verify`) tests **44 real `comfy.ldm.*` + `comfy.model_base.*` Image & Video architectures** alongside a 7-invariant FP32 + BF16 contract suite and a **14-architecture FP32 + BF16 unmocked image-editing suite**:
 
 | Family | Verified Architectures & Capabilities |
 | :--- | :--- |
@@ -213,21 +215,20 @@ The unmocked real-forward verification suite (`python -m omni_lora.tests.test_fr
 
 ## Supported Hardware Backends
 
-| Backend ID | Target Hardware | Key Optimizations in `omni_lora/backends/` |
-| :--- | :--- | :--- |
-| **`cuda`** | NVIDIA GeForce / RTX / Data Center GPUs | FlashAttention-2 / Cutlass Memory-Efficient SDPA, Tensor Core `bf16`/`tf32`, `expandable_segments:True` allocator, pinned-memory async PCIe layer streaming, plus `bitsandbytes` & GGUF support. |
-| **`xpu`** | Intel Arc (A770 16GB, B580 Battlemage) & Data Center Max | First-class `torch.xpu` backend with OneAPI Level Zero flags, XMX `bf16` runtime verification, 100% FP64-free execution, and proactive 64 MB query-chunked SDPA to stay below Level Zero's 4.00 GiB single-allocation limit. |
-| **`rocm`** | AMD Radeon RX 7000/9000 & Instinct MI200/MI300 (`HIP`) | ROCm HIP detection (`torch.version.hip`), AOTriton / FlashAttention SDPA, Matrix Core `bf16`/`fp16`, and tuning flags. |
-| **`mps`** | Apple Silicon (M1 / M2 / M3 / M4 Pro, Max, Ultra) | Metal Performance Shaders (`torch.backends.mps`) unified memory budget detection, `bf16`/`fp16` autocast, and chunked attention. |
-| **`dml`** | Windows DirectML (`torch_directml` — AMD / Intel / NVIDIA DX12) | Automatic `fp16` + `FP32GradScaler` cascade, custom DX12-safe `layer_norm` / `rms_norm` / `group_norm` / `sdpa` autograd overrides, and $\le 5\text{D}$ tensor descriptor guards. |
-| **`tpu`** | Google Cloud TPU (`torch_xla`) | XLA device resolution, native Matrix Multiply Unit `bf16`, and per-step `xm.mark_step()` graph execution. |
-| **`npu`** | Huawei Ascend 910A / 910B (`torch_npu` / CANN) | DaVinci Cube `bf16` execution and CANN memory management. |
-| **`hpu`** | Intel Gaudi 2 / Gaudi 3 (`habana_frameworks.torch`) | SynapseAI HPU eager/lazy mode `htcore.mark_step()` and `bf16` execution. |
-| **`cpu`** | Host CPU (x86_64 AVX-512 / ARM64) | OneDNN `bf16`/`fp32` execution and offline workflow verification. |
+| Backend ID | Target Hardware | Status | Key Optimizations in `omni_lora/backends/` |
+| :--- | :--- | :--- | :--- |
+| **`cuda`** | NVIDIA GeForce / RTX / Data Center GPUs | Actively tested on hardware | FlashAttention-2 / Cutlass Memory-Efficient SDPA, Tensor Core `bf16`/`tf32`, `expandable_segments:True` allocator, pinned-memory async PCIe layer streaming, plus `bitsandbytes` & GGUF support. |
+| **`xpu`** | Intel Arc (A770 16GB, B580 Battlemage) & Data Center Max | Actively tested on hardware | First-class `torch.xpu` backend with OneAPI Level Zero flags, XMX `bf16` runtime verification, 100% FP64-free execution, and proactive 64 MB query-chunked SDPA to stay below Level Zero's 4.00 GiB single-allocation limit. |
+| **`rocm`** | AMD Radeon RX 7000/9000 & Instinct MI200/MI300 (`HIP`) | Implemented & unit-tested *(community reports welcome)* | ROCm HIP detection (`torch.version.hip`), AOTriton / FlashAttention SDPA, Matrix Core `bf16`/`fp16`, and tuning flags. |
+| **`mps`** | Apple Silicon (M1 / M2 / M3 / M4 Pro, Max, Ultra) | Implemented & unit-tested *(community reports welcome)* | Metal Performance Shaders (`torch.backends.mps`) unified memory budget detection, `bf16`/`fp16` autocast, and chunked attention. |
+| **`tpu`** | Google Cloud TPU (`torch_xla`) | Implemented & unit-tested *(community reports welcome)* | XLA device resolution, native Matrix Multiply Unit `bf16`, and per-step `xm.mark_step()` graph execution. |
+| **`npu`** | Huawei Ascend 910A / 910B (`torch_npu` / CANN) | Implemented & unit-tested *(community reports welcome)* | DaVinci Cube `bf16` execution and CANN memory management. |
+| **`hpu`** | Intel Gaudi 2 / Gaudi 3 (`habana_frameworks.torch`) | Implemented & unit-tested *(community reports welcome)* | SynapseAI HPU eager/lazy mode `htcore.mark_step()` and `bf16` execution. |
+| **`cpu`** | Host CPU (x86_64 AVX-512 / ARM64) | Actively tested (CI) | OneDNN `bf16`/`fp32` execution and offline workflow verification. |
 
 ---
 
-## Under the Hood: Optimizers & Deterministic VRAM Ledger
+## Under the Hood: Optimizers & Analytical VRAM Ledger
 
 ### FP64-Free Optimizers
 All four optimizers execute with `foreach=False` (or pure-FP32 factored updates) so PyTorch never allocates internal `float64` step counters or multi-tensor lists on GPUs without FP64 hardware support:
@@ -236,14 +237,14 @@ All four optimizers execute with `foreach=False` (or pure-FP32 factored updates)
 - **`adamw`**: Standard `torch.optim.AdamW`.
 - **`sgd`**: Nesterov momentum SGD (`momentum=0.9`, single FP32 momentum buffer — uses 50% less optimizer VRAM than `radamw`/`adamw`).
 
-### How the Deterministic VRAM Ledger Works (`[ledger: opt=...MB, act=...MB, ckpt_in=...MB]`)
-Instead of relying on static percentage heuristics, `enforce_vram_budget` inspects the live LoRA-injected model graph before Step 1 and computes an exact bottom-up byte ledger:
+### How the Analytical VRAM Ledger Works (`[ledger: opt=...MB, act=...MB, ckpt_in=...MB]`)
+Instead of relying on static percentage heuristics, `enforce_vram_budget` inspects the live LoRA-injected model graph before Step 1 and computes a bottom-up byte budget (paired with dynamic OOM recovery to handle allocator fragmentation, temporary dequantization buffers, and backend kernel workspace variance):
 1. **Usable Hardware Ceiling (`usable_vram_mb`)**: Queries live OS/driver free memory (`mem_get_info()`) plus OmniLoRA's already-resident tensors, minus the hardware driver reserve and `reserve_vram_gb`.
 2. **Non-Base Resident Parameters & Trainable LoRA Weights**: Exact storage bytes of non-streamable stems, norms, embeddings, and `lora_A` / `lora_B` matrices.
-3. **Optimizer State + `.grad` Buffers (`opt`)**: Exact byte count from trainable parameter count and chosen `optimizer` (`~0.5 B/elem` for `adafactor`, `4 B/elem` for `sgd`, `8 B/elem` for `radamw`/`adamw`, plus `.grad` storage).
-4. **Checkpointed Block Input Snapshots (`ckpt_in`)**: $N_{\text{blocks}} \times B \times N_{\text{tokens}} \times D_{\text{model}} \times \text{sizeof}(\text{compute\\_dtype})$ when resident in VRAM (or a 2-block prefetch window when CPU layer streaming offloads block boundary snapshots to host RAM).
-5. **Peak Single-Block Backward Recomputation & GEMM Workspace (`act`)**: Summed from the exact `in_features`, `out_features`, and `rank` of every `LoRALinear` inside the largest transformer block, plus cuBLAS/oneDNN/rocBLAS workspace (`64–128 MB`).
-6. **Greedy Resident Fill + On-Demand CPU Layer Streaming**: All remaining VRAM (`max_resident_model_mb`) is filled with frozen base layers; any remaining frozen layers stay in pinned CPU RAM and stream on-demand into a pre-allocated GPU staging buffer (`2 × max_single_layer_mb`) without fragmenting the caching allocator. If an external OS memory spike triggers an OOM mid-step, OmniLoRA automatically demotes a slice of resident frozen layers to CPU RAM and retries the step cleanly.
+3. **Optimizer State + `.grad` Buffers (`opt`)**: Computed from trainable parameter count and chosen `optimizer` (`~0.5 B/elem` for `adafactor`, `4 B/elem` for `sgd`, `8 B/elem` for `radamw`/`adamw`, plus `.grad` storage).
+4. **Checkpointed Block Input Snapshots (`ckpt_in`)**: $N_{\text{blocks}} \times B \times N_{\text{tokens}} \times D_{\text{model}} \times \text{sizeof}(\text{compute dtype})$ when resident in VRAM (or a 2-block prefetch window when CPU layer streaming offloads block boundary snapshots to host RAM).
+5. **Peak Single-Block Backward Recomputation & GEMM Workspace (`act`)**: Estimated from the `in_features`, `out_features`, and `rank` of every `LoRALinear` inside the largest transformer block, plus cuBLAS/oneDNN/rocBLAS workspace headroom (`64–128 MB`).
+6. **Greedy Resident Fill, CPU Streaming & OOM Self-Healing**: All remaining VRAM (`max_resident_model_mb`) is filled with frozen base layers; any remaining frozen layers stay in pinned CPU RAM and stream on-demand into a pre-allocated GPU staging buffer (`2 × max_single_layer_mb`) to minimize allocator fragmentation. Because peak runtime memory also depends on allocator fragmentation and backend-specific temporary buffers, any unexpected mid-step OOM automatically demotes a slice of resident frozen layers to CPU RAM and retries the step cleanly.
 
 ---
 
@@ -264,7 +265,7 @@ Instead of relying on static percentage heuristics, `enforce_vram_budget` inspec
 
 ## Running the Unmocked Real-Forward Test & Verification Suite
 
-You can run the full unit, autograd-fidelity, and 44-architecture unmocked ComfyUI verification suite from the repository root without starting the ComfyUI server:
+You can run the full unit, autograd-fidelity, AST silent-exception guard, and 44-architecture unmocked ComfyUI verification suite from the repository root without starting the ComfyUI server:
 
 ```bash
 # Run all unit tests + 7-invariant unmocked real-forward contract suites (44 architectures)
@@ -272,7 +273,12 @@ python -m omni_lora.tests.test_framework
 
 # Run the live active-backend (CUDA / XPU / ROCm / MPS / CPU) 44-architecture sweep + full test suite
 python -m omni_lora.tests.test_framework --cloud-verify
+
+# Optional: fail fast on any unexpected state-restoration exception during CI or debugging
+OMNILORA_STRICT_ERRORS=1 python -m omni_lora.tests.test_framework
 ```
+
+> **Diagnostics & Exception Hygiene**: All production modules route recoverable fallbacks through `omni_lora/diagnostics.py` (`log_once` / `report_exception` under the `omni_lora` logger), enforced by a repo-wide AST regression test guaranteeing zero bare `except:` or silent `except Exception: pass` handlers. Setting `OMNILORA_STRICT_ERRORS=1` re-raises unexpected errors at critical cleanup and restoration boundaries instead of falling back.
 
 ---
 

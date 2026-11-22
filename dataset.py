@@ -22,6 +22,7 @@ Features:
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 from dataclasses import dataclass
@@ -30,6 +31,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+from .diagnostics import report_exception
 
 SUPPORTED_IMAGE_EXTENSIONS: Tuple[str, ...] = (
     ".png",
@@ -57,8 +60,10 @@ def _ensure_image_format_plugins_registered() -> None:
     _AVIF_PLUGINS_REGISTERED = True
     try:
         import pillow_avif  # type: ignore  # noqa: F401
-    except Exception:
+    except ImportError:
         pass
+    except Exception as exc:
+        report_exception("dataset.register_pillow_avif", "Failed to initialize pillow_avif plugin", exc, level=logging.DEBUG, once=True, logger_name="dataset")
     try:
         import pillow_heif  # type: ignore
 
@@ -66,8 +71,10 @@ def _ensure_image_format_plugins_registered() -> None:
             pillow_heif.register_heif_opener()
         if hasattr(pillow_heif, "register_avif_opener"):
             pillow_heif.register_avif_opener()
-    except Exception:
+    except ImportError:
         pass
+    except Exception as exc:
+        report_exception("dataset.register_pillow_heif", "Failed to initialize pillow_heif plugin", exc, level=logging.DEBUG, once=True, logger_name="dataset")
 
 
 def _open_pil_image_any_format(img_path: Path):
@@ -91,8 +98,8 @@ def _open_pil_image_any_format(img_path: Path):
         with Image.open(img_path) as raw_img:
             try:
                 raw_img.seek(0)
-            except Exception:
-                pass
+            except (EOFError, AttributeError, ValueError) as exc:
+                report_exception("dataset.pil_seek_zero", "PIL seek(0) skipped on single-frame image", exc, level=logging.DEBUG, once=True, logger_name="dataset")
             transposed = ImageOps.exif_transpose(raw_img)
             return transposed.copy()
     except Exception as exc:
@@ -107,7 +114,8 @@ def _open_pil_image_any_format(img_path: Path):
             if arr.ndim == 4:
                 arr = arr[0]
             return Image.fromarray(arr)
-    except Exception:
+    except Exception as exc:
+        report_exception("dataset.decode_imageio_v3", "imageio.v3 decode fallback failed", exc, level=logging.DEBUG, once=True, logger_name="dataset")
         try:
             import imageio  # type: ignore
 
@@ -116,8 +124,8 @@ def _open_pil_image_any_format(img_path: Path):
                 if arr.ndim == 4:
                     arr = arr[0]
                 return Image.fromarray(arr)
-        except Exception:
-            pass
+        except Exception as exc_v2:
+            report_exception("dataset.decode_imageio_v2", "imageio v2 decode fallback failed", exc_v2, level=logging.DEBUG, once=True, logger_name="dataset")
 
     # Fallback 2: OpenCV (cv2)
     try:
@@ -133,8 +141,8 @@ def _open_pil_image_any_format(img_path: Path):
             if mat.ndim == 3 and mat.shape[2] == 4:
                 rgba_mat = cv2.cvtColor(mat, cv2.COLOR_BGRA2RGBA)
                 return Image.fromarray(rgba_mat, mode="RGBA")
-    except Exception:
-        pass
+    except Exception as exc:
+        report_exception("dataset.decode_cv2", "OpenCV cv2 decode fallback failed", exc, level=logging.DEBUG, once=True, logger_name="dataset")
 
     ext_lower = img_path.suffix.lower()
     if ext_lower in (".avif", ".heic", ".heif"):
@@ -167,8 +175,8 @@ def _probe_image_header(img_path: Path) -> Tuple[int, int, bool]:
                 orientation = int(exif.get(274, 1)) if exif is not None else 1
                 if orientation in (5, 6, 7, 8):
                     h, w = w, h
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception("dataset.probe_exif", "Could not read EXIF orientation during header probe", exc, level=logging.DEBUG, once=True, logger_name="dataset")
             has_alpha = raw_img.mode in ("RGBA", "LA", "PA") or (
                 raw_img.mode == "P" and "transparency" in raw_img.info
             )
@@ -184,8 +192,8 @@ def _probe_image_header(img_path: Path) -> Tuple[int, int, bool]:
         finally:
             try:
                 pil_img.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception("dataset.pil_close_probe", "Could not close PIL image handle", exc, level=logging.DEBUG, once=True, logger_name="dataset")
 
 
 class DatasetSample:
@@ -661,8 +669,8 @@ def _load_mask_file_as_tensor(mask_path: Path) -> torch.Tensor:
     finally:
         try:
             pil_img.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            report_exception("dataset.pil_close", "Could not close PIL image handle", exc, level=logging.DEBUG, once=True, logger_name="dataset")
 
 
 def _load_image_and_mask_from_file(
@@ -705,8 +713,8 @@ def _load_image_and_mask_from_file(
     finally:
         try:
             pil_img.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            report_exception("dataset.pil_close", "Could not close PIL image handle", exc, level=logging.DEBUG, once=True, logger_name="dataset")
 
     if use_alpha_mask:
         sidecar_path = _find_sidecar_mask_file(img_path)
@@ -885,8 +893,15 @@ class OmniLoRADataset:
                                 ).strip()
                                 if fn and cap:
                                     _register_entry(scan_dir, fn, cap)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        report_exception(
+                            f"dataset.parse_jsonl.{jl_path.name}",
+                            f"Could not parse caption metadata file '{jl_path}'",
+                            exc,
+                            level=logging.WARNING,
+                            once=True,
+                            logger_name="dataset",
+                        )
             for json_name in ("captions.json", "metadata.json"):
                 j_path = scan_dir / json_name
                 if j_path.is_file():
@@ -901,8 +916,15 @@ class OmniLoRADataset:
                                     cap = str(v.get("text") or v.get("caption") or v.get("prompt") or "").strip()
                                     if cap:
                                         _register_entry(scan_dir, str(k), cap)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        report_exception(
+                            f"dataset.parse_json.{j_path.name}",
+                            f"Could not parse caption metadata file '{j_path}'",
+                            exc,
+                            level=logging.WARNING,
+                            once=True,
+                            logger_name="dataset",
+                        )
         return out
 
     @staticmethod
@@ -917,7 +939,15 @@ class OmniLoRADataset:
         def _walk_dir(cur: Path) -> None:
             try:
                 entries = sorted(cur.iterdir())
-            except Exception:
+            except OSError as exc:
+                report_exception(
+                    "dataset.walk_dir",
+                    f"Skipping unreadable dataset directory '{cur}'",
+                    exc,
+                    level=logging.WARNING,
+                    once=True,
+                    logger_name="dataset",
+                )
                 return
             for entry in entries:
                 if entry.name.startswith("."):

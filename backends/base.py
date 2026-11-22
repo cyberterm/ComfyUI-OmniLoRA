@@ -3,12 +3,12 @@ Unified Hardware Backend Abstraction Layer (ComfyUI-style model_management).
 
 Decouples training pipelines and model adapters from vendor-specific APIs
 (e.g., torch.cuda, xformers, nccl) so workloads run natively on Intel Arc XPU,
-NVIDIA CUDA, AMD ROCm, Huawei Ascend NPU, Intel Gaudi HPU, Windows DirectML,
+NVIDIA CUDA, AMD ROCm, Google Cloud TPU, Huawei Ascend NPU, Intel Gaudi HPU,
 Apple Silicon MPS, and CPU.
 
 Includes `FP32GradScaler` and `sanitize_module_no_fp64()` to guarantee zero
 `torch.float64` (`.double()`) operations on GPUs that lack hardware FP64
-(such as Intel Arc A770 `xpu`, Apple `mps`, and `dml`).
+(such as Intel Arc A770 `xpu` and Apple `mps`).
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from __future__ import annotations
 import abc
 import contextlib
 import gc
+import logging
 import math
 import os
 import sys
@@ -25,11 +26,13 @@ from typing import Any, ContextManager, Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from ..diagnostics import report_exception
+
 
 def query_comfy_device_memory_mb(device: torch.device) -> Optional[Tuple[float, float]]:
     """
     Query `(total_vram_mb, free_vram_mb)` via ComfyUI's `comfy.model_management` when running
-    inside ComfyUI (supports CUDA, ROCm, XPU, MPS, DirectML, and CPU).
+    inside ComfyUI (supports CUDA, ROCm, XPU, MPS, and CPU).
     """
     try:
         import comfy.model_management as mm  # type: ignore
@@ -40,8 +43,17 @@ def query_comfy_device_memory_mb(device: torch.device) -> Optional[Tuple[float, 
             total_mb = total_bytes / (1024**2)
             free_mb = max(0.0, min(total_mb, free_bytes / (1024**2)))
             return (round(total_mb, 1), round(free_mb, 1))
-    except Exception:
-        pass
+    except ImportError:
+        return None
+    except Exception as exc:
+        report_exception(
+            "backends.query_comfy_mem",
+            "comfy.model_management memory query failed",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="backends",
+        )
     return None
 
 
@@ -58,8 +70,17 @@ def query_host_ram_mb() -> Tuple[float, float]:
         avail_mb = float(vm.available) / (1024**2)
         if total_mb > 0:
             return (round(total_mb, 1), round(avail_mb, 1))
-    except Exception:
+    except ImportError:
         pass
+    except Exception as exc:
+        report_exception(
+            "backends.query_host_ram_psutil",
+            "psutil.virtual_memory() failed",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="backends",
+        )
 
     comfy_cpu_mem = query_comfy_device_memory_mb(torch.device("cpu"))
     if comfy_cpu_mem is not None and comfy_cpu_mem[0] > 0:
@@ -80,8 +101,15 @@ def query_host_ram_mb() -> Tuple[float, float]:
                 total_mb = mem_total_kb / 1024.0
                 avail_mb = (mem_avail_kb / 1024.0) if mem_avail_kb > 0 else (total_mb * 0.75)
                 return (round(total_mb, 1), round(avail_mb, 1))
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            report_exception(
+                "backends.query_host_ram_proc",
+                "Could not parse /proc/meminfo",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="backends",
+            )
 
     # 3. POSIX sysconf (macOS / BSD / Linux fallback)
     try:
@@ -91,8 +119,15 @@ def query_host_ram_mb() -> Tuple[float, float]:
             if page_size > 0 and phys_pages > 0:
                 total_mb = (page_size * phys_pages) / (1024**2)
                 return (round(total_mb, 1), round(total_mb * 0.75, 1))
-    except Exception:
-        pass
+    except (OSError, ValueError) as exc:
+        report_exception(
+            "backends.query_host_ram_sysconf",
+            "os.sysconf host RAM query failed",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="backends",
+        )
 
     return (32768.0, 24576.0)
 
@@ -147,7 +182,7 @@ def probe_bitsandbytes_support(device: torch.device, backend_id: str) -> bool:
     """
     Return True ONLY if `bitsandbytes` is genuinely supported on the active accelerator.
     `bitsandbytes` relies on CUDA C++ kernels (`libbitsandbytes_cuda`) and is unsupported on
-    Intel XPU (`xpu`), DirectML (`dml`), Apple MPS (`mps`), Ascend NPU (`npu`), Gaudi HPU (`hpu`), and CPU.
+    Intel XPU (`xpu`), Apple MPS (`mps`), Ascend NPU (`npu`), Gaudi HPU (`hpu`), and CPU.
     """
     if backend_id != "cuda" or device.type != "cuda" or not torch.cuda.is_available():
         return False
@@ -227,8 +262,15 @@ def move_custom_quantized_tensor(tensor: torch.Tensor, dest_device: torch.device
                     setattr(moved, attr_k, attr_v.to(device=dest_device))
                 else:
                     setattr(moved, attr_k, attr_v)
-            except Exception:
-                pass
+            except (AttributeError, TypeError, RuntimeError) as exc:
+                report_exception(
+                    "backends.move_custom_quant_attr",
+                    f"Could not preserve custom quantized tensor attribute '{attr_k}' on move",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="backends",
+                )
     return moved
 
 
@@ -388,9 +430,16 @@ def quantize_weight_fp8_or_int8(
                 q_weight = scaled.to(device=dest_device, dtype=fp8_dt)
                 q_scale = scale.to(device=dest_device, dtype=torch.float32)
                 return q_weight, q_scale
-            except Exception:
+            except RuntimeError as exc:
                 # Automatic fallback to universal 1-byte INT8 QLoRA if device driver rejects FP8 tensor
-                pass
+                report_exception(
+                    "backends.quantize_fp8_fallback_int8",
+                    f"FP8 weight quantization rejected on {dest_device}; falling back to INT8 QLoRA",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="backends",
+                )
 
         scale = (amax / 127.0).to(dtype=torch.float32)
         q_int8 = torch.clamp(torch.round(w_fp32 / scale), -127.0, 127.0).to(dtype=torch.int8)
@@ -404,12 +453,19 @@ def is_inference_tensor(tensor: Any) -> bool:
     try:
         if tensor.is_inference():
             return True
-    except Exception:
-        pass
+    except (RuntimeError, AttributeError) as exc:
+        report_exception(
+            "backends.is_inference_probe",
+            "tensor.is_inference() check failed; falling back to _version probe",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="backends",
+        )
     try:
         _ = tensor._version
         return False
-    except Exception:
+    except RuntimeError:
         return True
 
 
@@ -425,13 +481,11 @@ def _same_device(d1: torch.device, d2: torch.device) -> bool:
 def _safe_tensor_storage_id(tensor: torch.Tensor) -> int:
     """
     Return a unique integer identifier for `tensor`'s underlying storage without crashing
-    on backends whose GPU tensors do not expose a linear host/device storage pointer
-    (such as Windows DirectML `privateuseone` tensors, which raise
-    `RuntimeError: Cannot access data pointer of Tensor that doesn't have storage`,
-    or `meta` tensors).
+    on tensors that do not expose a linear host/device storage pointer (such as `meta`
+    or storage-less custom tensor subclasses).
     """
     dev_type = getattr(tensor.device, "type", "cpu")
-    if dev_type in ("meta", "privateuseone", "dml"):
+    if dev_type == "meta":
         return id(tensor)
     try:
         return int(tensor.data_ptr())
@@ -447,9 +501,7 @@ def safe_to_device(
 ) -> torch.Tensor:
     """
     Vendor-safe replacement for `tensor.to(device=..., dtype=...)`:
-    1. DirectML (`privateuseone`) does not support `torch.bfloat16` or `float8_*` in `DML_TENSOR_DATA_TYPE`
-       and fails inside `dml::CopyTensor` if a CPU `BFloat16` tensor is copied directly to a DirectML
-       `Float16` tensor via `.to(device=dml_device, dtype=torch.float16)`.
+    1. Prevents accidental `torch.float64` transfers onto accelerators without hardware FP64.
     2. When moving from CPU to an accelerator with a dtype conversion (`tensor.dtype != target_dt`),
        casts on CPU FIRST (`tensor.to(dtype=target_dt)`) before copying to `target_dev`.
     3. When moving from an accelerator to CPU with a dtype conversion, moves to CPU FIRST
@@ -464,20 +516,6 @@ def safe_to_device(
 
     if target_dt == torch.float64:
         target_dt = torch.float32
-    if target_dev.type in ("privateuseone", "dml"):
-        if target_dt == torch.bfloat16 or is_fp8_dtype(target_dt):
-            target_dt = torch.float16
-
-    if target_dev.type in ("privateuseone", "dml") or tensor.device.type in ("privateuseone", "dml"):
-        with torch.inference_mode(False), torch.no_grad():
-            src = tensor.detach() if is_inference_tensor(tensor) else tensor
-            if _same_device(src.device, target_dev) and src.dtype == target_dt:
-                return src.clone() if is_inference_tensor(tensor) else src
-            if src.device.type == "cpu" and target_dev.type != "cpu" and src.dtype != target_dt:
-                return src.to(dtype=target_dt).to(device=target_dev, non_blocking=non_blocking)
-            if src.device.type != "cpu" and target_dev.type == "cpu" and src.dtype != target_dt:
-                return src.to(device=target_dev, non_blocking=non_blocking).to(dtype=target_dt)
-            return src.to(device=target_dev, dtype=target_dt, non_blocking=non_blocking)
 
     if _same_device(tensor.device, target_dev) and tensor.dtype == target_dt:
         return tensor
@@ -491,363 +529,10 @@ def safe_to_device(
     return tensor.to(device=target_dev, dtype=target_dt, non_blocking=non_blocking)
 
 
-_DML_SCALAR_CACHE: Dict[Tuple[str, int, torch.dtype, float], torch.Tensor] = {}
-
-
-def _dml_scalar_tensor(val: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """
-    Return a 0-D scalar tensor on `device` with `dtype` (`float16` or `float32`, never `float64`
-    or `bfloat16` on DirectML), created outside `inference_mode` so it can safely participate in
-    both autograd training expressions and `torch.inference_mode()` sampling.
-    """
-    target_dt = dtype if dtype in (torch.float16, torch.float32) else torch.float32
-    dev_idx = int(device.index or 0) if device.type != "cpu" else 0
-    key = (device.type, dev_idx, target_dt, float(val))
-    cached = _DML_SCALAR_CACHE.get(key)
-    if cached is not None:
-        return cached
-    with torch.inference_mode(False), torch.no_grad():
-        t = torch.tensor(float(val), dtype=target_dt, device="cpu")
-        if device.type != "cpu":
-            t = t.to(device=device)
-    if len(_DML_SCALAR_CACHE) < 512:
-        _DML_SCALAR_CACHE[key] = t
-    return t
-
-
-def _is_dml_or_no_fp64_tensor(t: Any) -> bool:
-    if not isinstance(t, torch.Tensor):
-        return False
-    dev_type = getattr(t.device, "type", "cpu")
-    return dev_type in ("privateuseone", "dml") or bool(getattr(t, "_omni_simulate_dml_no_fp64", False))
-
-
-def _is_fp64_runtime_error(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    return "double" in msg or "float64" in msg or "fp64" in msg
-
-
-def install_dml_fp64_scalar_guards() -> None:
-    """
-    Install transparent `torch.Tensor` operator guards for Windows DirectML (`privateuseone` / `dml`)
-    and non-FP64 GPUs:
-    - In PyTorch, `1.0 - tensor` (`Tensor.__rsub__`) invokes `_C._VariableFunctions.rsub(self, other)`
-      which binds to `aten::rsub.Scalar(Tensor, Scalar)` where Python `float` (`1.0`) is passed as a
-      64-bit `c10::Scalar(double)`. On `torch-directml` (`privateuseone`), ATen's fallback wraps that
-      `Scalar(double)` into a `Float64` (`Double`) tensor and immediately crashes with:
-      `RuntimeError: The GPU device does not support Double (Float64) operations!`.
-    - Similarly guards `__sub__`, `__add__`, `__radd__`, `__mul__`, `__rmul__`, `__truediv__`,
-      `__rtruediv__`, `__pow__`, `add_`, `sub_`, `mul_`, `div_`, `addcmul_`, `addcdiv_`, and `torch.rsub`
-      so Python `float` scalars on `privateuseone` are always converted to explicit `float16`/`float32`
-      device tensors before dispatch.
-    """
-    if getattr(torch.Tensor, "_omni_dml_scalar_guards_installed", False):
-        return
-
-    orig_rsub = torch.Tensor.__rsub__
-    orig_sub = torch.Tensor.__sub__
-    orig_add = torch.Tensor.__add__
-    orig_radd = torch.Tensor.__radd__
-    orig_mul = torch.Tensor.__mul__
-    orig_rmul = torch.Tensor.__rmul__
-    orig_truediv = torch.Tensor.__truediv__
-    orig_rtruediv = torch.Tensor.__rtruediv__
-    orig_pow = torch.Tensor.__pow__
-    orig_add_ = torch.Tensor.add_
-    orig_sub_ = torch.Tensor.sub_
-    orig_mul_ = torch.Tensor.mul_
-    orig_div_ = torch.Tensor.div_
-    orig_addcmul_ = torch.Tensor.addcmul_
-    orig_addcdiv_ = torch.Tensor.addcdiv_
-    orig_torch_rsub = getattr(torch, "rsub", None)
-
-    def _safe_rsub(self: torch.Tensor, other: Any) -> Any:
-        if isinstance(other, (int, float)) and not isinstance(other, bool) and _is_dml_or_no_fp64_tensor(self):
-            other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-            return orig_sub(other_t, self)
-        try:
-            return orig_rsub(self, other)
-        except RuntimeError as exc:
-            if isinstance(other, (int, float)) and not isinstance(other, bool) and _is_fp64_runtime_error(exc):
-                other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-                return orig_sub(other_t, self)
-            raise
-
-    def _safe_sub(self: torch.Tensor, other: Any) -> Any:
-        if (
-            isinstance(other, (int, float))
-            and not isinstance(other, bool)
-            and torch.is_floating_point(self)
-            and _is_dml_or_no_fp64_tensor(self)
-        ):
-            other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-            return orig_sub(self, other_t)
-        try:
-            return orig_sub(self, other)
-        except RuntimeError as exc:
-            if isinstance(other, (int, float)) and not isinstance(other, bool) and _is_fp64_runtime_error(exc):
-                other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-                return orig_sub(self, other_t)
-            raise
-
-    def _safe_add(self: torch.Tensor, other: Any) -> Any:
-        if (
-            isinstance(other, (int, float))
-            and not isinstance(other, bool)
-            and torch.is_floating_point(self)
-            and _is_dml_or_no_fp64_tensor(self)
-        ):
-            other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-            return orig_add(self, other_t)
-        try:
-            return orig_add(self, other)
-        except RuntimeError as exc:
-            if isinstance(other, (int, float)) and not isinstance(other, bool) and _is_fp64_runtime_error(exc):
-                other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-                return orig_add(self, other_t)
-            raise
-
-    def _safe_radd(self: torch.Tensor, other: Any) -> Any:
-        if (
-            isinstance(other, (int, float))
-            and not isinstance(other, bool)
-            and torch.is_floating_point(self)
-            and _is_dml_or_no_fp64_tensor(self)
-        ):
-            other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-            return orig_add(self, other_t)
-        try:
-            return orig_radd(self, other)
-        except RuntimeError as exc:
-            if isinstance(other, (int, float)) and not isinstance(other, bool) and _is_fp64_runtime_error(exc):
-                other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-                return orig_add(self, other_t)
-            raise
-
-    def _safe_mul(self: torch.Tensor, other: Any) -> Any:
-        if (
-            isinstance(other, (int, float))
-            and not isinstance(other, bool)
-            and torch.is_floating_point(self)
-            and _is_dml_or_no_fp64_tensor(self)
-        ):
-            other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-            return orig_mul(self, other_t)
-        try:
-            return orig_mul(self, other)
-        except RuntimeError as exc:
-            if isinstance(other, (int, float)) and not isinstance(other, bool) and _is_fp64_runtime_error(exc):
-                other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-                return orig_mul(self, other_t)
-            raise
-
-    def _safe_rmul(self: torch.Tensor, other: Any) -> Any:
-        if (
-            isinstance(other, (int, float))
-            and not isinstance(other, bool)
-            and torch.is_floating_point(self)
-            and _is_dml_or_no_fp64_tensor(self)
-        ):
-            other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-            return orig_mul(self, other_t)
-        try:
-            return orig_rmul(self, other)
-        except RuntimeError as exc:
-            if isinstance(other, (int, float)) and not isinstance(other, bool) and _is_fp64_runtime_error(exc):
-                other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-                return orig_mul(self, other_t)
-            raise
-
-    def _safe_truediv(self: torch.Tensor, other: Any) -> Any:
-        if (
-            isinstance(other, (int, float))
-            and not isinstance(other, bool)
-            and torch.is_floating_point(self)
-            and _is_dml_or_no_fp64_tensor(self)
-        ):
-            other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-            return orig_truediv(self, other_t)
-        try:
-            return orig_truediv(self, other)
-        except RuntimeError as exc:
-            if isinstance(other, (int, float)) and not isinstance(other, bool) and _is_fp64_runtime_error(exc):
-                other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-                return orig_truediv(self, other_t)
-            raise
-
-    def _safe_rtruediv(self: torch.Tensor, other: Any) -> Any:
-        if isinstance(other, (int, float)) and not isinstance(other, bool) and _is_dml_or_no_fp64_tensor(self):
-            other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-            return orig_truediv(other_t, self)
-        try:
-            return orig_rtruediv(self, other)
-        except RuntimeError as exc:
-            if isinstance(other, (int, float)) and not isinstance(other, bool) and _is_fp64_runtime_error(exc):
-                other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-                return orig_truediv(other_t, self)
-            raise
-
-    def _safe_pow(self: torch.Tensor, exponent: Any) -> Any:
-        if (
-            isinstance(exponent, (int, float))
-            and not isinstance(exponent, bool)
-            and torch.is_floating_point(self)
-            and _is_dml_or_no_fp64_tensor(self)
-        ):
-            if exponent == 2 or exponent == 2.0:
-                return orig_mul(self, self)
-            if exponent == 1 or exponent == 1.0:
-                return self
-            if exponent == 0.5:
-                return torch.sqrt(self)
-            exp_t = _dml_scalar_tensor(float(exponent), self.device, self.dtype)
-            return orig_pow(self, exp_t)
-        try:
-            return orig_pow(self, exponent)
-        except RuntimeError as exc:
-            if isinstance(exponent, (int, float)) and not isinstance(exponent, bool) and _is_fp64_runtime_error(exc):
-                if exponent == 2 or exponent == 2.0:
-                    return orig_mul(self, self)
-                if exponent == 0.5:
-                    return torch.sqrt(self)
-                exp_t = _dml_scalar_tensor(float(exponent), self.device, self.dtype)
-                return orig_pow(self, exp_t)
-            raise
-
-    def _safe_add_(self: torch.Tensor, other: Any, *args: Any, **kwargs: Any) -> torch.Tensor:
-        if (
-            not args
-            and not kwargs
-            and isinstance(other, (int, float))
-            and not isinstance(other, bool)
-            and torch.is_floating_point(self)
-            and _is_dml_or_no_fp64_tensor(self)
-        ):
-            other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-            return orig_add_(self, other_t)
-        return orig_add_(self, other, *args, **kwargs)
-
-    def _safe_sub_(self: torch.Tensor, other: Any, *args: Any, **kwargs: Any) -> torch.Tensor:
-        if (
-            not args
-            and not kwargs
-            and isinstance(other, (int, float))
-            and not isinstance(other, bool)
-            and torch.is_floating_point(self)
-            and _is_dml_or_no_fp64_tensor(self)
-        ):
-            other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-            return orig_sub_(self, other_t)
-        return orig_sub_(self, other, *args, **kwargs)
-
-    def _safe_mul_(self: torch.Tensor, other: Any) -> torch.Tensor:
-        if (
-            isinstance(other, (int, float))
-            and not isinstance(other, bool)
-            and torch.is_floating_point(self)
-            and _is_dml_or_no_fp64_tensor(self)
-        ):
-            other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-            return orig_mul_(self, other_t)
-        return orig_mul_(self, other)
-
-    def _safe_div_(self: torch.Tensor, other: Any, *args: Any, **kwargs: Any) -> torch.Tensor:
-        if (
-            not args
-            and not kwargs
-            and isinstance(other, (int, float))
-            and not isinstance(other, bool)
-            and torch.is_floating_point(self)
-            and _is_dml_or_no_fp64_tensor(self)
-        ):
-            other_t = _dml_scalar_tensor(float(other), self.device, self.dtype)
-            return orig_div_(self, other_t)
-        return orig_div_(self, other, *args, **kwargs)
-
-    def _safe_addcmul_(
-        self: torch.Tensor,
-        tensor1: torch.Tensor,
-        tensor2: torch.Tensor,
-        *,
-        value: Any = 1,
-    ) -> torch.Tensor:
-        if _is_dml_or_no_fp64_tensor(self):
-            prod = orig_mul(tensor1, tensor2)
-            if value != 1 and value != 1.0:
-                val_t = _dml_scalar_tensor(float(value), self.device, self.dtype)
-                prod = orig_mul(prod, val_t)
-            return orig_add_(self, prod)
-        try:
-            return orig_addcmul_(self, tensor1, tensor2, value=value)
-        except RuntimeError:
-            prod = orig_mul(tensor1, tensor2)
-            if value != 1 and value != 1.0:
-                val_t = _dml_scalar_tensor(float(value), self.device, self.dtype)
-                prod = orig_mul(prod, val_t)
-            return orig_add_(self, prod)
-
-    def _safe_addcdiv_(
-        self: torch.Tensor,
-        tensor1: torch.Tensor,
-        tensor2: torch.Tensor,
-        *,
-        value: Any = 1,
-    ) -> torch.Tensor:
-        if _is_dml_or_no_fp64_tensor(self):
-            quot = orig_truediv(tensor1, tensor2)
-            if value != 1 and value != 1.0:
-                val_t = _dml_scalar_tensor(float(value), self.device, self.dtype)
-                quot = orig_mul(quot, val_t)
-            return orig_add_(self, quot)
-        try:
-            return orig_addcdiv_(self, tensor1, tensor2, value=value)
-        except RuntimeError:
-            quot = orig_truediv(tensor1, tensor2)
-            if value != 1 and value != 1.0:
-                val_t = _dml_scalar_tensor(float(value), self.device, self.dtype)
-                quot = orig_mul(quot, val_t)
-            return orig_add_(self, quot)
-
-    torch.Tensor.__rsub__ = _safe_rsub  # type: ignore[method-assign,assignment]
-    torch.Tensor.__sub__ = _safe_sub  # type: ignore[method-assign,assignment]
-    torch.Tensor.__add__ = _safe_add  # type: ignore[method-assign,assignment]
-    torch.Tensor.__radd__ = _safe_radd  # type: ignore[method-assign,assignment]
-    torch.Tensor.__mul__ = _safe_mul  # type: ignore[method-assign,assignment]
-    torch.Tensor.__rmul__ = _safe_rmul  # type: ignore[method-assign,assignment]
-    torch.Tensor.__truediv__ = _safe_truediv  # type: ignore[method-assign,assignment]
-    torch.Tensor.__rtruediv__ = _safe_rtruediv  # type: ignore[method-assign,assignment]
-    if hasattr(torch.Tensor, "__rdiv__"):
-        torch.Tensor.__rdiv__ = _safe_rtruediv  # type: ignore[attr-defined]
-    torch.Tensor.__pow__ = _safe_pow  # type: ignore[method-assign,assignment]
-    torch.Tensor.add_ = _safe_add_  # type: ignore[method-assign,assignment]
-    torch.Tensor.sub_ = _safe_sub_  # type: ignore[method-assign,assignment]
-    torch.Tensor.mul_ = _safe_mul_  # type: ignore[method-assign,assignment]
-    torch.Tensor.div_ = _safe_div_  # type: ignore[method-assign,assignment]
-    torch.Tensor.addcmul_ = _safe_addcmul_  # type: ignore[method-assign,assignment]
-    torch.Tensor.addcdiv_ = _safe_addcdiv_  # type: ignore[method-assign,assignment]
-
-    if orig_torch_rsub is not None:
-        def _safe_torch_rsub(input: torch.Tensor, other: Any, *, alpha: Any = 1) -> torch.Tensor:
-            if isinstance(other, (int, float)) and not isinstance(other, bool) and _is_dml_or_no_fp64_tensor(input):
-                other_t = _dml_scalar_tensor(float(other), input.device, input.dtype)
-                scaled = input if (alpha == 1 or alpha == 1.0) else orig_mul(
-                    input, _dml_scalar_tensor(float(alpha), input.device, input.dtype)
-                )
-                return orig_sub(other_t, scaled)
-            return orig_torch_rsub(input, other, alpha=alpha)
-
-        torch.rsub = _safe_torch_rsub  # type: ignore[assignment]
-
-    setattr(torch.Tensor, "_omni_dml_scalar_guards_installed", True)
-
-
-install_dml_fp64_scalar_guards()
-
-
 def sanitize_module_no_fp64(module: nn.Module) -> nn.Module:
     """
     Ensure every parameter and buffer in `module`:
-    1. Is converted from `torch.float64` to `torch.float32` (preventing fp64 kernel crashes on XPU/MPS/DML).
+    1. Is converted from `torch.float64` to `torch.float32` (preventing fp64 kernel crashes on XPU/MPS).
     2. Is NOT an inference tensor (`param.is_inference() == True`) for small/non-linear layers that run
        standard PyTorch autograd `SavedVariable` paths (such as 1D LayerNorm/RMSNorm weights, biases,
        or Conv/Embedding layers), while NEVER cloning large 2D `weight` matrices on CPU or GPU so
@@ -885,7 +570,6 @@ def sanitize_module_no_fp64(module: nn.Module) -> nn.Module:
                         not param.requires_grad
                         and param.ndim == 2
                         and name == "weight"
-                        and param.device.type not in ("privateuseone", "dml")
                         and (param.numel() >= 65536 or is_fp8_dtype(param.dtype) or param.dtype == torch.int8)
                         and sub_cls_name != "Embedding"
                     )
@@ -922,8 +606,15 @@ def trim_process_working_set() -> None:
     """
     try:
         gc.collect()
-    except Exception:
-        pass
+    except Exception as exc:
+        report_exception(
+            "backends.trim_working_set_gc",
+            "gc.collect() failed in trim_process_working_set",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="backends",
+        )
 
 
 
@@ -936,7 +627,7 @@ class FP32GradScaler:
       `self._scale.double().reciprocal().float()`
     on the target device (`grad_scaler.py:352`), which allocates a `torch.float64`
     tensor on the GPU and crashes on Intel Arc XPU (`RuntimeError: Required aspect
-    fp64 is not supported on the device`), Apple MPS, and DirectML.
+    fp64 is not supported on the device`) and Apple MPS.
 
     `FP32GradScaler` implements the exact same dynamic loss-scaling state machine
     using strictly Python floats and `torch.float32` operations—never `fp64`.
@@ -969,7 +660,9 @@ class FP32GradScaler:
         if not self.enabled:
             return loss
         # Multiply by an explicit float32 scalar created on CPU first—never float64
-        scale_t = _dml_scalar_tensor(self._scale, loss.device, torch.float32)
+        scale_t = torch.tensor(float(self._scale), dtype=torch.float32, device="cpu")
+        if loss.device.type != "cpu":
+            scale_t = scale_t.to(device=loss.device)
         return loss.to(dtype=torch.float32) * scale_t
 
     @staticmethod
@@ -1076,7 +769,6 @@ class HardwareBackend(abc.ABC):
 
     def __init__(self, device_index: int = 0, dtype: str = "bf16") -> None:
         torch.set_default_dtype(torch.float32)
-        install_dml_fp64_scalar_guards()
         self.device_index = device_index
         req = (dtype or "bf16").lower()
         self.base_weight_quantization: Optional[str] = (
@@ -1086,11 +778,18 @@ class HardwareBackend(abc.ABC):
         self.torch_dtype = self.resolve_dtype(self.dtype_name)
         if self.torch_dtype == torch.bfloat16:
             try:
-                if self.backend_id == "dml" or (self.is_available() and not self.get_capabilities().supports_bf16):
+                if self.is_available() and not self.get_capabilities().supports_bf16:
                     self.dtype_name = "fp16"
                     self.torch_dtype = torch.float16
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception(
+                    "backends.init_bf16_probe",
+                    "BF16 capability check failed during backend init; keeping requested dtype",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="backends",
+                )
 
     @property
     @abc.abstractmethod
@@ -1148,7 +847,6 @@ class HardwareBackend(abc.ABC):
         if (
             not enabled
             or self.torch_dtype == torch.float32
-            or active_dev_type == "privateuseone"
             or (active_dev_type == "cpu" and self.torch_dtype != torch.bfloat16)
         ):
             yield
@@ -1400,7 +1098,7 @@ class HardwareBackend(abc.ABC):
     ) -> Dict[str, float]:
         """
         Compute a deterministic, graph-inspected VRAM budget across any GPU size (6 GB to 80 GB+)
-        and any vendor (`cuda`, `rocm`, `xpu`, `tpu`, `mps`, `dml`, `npu`, `hpu`, `cpu`).
+        and any vendor (`cuda`, `rocm`, `xpu`, `tpu`, `mps`, `npu`, `hpu`, `cpu`).
         Replaces arbitrary percentages with a bottom-up memory ledger:
         1. `usable_vram_mb`: Hardware capacity minus OS/WDDM/CUDA driver context reserve and `reserve_vram_gb`.
         2. `optimizer_allowance_mb`: Exact LoRA gradients (`p.grad`) + FP32 optimizer state buffers
@@ -1452,7 +1150,7 @@ class HardwareBackend(abc.ABC):
         free_mb = min(total_mb, max(0.0, free_mb))
 
         # 1. Hardware Available Ceiling (OS / WDDM paging reserve / CUDA context reserve)
-        if self.backend_id in ("xpu", "dml", "mps"):
+        if self.backend_id in ("xpu", "mps"):
             os_driver_reserve_mb = max(768.0, total_mb * 0.125)
         else:
             os_driver_reserve_mb = max(512.0, total_mb * 0.085)
@@ -1466,7 +1164,7 @@ class HardwareBackend(abc.ABC):
         if trainable_numel <= 0.0 and trainable_mb > 0.0:
             trainable_numel = (trainable_mb * (1024.0**2)) / 2.0
         opt_name = (optimizer_type or "radamw").lower()
-        needs_fp32_master = self.torch_dtype in (torch.float16, torch.bfloat16) or self.backend_id == "dml"
+        needs_fp32_master = self.torch_dtype in (torch.float16, torch.bfloat16)
         if opt_name == "adafactor":
             # Adafactor (beta1=0, factored row/col FP32 2nd moments + stochastic rounding): ~0.5 B/elem
             state_bytes_per_elem = 0.5
@@ -1539,7 +1237,7 @@ class HardwareBackend(abc.ABC):
             # never stalls trimming the pool mid-backward.
             offload_ckpt_inputs = True
             ckpt_inputs_mb = ckpt_inputs_cpu_mb
-            if self.backend_id in ("xpu", "dml", "mps"):
+            if self.backend_id in ("xpu", "mps"):
                 allocator_workspace_mb = max(2450.0, 1750.0 + 6.5 * peak_single_act_mb)
             elif total_mb < 15600.0 or needs_fp32_master:
                 allocator_workspace_mb = max(3600.0, 2650.0 + 10.0 * peak_single_act_mb)
@@ -1575,7 +1273,7 @@ class HardwareBackend(abc.ABC):
         """
         Inspect `module` for external `bitsandbytes` layers (`Linear4bit`, `Linear8bitLt`, `Params4bit`,
         `Int8Params`) and fail fast with a clear, actionable `ValueError` on unsupported backends
-        (such as Intel Arc XPU `xpu`, DirectML `dml`, Apple `mps`, Ascend `npu`, Gaudi `hpu`, or `cpu`,
+        (such as Intel Arc XPU `xpu`, Apple `mps`, Ascend `npu`, Gaudi `hpu`, or `cpu`,
         or on `cuda` when `bitsandbytes` CUDA C++ binaries are unavailable/broken).
         """
         bnb_layers: List[Tuple[str, str]] = []
@@ -1597,7 +1295,7 @@ class HardwareBackend(abc.ABC):
                 f"[OmniLoRA] Unsupported bitsandbytes quantized model detected ({len(bnb_layers)} layers, "
                 f"e.g. '{first_path}': {first_cls}) on backend '{self.backend_id}' (device '{device}'). "
                 f"bitsandbytes (4-bit NF4 / FP4 / LLM.int8) requires CUDA C++ kernels and is not supported on "
-                f"{self.backend_id.upper()} (including Intel Arc XPU, DirectML, Apple MPS, Ascend NPU, Gaudi HPU, and CPU). "
+                f"{self.backend_id.upper()} (including Intel Arc XPU, Apple MPS, Ascend NPU, Gaudi HPU, and CPU). "
                 f"To train in 8-bit on {self.backend_id.upper()}, load a standard BF16/FP16, FP8, or GGUF model and set "
                 f"OmniLoRA's 'precision' to 'fp8_e4m3fn' or 'int8_qlora' (which uses 100% pure-PyTorch quantization "
                 f"with zero bitsandbytes dependency)."
@@ -1731,8 +1429,15 @@ class HardwareBackend(abc.ABC):
                                     sub._omni_orig_params = orig_map  # type: ignore[attr-defined]
                                 moved_p = move_custom_quantized_tensor(param, device)
                                 param = assign_module_parameter(sub, name, moved_p)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            report_exception(
+                                "backends.budget_move_nonbase_quant_param",
+                                f"Could not move custom quantized parameter '{name}' to {device}",
+                                exc,
+                                level=logging.WARNING,
+                                once=True,
+                                logger_name="backends",
+                            )
                         p_bytes = get_tensor_storage_bytes(param)
                         if param.device.type == device.type and device.type != "cpu":
                             resident_bytes += p_bytes
@@ -1806,8 +1511,15 @@ class HardwareBackend(abc.ABC):
                                     orig_bufs[name] = buf
                                     sub._omni_orig_buffers = orig_bufs  # type: ignore[attr-defined]
                                 buf = assign_module_parameter(sub, name, move_custom_quantized_tensor(buf, device))
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            report_exception(
+                                "backends.budget_move_nonbase_quant_buf",
+                                f"Could not move custom quantized buffer '{name}' to {device}",
+                                exc,
+                                level=logging.WARNING,
+                                once=True,
+                                logger_name="backends",
+                            )
                         if buf.device.type == device.type and device.type != "cpu":
                             resident_bytes += get_tensor_storage_bytes(buf)
                         continue
@@ -1834,7 +1546,7 @@ class HardwareBackend(abc.ABC):
         # 2. Allocate frozen LoRALinear.base_layer weights on device up to max_resident_bytes; offload overflow to CPU
         max_streamed_numel = 0
         bytes_since_sync = 0
-        sync_chunk_bytes = 256 * 1024 * 1024  # Flush Level Zero / DML copy queue every 256 MB so WDDM host DMA staging never bloats RAM
+        sync_chunk_bytes = 256 * 1024 * 1024  # Flush Level Zero copy queue every 256 MB so WDDM host DMA staging never bloats RAM
         with torch.inference_mode(False):
             for wrapper in lora_wrappers:
                 base = wrapper.base_layer
@@ -1870,8 +1582,15 @@ class HardwareBackend(abc.ABC):
                                         b_sub._omni_orig_params = orig_map  # type: ignore[attr-defined]
                                     moved_p = move_custom_quantized_tensor(param, dest_device)
                                     param = assign_module_parameter(b_sub, pname, moved_p)
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                report_exception(
+                                    "backends.budget_move_base_quant_param",
+                                    f"Could not move base custom quantized parameter '{pname}' to {dest_device}",
+                                    exc,
+                                    level=logging.WARNING,
+                                    once=True,
+                                    logger_name="backends",
+                                )
                             p_bytes = get_tensor_storage_bytes(param)
                             if param.device.type == device.type and device.type != "cpu":
                                 resident_bytes += p_bytes
@@ -1901,8 +1620,15 @@ class HardwareBackend(abc.ABC):
                             if not place_on_gpu and use_pinned_cpu and not q_weight.is_pinned():
                                 try:
                                     q_weight = q_weight.pin_memory()
-                                except Exception:
-                                    pass
+                                except RuntimeError as exc:
+                                    report_exception(
+                                        "backends.budget_pin_quant_weight",
+                                        "pin_memory() failed for quantized CPU-streamed weight; using pageable RAM",
+                                        exc,
+                                        level=logging.DEBUG,
+                                        once=True,
+                                        logger_name="backends",
+                                    )
                             new_p = nn.Parameter(q_weight, requires_grad=False)
                             setattr(b_sub, pname, new_p)
                             if hasattr(b_sub, "_omni_weight_scale"):
@@ -1969,8 +1695,15 @@ class HardwareBackend(abc.ABC):
                                 if not place_on_gpu and use_pinned_cpu and not t_moved.is_pinned():
                                     try:
                                         t_moved = t_moved.pin_memory()
-                                    except Exception:
-                                        pass
+                                    except RuntimeError as exc:
+                                        report_exception(
+                                            "backends.budget_pin_moved_weight",
+                                            "pin_memory() failed for CPU-streamed weight; using pageable RAM",
+                                            exc,
+                                            level=logging.DEBUG,
+                                            once=True,
+                                            logger_name="backends",
+                                        )
                                 new_p = nn.Parameter(t_moved, requires_grad=False)
                                 setattr(b_sub, pname, new_p)
                                 param = new_p
@@ -1983,8 +1716,15 @@ class HardwareBackend(abc.ABC):
                                     new_p = nn.Parameter(param.detach().pin_memory(), requires_grad=False)
                                     setattr(b_sub, pname, new_p)
                                     param = new_p
-                                except Exception:
-                                    pass
+                                except RuntimeError as exc:
+                                    report_exception(
+                                        "backends.budget_pin_existing_weight",
+                                        "pin_memory() failed for existing CPU weight; using pageable RAM",
+                                        exc,
+                                        level=logging.DEBUG,
+                                        once=True,
+                                        logger_name="backends",
+                                    )
                             if is_fp8_dtype(param.dtype) or param.dtype == torch.int8:
                                 quantized_layer_count += 1
                                 max_streamed_numel = max(max_streamed_numel, int(param.numel()))
@@ -1995,7 +1735,7 @@ class HardwareBackend(abc.ABC):
                         if param.device.type == device.type and device.type != "cpu":
                             resident_bytes += p_bytes
                             bytes_since_sync += p_bytes
-                            if self.backend_id in ("xpu", "dml", "mps") and bytes_since_sync >= sync_chunk_bytes:
+                            if self.backend_id in ("xpu", "mps") and bytes_since_sync >= sync_chunk_bytes:
                                 self.synchronize()
                                 bytes_since_sync = 0
                         elif device.type != "cpu":
@@ -2012,8 +1752,15 @@ class HardwareBackend(abc.ABC):
                                         orig_bufs[bname] = buf
                                         b_sub._omni_orig_buffers = orig_bufs  # type: ignore[attr-defined]
                                     assign_module_parameter(b_sub, bname, move_custom_quantized_tensor(buf, dest_device))
-                            except Exception:
-                                pass
+                            except Exception as exc:
+                                report_exception(
+                                    "backends.budget_move_base_quant_buf",
+                                    f"Could not move base custom quantized buffer '{bname}' to {dest_device}",
+                                    exc,
+                                    level=logging.WARNING,
+                                    once=True,
+                                    logger_name="backends",
+                                )
                             continue
                         if buf.dtype == torch.float64:
                             dest_dt = torch.float32
@@ -2047,8 +1794,15 @@ class HardwareBackend(abc.ABC):
                 from ..lora.layers import prepare_streamed_weight_buffer
 
                 prepare_streamed_weight_buffer(device, target_dtype, max_streamed_numel)
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception(
+                    "backends.budget_prepare_stream_buf",
+                    "Could not pre-allocate GPU staging buffer during VRAM budget enforcement",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="backends",
+                )
 
         self.synchronize()
         budget["resident_model_mb"] = round(resident_bytes / (1024**2), 1)
@@ -2117,8 +1871,15 @@ class HardwareBackend(abc.ABC):
                                     if use_pinned_cpu and not t_cpu.is_pinned():
                                         try:
                                             t_cpu = t_cpu.pin_memory()
-                                        except Exception:
-                                            pass
+                                        except RuntimeError as exc:
+                                            report_exception(
+                                                "backends.demote_pin_orig",
+                                                "pin_memory() failed during layer demotion; using pageable RAM",
+                                                exc,
+                                                level=logging.DEBUG,
+                                                once=True,
+                                                logger_name="backends",
+                                            )
                                     restored_p = nn.Parameter(t_cpu, requires_grad=False)
                                 else:
                                     restored_p = (
@@ -2136,8 +1897,15 @@ class HardwareBackend(abc.ABC):
                                     moved_cpu = move_custom_quantized_tensor(param, torch.device("cpu"))
                                     assign_module_parameter(b_sub, pname, moved_cpu)
                                     demoted_bytes += p_bytes
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    report_exception(
+                                        "backends.demote_quant_param",
+                                        f"Could not demote custom quantized parameter '{pname}' to CPU",
+                                        exc,
+                                        level=logging.WARNING,
+                                        once=True,
+                                        logger_name="backends",
+                                    )
                                 continue
                             t_cpu = param.detach().to(device="cpu")
                             if is_inference_tensor(t_cpu):
@@ -2145,8 +1913,15 @@ class HardwareBackend(abc.ABC):
                             if use_pinned_cpu and not t_cpu.is_pinned():
                                 try:
                                     t_cpu = t_cpu.pin_memory()
-                                except Exception:
-                                    pass
+                                except RuntimeError as exc:
+                                    report_exception(
+                                        "backends.demote_pin_param",
+                                        "pin_memory() failed during layer demotion; using pageable RAM",
+                                        exc,
+                                        level=logging.DEBUG,
+                                        once=True,
+                                        logger_name="backends",
+                                    )
                             setattr(b_sub, pname, nn.Parameter(t_cpu, requires_grad=False))
                             demoted_bytes += p_bytes
                             if pname == "weight" and t_cpu.ndim >= 2:
@@ -2159,8 +1934,15 @@ class HardwareBackend(abc.ABC):
                             elif is_custom_quantized_tensor(buf):
                                 try:
                                     assign_module_parameter(b_sub, bname, move_custom_quantized_tensor(buf, torch.device("cpu")))
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    report_exception(
+                                        "backends.demote_quant_buf",
+                                        f"Could not demote custom quantized buffer '{bname}' to CPU",
+                                        exc,
+                                        level=logging.WARNING,
+                                        once=True,
+                                        logger_name="backends",
+                                    )
                             else:
                                 setattr(b_sub, bname, buf.detach().to(device="cpu"))
 
@@ -2177,8 +1959,15 @@ class HardwareBackend(abc.ABC):
                 from ..lora.layers import prepare_streamed_weight_buffer
 
                 prepare_streamed_weight_buffer(device, self.torch_dtype, max_demoted_numel)
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception(
+                    "backends.demote_prepare_stream_buf",
+                    "Could not resize GPU staging buffer after layer demotion",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="backends",
+                )
         if demoted_bytes > 0:
             self.synchronize()
         return round(demoted_bytes / (1024**2), 1)
@@ -2214,8 +2003,15 @@ class HardwareBackend(abc.ABC):
                 if cudnn_sdp is not None and self.backend_id == "cuda":
                     backends.insert(0, cudnn_sdp)
                 return sdpa_kernel(backends)
-        except Exception:
-            pass
+        except Exception as exc:
+            report_exception(
+                "backends.sdpa_kernel_context",
+                "Could not configure torch.nn.attention.sdpa_kernel; using default SDPA",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="backends",
+            )
         return contextlib.nullcontext()
 
     @staticmethod

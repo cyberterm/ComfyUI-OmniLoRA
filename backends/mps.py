@@ -4,8 +4,11 @@ Apple Silicon Metal Performance Shaders Backend (`torch.backends.mps`).
 
 from __future__ import annotations
 
+import logging
+
 import torch
 
+from ..diagnostics import report_exception
 from .base import (
     DeviceCapabilities,
     HardwareBackend,
@@ -58,8 +61,8 @@ class MPSBackend(HardwareBackend):
                             else 0.0
                         )
                         return (round(rec_mb, 1), round(max(0.0, rec_mb - alloc_mb), 1))
-                except Exception:
-                    pass
+                except (RuntimeError, AttributeError) as exc:
+                    report_exception("mps.recommended_max_memory", "torch.mps.recommended_max_memory() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.mps")
             total_ram, avail_ram = query_host_ram_mb()
             return (round(total_ram * 0.75, 1), round(avail_ram * 0.85, 1))
         return (36864.0, 36864.0)
@@ -83,16 +86,16 @@ class MPSBackend(HardwareBackend):
         if self.is_available() and hasattr(torch, "mps"):
             try:
                 torch.mps.synchronize()
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("mps.synchronize", "torch.mps.synchronize() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.mps")
 
     def empty_cache(self) -> None:
         if self.is_available() and hasattr(torch, "mps"):
             try:
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("mps.empty_cache", "torch.mps.empty_cache() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.mps")
 
     def get_memory_snapshot(self) -> MemorySnapshot:
         total_mb, free_mb = self._query_unified_vram_mb()
@@ -111,8 +114,8 @@ class MPSBackend(HardwareBackend):
                     total_mb,
                     round(max(0.0, min(free_mb, total_mb - alloc)), 2),
                 )
-            except Exception:
-                pass
+            except (RuntimeError, AttributeError) as exc:
+                report_exception("mps.memory_snapshot", "MPS memory snapshot query failed", exc, level=logging.DEBUG, once=True, logger_name="backends.mps")
         return MemorySnapshot(0.0, 0.0, 0.0, total_mb, free_mb)
 
     def manual_seed_all(self, seed: int) -> None:
@@ -120,6 +123,6 @@ class MPSBackend(HardwareBackend):
         if self.is_available() and hasattr(torch, "mps") and hasattr(torch.mps, "manual_seed"):
             try:
                 torch.mps.manual_seed(seed)
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("mps.manual_seed", "torch.mps.manual_seed() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.mps")
 

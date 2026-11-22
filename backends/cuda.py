@@ -4,9 +4,11 @@ NVIDIA CUDA Hardware Backend (`torch.cuda`).
 
 from __future__ import annotations
 
+import logging
 from typing import Dict
 import torch
 
+from ..diagnostics import report_exception
 from .base import (
     DeviceCapabilities,
     HardwareBackend,
@@ -38,8 +40,8 @@ class CUDABackend(HardwareBackend):
             count = int(torch.cuda.device_count())
             if count > 0:
                 return max(0, min(int(self.device_index), count - 1))
-        except Exception:
-            pass
+        except (RuntimeError, ValueError, TypeError) as exc:
+            report_exception("cuda.device_count", "torch.cuda.device_count() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.cuda")
         return 0
 
     def _probe_bf16_support(self) -> bool:
@@ -55,23 +57,23 @@ class CUDABackend(HardwareBackend):
                 # `including_emulation=True`). Returning False selects native FP16 Tensor Cores
                 # (`fp16` + `FP32GradScaler`) on Turing/Volta for up to 8x faster matmuls & SDPA.
                 return False
-        except Exception:
-            pass
+        except (RuntimeError, AttributeError, ValueError) as exc:
+            report_exception("cuda.probe_bf16_props", "CUDA device properties probe failed", exc, level=logging.DEBUG, once=True, logger_name="backends.cuda")
         if hasattr(torch.cuda, "is_bf16_supported"):
             try:
                 return bool(torch.cuda.is_bf16_supported(including_emulation=False))
             except TypeError:
                 try:
                     return bool(torch.cuda.is_bf16_supported())
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                except (RuntimeError, AttributeError) as exc:
+                    report_exception("cuda.is_bf16_supported_legacy", "torch.cuda.is_bf16_supported() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.cuda")
+            except (RuntimeError, AttributeError) as exc:
+                report_exception("cuda.is_bf16_supported", "torch.cuda.is_bf16_supported(including_emulation=False) failed", exc, level=logging.DEBUG, once=True, logger_name="backends.cuda")
         try:
             dev = self.get_device()
             a = torch.ones((2, 2), device=dev, dtype=torch.bfloat16)
             return bool(torch.matmul(a, a).shape == (2, 2))
-        except Exception:
+        except RuntimeError:
             return False
 
     def configure_environment(self) -> Dict[str, str]:
@@ -83,8 +85,8 @@ class CUDABackend(HardwareBackend):
             try:
                 self.device_index = self._valid_device_index()
                 torch.cuda.set_device(self.device_index)
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("cuda.set_device", "torch.cuda.set_device() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.cuda")
         return applied
 
     def get_device(self) -> torch.device:
@@ -131,16 +133,16 @@ class CUDABackend(HardwareBackend):
         if self.is_available():
             try:
                 torch.cuda.synchronize(self._valid_device_index())
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("cuda.synchronize", "torch.cuda.synchronize() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.cuda")
 
     def empty_cache(self) -> None:
         if self.is_available():
             try:
                 torch.cuda.synchronize(self._valid_device_index())
                 torch.cuda.empty_cache()
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("cuda.empty_cache", "torch.cuda.empty_cache() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.cuda")
 
     def get_memory_snapshot(self) -> MemorySnapshot:
         if not self.is_available():
@@ -161,8 +163,8 @@ class CUDABackend(HardwareBackend):
                         # Add back unused cached blocks inside PyTorch's caching allocator pool
                         cached_free_mb = max(0.0, res_mb - alloc_mb)
                         free_mb = round(min(total_mb, (free_bytes / (1024**2)) + cached_free_mb), 2)
-                except Exception:
-                    pass
+                except RuntimeError as exc:
+                    report_exception("cuda.mem_get_info", "torch.cuda.mem_get_info() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.cuda")
             return MemorySnapshot(
                 allocated_mb=alloc_mb,
                 reserved_mb=res_mb,
@@ -170,7 +172,8 @@ class CUDABackend(HardwareBackend):
                 total_vram_mb=total_mb,
                 free_vram_mb=free_mb,
             )
-        except Exception:
+        except Exception as exc:
+            report_exception("cuda.memory_snapshot", "CUDA memory snapshot query failed; using fallback", exc, level=logging.DEBUG, once=True, logger_name="backends.cuda")
             return MemorySnapshot(0.0, 0.0, 0.0, 24576.0, 24576.0)
 
     def manual_seed_all(self, seed: int) -> None:
@@ -178,6 +181,6 @@ class CUDABackend(HardwareBackend):
         if self.is_available():
             try:
                 torch.cuda.manual_seed_all(seed)
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("cuda.manual_seed_all", "torch.cuda.manual_seed_all() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.cuda")
 

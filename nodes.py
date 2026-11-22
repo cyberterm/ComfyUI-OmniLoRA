@@ -43,6 +43,7 @@ import torch.nn.functional as F
 
 from .backends import detect_and_configure, sanitize_module_no_fp64, trim_process_working_set
 from .dataset import OmniLoRADataset, OmniLoRADatasetConfig
+from .diagnostics import report_exception
 from .lora import LoRAConfig, LoRAInjector, release_streamed_weight_buffers
 from .lora.layers import _is_conv_like, _is_linear_like, _strip_numeric_segments
 from .models import (
@@ -211,8 +212,17 @@ def _resolve_comfy_loras_dir(fallback_dir: str = "./models/loras", create: bool 
             if create:
                 out.mkdir(parents=True, exist_ok=True)
             return out
-    except Exception:
+    except ImportError:
         pass
+    except Exception as exc:
+        report_exception(
+            "nodes.resolve_loras_dir_folder_paths",
+            "folder_paths.get_folder_paths('loras') failed; falling back to local path",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="nodes",
+        )
 
     pkg_dir = Path(__file__).resolve().parent
     if pkg_dir.parent.name.lower() == "custom_nodes":
@@ -227,8 +237,15 @@ def _resolve_comfy_loras_dir(fallback_dir: str = "./models/loras", create: bool 
         resolved_parent = out.resolve().parent
         if resolved_parent.parent.name.lower() == "custom_nodes":
             out = resolved_parent.parent.parent / "models" / "loras"
-    except Exception:
-        pass
+    except OSError as exc:
+        report_exception(
+            "nodes.resolve_loras_dir_parent",
+            "Could not resolve fallback loras directory parent",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="nodes",
+        )
     if create:
         out.mkdir(parents=True, exist_ok=True)
     return out
@@ -262,8 +279,17 @@ def _list_available_comfy_loras() -> List[str]:
         files = list(folder_paths.get_filename_list("loras"))
         if files:
             return files
-    except Exception:
+    except ImportError:
         pass
+    except Exception as exc:
+        report_exception(
+            "nodes.list_loras_folder_paths",
+            "folder_paths.get_filename_list('loras') failed; scanning directory directly",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="nodes",
+        )
 
     loras_dir = _resolve_comfy_loras_dir(create=False)
     found: List[str] = []
@@ -339,14 +365,30 @@ def _load_lora_safetensors_or_pt(file_path: Path) -> Tuple[Dict[str, torch.Tenso
     if file_path.suffix.lower() != ".safetensors":
         try:
             raw_obj = torch.load(str(file_path), map_location="cpu", weights_only=True)
-        except Exception:
+        except Exception as exc:
+            report_exception(
+                "nodes.load_lora_torch_weights_only",
+                f"torch.load(..., weights_only=True) failed for '{file_path.name}'; trying comfy.utils.load_torch_file",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="nodes",
+            )
             raw_obj = None
     if raw_obj is None:
         try:
             import comfy.utils  # type: ignore
 
             raw_obj = comfy.utils.load_torch_file(str(file_path), safe_load=True)
-        except Exception:
+        except Exception as exc:
+            report_exception(
+                "nodes.load_lora_comfy_utils",
+                f"comfy.utils.load_torch_file failed for '{file_path.name}'; retrying torch.load",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="nodes",
+            )
             raw_obj = torch.load(str(file_path), map_location="cpu", weights_only=True)
 
     if isinstance(raw_obj, dict):
@@ -947,8 +989,17 @@ class OmniLoRAPrecomputeConditioning:
             import comfy.utils  # type: ignore
 
             pbar = comfy.utils.ProgressBar(num_stage1 + num_stage2)
-        except Exception:
+        except ImportError:
             pass
+        except Exception as exc:
+            report_exception(
+                "nodes.precache_pbar",
+                "Could not initialize ComfyUI ProgressBar for pre-caching",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="nodes",
+            )
 
         latent_scaled = False
         inner_model = getattr(model, "model", model) if model is not None else None
@@ -968,18 +1019,42 @@ class OmniLoRAPrecomputeConditioning:
             if had_stale_shapes:
                 try:
                     inner_model.latent_shapes = None
-                except Exception:
+                except (AttributeError, TypeError) as exc:
+                    report_exception(
+                        "nodes.precache_clear_latent_shapes",
+                        "Could not temporarily clear inner_model.latent_shapes during pre-caching",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="nodes",
+                    )
                     had_stale_shapes = False
             try:
                 return process_latent_in(lat_tensor), True
-            except Exception:
+            except Exception as exc:
+                report_exception(
+                    "nodes.precache_process_latent_in",
+                    "process_latent_in failed during pre-caching; deferring scaling to trainer",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="nodes",
+                )
                 return lat_tensor, False
             finally:
                 if had_stale_shapes:
                     try:
                         inner_model.latent_shapes = prev_shapes
-                    except Exception:
-                        pass
+                    except (AttributeError, TypeError) as exc:
+                        report_exception(
+                            "nodes.precache_restore_latent_shapes",
+                            "Could not restore inner_model.latent_shapes after pre-caching",
+                            exc,
+                            level=logging.WARNING,
+                            once=True,
+                            reraise_in_strict=True,
+                            logger_name="nodes",
+                        )
 
         def _downsample_single_mask_to_latent(mask_t: torch.Tensor, lat_h: int, lat_w: int) -> torch.Tensor:
             with torch.inference_mode(False):
@@ -1685,8 +1760,17 @@ class OmniLoRALoader:
                     full_p = folder_paths.get_full_path("loras", lora_name)
                     if full_p:
                         resolved_path = Path(full_p)
-                except Exception:
+                except ImportError:
                     pass
+                except Exception as exc:
+                    report_exception(
+                        "nodes.loader_get_full_path",
+                        f"folder_paths.get_full_path('loras', '{lora_name}') failed; falling back to loras dir",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="nodes",
+                    )
                 if resolved_path is None:
                     resolved_path = _resolve_comfy_loras_dir() / lora_name
 
@@ -1726,7 +1810,7 @@ class OmniLoRALoader:
 
 class OmniLoRATrainer:
     """
-    ComfyUI Node 4: Universal Multi-Backend PyTorch LoRA Trainer (`xpu`, `rocm`, `cuda`, `npu`, `hpu`, `dml`, `mps`, `cpu`).
+    ComfyUI Node 4: Universal Multi-Backend PyTorch LoRA Trainer (`xpu`, `rocm`, `cuda`, `tpu`, `npu`, `hpu`, `mps`, `cpu`).
     - Exits ComfyUI's `@torch.inference_mode()` and enforces a dynamic VRAM headroom budget across any GPU size.
     - Optionally accepts `initial_lora` (`OMNILORA_NETWORK`) from `OmniLoRALoader` (or a previous trainer node)
       to seamlessly continue training an existing LoRA, automatically adopting its `rank` and `alpha`.
@@ -1756,7 +1840,7 @@ class OmniLoRATrainer:
                     },
                 ),
                 "backend": (
-                    ["auto", "xpu", "rocm", "cuda", "tpu", "npu", "hpu", "dml", "mps", "cpu"],
+                    ["auto", "xpu", "rocm", "cuda", "tpu", "npu", "hpu", "mps", "cpu"],
                     {"default": "auto"},
                 ),
                 "reserve_vram_gb": (
@@ -2030,8 +2114,17 @@ class OmniLoRATrainer:
             has_mm = True
             orig_in_training = getattr(mm, "in_training", False)
             mm.in_training = True
-        except Exception:
+        except ImportError:
             pass
+        except Exception as exc:
+            report_exception(
+                "nodes.training_flags_mm_enter",
+                "Failed to set comfy.model_management.in_training = True",
+                exc,
+                level=logging.WARNING,
+                once=True,
+                logger_name="nodes",
+            )
         try:
             import comfy.cli_args as cli_args  # type: ignore
 
@@ -2055,8 +2148,17 @@ class OmniLoRATrainer:
                         f"[OmniLoRA] Detected inference-only attention configuration ({', '.join(active_infer_attn)}); "
                         "routing training attention and RoPE/AdaLN kernels through differentiable PyTorch SDPA."
                     )
-        except Exception:
+        except ImportError:
             pass
+        except Exception as exc:
+            report_exception(
+                "nodes.training_flags_cli_enter",
+                "Failed to configure comfy.cli_args training flags",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="nodes",
+            )
 
         def _restore_flags() -> None:
             nonlocal restored
@@ -2068,16 +2170,30 @@ class OmniLoRATrainer:
                     import comfy.model_management as mm  # type: ignore
 
                     mm.in_training = bool(orig_in_training)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        "nodes.training_flags_mm_exit",
+                        "Failed to restore comfy.model_management.in_training on exit",
+                        exc,
+                        level=logging.WARNING,
+                        reraise_in_strict=True,
+                        logger_name="nodes",
+                    )
             if orig_disable_compiler is not None:
                 try:
                     import comfy.cli_args as cli_args  # type: ignore
 
                     if hasattr(cli_args, "args"):
                         cli_args.args.disable_comfy_compiler = orig_disable_compiler
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        "nodes.training_flags_cli_exit",
+                        "Failed to restore comfy.cli_args.args.disable_comfy_compiler on exit",
+                        exc,
+                        level=logging.WARNING,
+                        reraise_in_strict=True,
+                        logger_name="nodes",
+                    )
 
         try:
             yield _restore_flags
@@ -2218,10 +2334,24 @@ class OmniLoRATrainer:
                     except TypeError:
                         try:
                             model.unpatch_model()
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
+                        except Exception as exc:
+                            report_exception(
+                                "nodes.pretrain_unpatch_noarg",
+                                "model.unpatch_model() failed before training",
+                                exc,
+                                level=logging.WARNING,
+                                once=True,
+                                logger_name="nodes",
+                            )
+                    except Exception as exc:
+                        report_exception(
+                            "nodes.pretrain_unpatch",
+                            "model.unpatch_model(device_to=None, unpatch_weights=True) failed before training",
+                            exc,
+                            level=logging.WARNING,
+                            once=True,
+                            logger_name="nodes",
+                        )
 
                 clean_base_patcher = getattr(model, "_omni_clean_base_patcher", None)
                 if (
@@ -2245,8 +2375,15 @@ class OmniLoRATrainer:
                         if not hasattr(p, "_omni_base_patches_len"):
                             try:
                                 setattr(p, "_omni_base_patches_len", 0 if effective_initial_lora is not None else len(patches_list))
-                            except Exception:
-                                pass
+                            except (AttributeError, TypeError) as exc:
+                                report_exception(
+                                    "nodes.record_base_patches_len",
+                                    "Could not record _omni_base_patches_len on parameter",
+                                    exc,
+                                    level=logging.DEBUG,
+                                    once=True,
+                                    logger_name="nodes",
+                                )
                         base_len = int(getattr(p, "_omni_base_patches_len", 0))
                         if len(patches_list) > base_len:
                             del patches_list[base_len:]
@@ -2469,8 +2606,17 @@ class OmniLoRATrainer:
                     import comfy.utils  # type: ignore
 
                     ui_pbar = comfy.utils.ProgressBar(steps, node_id=unique_id)
-                except Exception:
+                except ImportError:
                     pass
+                except Exception as exc:
+                    report_exception(
+                        "nodes.trainer_ui_pbar",
+                        "Could not initialize ComfyUI ProgressBar for trainer",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="nodes",
+                    )
 
                 weight_format = str(
                     vram_budget.get("weight_format")
@@ -2575,7 +2721,17 @@ class OmniLoRATrainer:
                     if hasattr(server, "PromptServer") and server.PromptServer.instance is not None:
                         prompt_server = server.PromptServer.instance
                         register_omni_lora_routes(prompt_server)
-                except Exception:
+                except ImportError:
+                    prompt_server = None
+                except Exception as exc:
+                    report_exception(
+                        "nodes.prompt_server_init",
+                        "Could not attach ComfyUI PromptServer for live telemetry",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="nodes",
+                    )
                     prompt_server = None
 
                 run_timestamp = int(time.time())
@@ -2597,8 +2753,15 @@ class OmniLoRATrainer:
                 if prompt_server is not None:
                     try:
                         prompt_server.send_sync("omni_lora_training_start", start_payload)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        report_exception(
+                            "nodes.telemetry_send_start",
+                            "Failed to emit omni_lora_training_start telemetry event",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="nodes",
+                        )
 
                 # Per-pass batch shuffling (with boundary de-duplication so the first batch of a
                 # new pass never immediately repeats the last batch of the previous pass).
@@ -3004,8 +3167,15 @@ class OmniLoRATrainer:
                     if prompt_server is not None:
                         try:
                             prompt_server.send_sync("omni_lora_step_metric", step_payload)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            report_exception(
+                                "nodes.telemetry_send_step",
+                                "Failed to emit omni_lora_step_metric telemetry event",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="nodes",
+                            )
 
                     manual_ckpt = TRACKER_STORE.consume_checkpoint_request(str(unique_id or ""))
                     if (
@@ -3067,8 +3237,15 @@ class OmniLoRATrainer:
                 if prompt_server is not None:
                     try:
                         prompt_server.send_sync("omni_lora_training_complete", complete_payload)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        report_exception(
+                            "nodes.telemetry_send_complete",
+                            "Failed to emit omni_lora_training_complete telemetry event",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="nodes",
+                        )
 
                 assert pipeline.backbone is not None
                 lora_state = dict(filtered_resumed_state)
@@ -3135,8 +3312,15 @@ class OmniLoRATrainer:
                 if prompt_server is not None:
                     try:
                         prompt_server.send_sync("omni_lora_training_interrupted", interrupt_payload)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        report_exception(
+                            "nodes.telemetry_send_interrupted",
+                            "Failed to emit omni_lora_training_interrupted telemetry event",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="nodes",
+                        )
                 logging.error(f"[OmniLoRA] Training interrupted or failed ({type(exc).__name__}: {exc})")
                 raise
             finally:
@@ -3158,7 +3342,15 @@ class OmniLoRATrainer:
                     elif isinstance(raw_off, str):
                         try:
                             offload_dev = torch.device(raw_off)
-                        except Exception:
+                        except (RuntimeError, ValueError, TypeError) as dev_exc:
+                            report_exception(
+                                "nodes.parse_offload_device",
+                                f"Invalid offload_device '{raw_off}'; falling back to cpu",
+                                dev_exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="nodes",
+                            )
                             offload_dev = torch.device("cpu")
                 if pipeline.backbone is not None:
                     try:
@@ -3188,19 +3380,41 @@ class OmniLoRATrainer:
                                     if hasattr(sub, "comfy_patched_weights"):
                                         try:
                                             delattr(sub, "comfy_patched_weights")
-                                        except Exception:
+                                        except (AttributeError, TypeError) as attr_exc:
+                                            report_exception(
+                                                "nodes.cleanup_del_comfy_patched",
+                                                "Could not delete comfy_patched_weights; setting False",
+                                                attr_exc,
+                                                level=logging.DEBUG,
+                                                once=True,
+                                                logger_name="nodes",
+                                            )
                                             setattr(sub, "comfy_patched_weights", False)
                                     if hasattr(sub, "_v_signature"):
                                         try:
                                             setattr(sub, "_v_signature", None)
-                                        except Exception:
-                                            pass
+                                        except (AttributeError, TypeError) as attr_exc:
+                                            report_exception(
+                                                "nodes.cleanup_clear_v_signature",
+                                                "Could not clear _v_signature cache",
+                                                attr_exc,
+                                                level=logging.DEBUG,
+                                                once=True,
+                                                logger_name="nodes",
+                                            )
                                     comb = getattr(sub, "_combined_linear", None)
                                     if comb is not None and hasattr(comb, "_v_weight"):
                                         try:
                                             setattr(comb, "_v_weight", None)
-                                        except Exception:
-                                            pass
+                                        except (AttributeError, TypeError) as attr_exc:
+                                            report_exception(
+                                                "nodes.cleanup_clear_v_weight",
+                                                "Could not clear _combined_linear._v_weight cache",
+                                                attr_exc,
+                                                level=logging.DEBUG,
+                                                once=True,
+                                                logger_name="nodes",
+                                            )
                         if hasattr(model, "model_loaded_weight_memory"):
                             model.model_loaded_weight_memory = 0
                     except Exception as reset_exc:
@@ -3287,8 +3501,15 @@ class OmniLoRATrainer:
                     try:
                         setattr(out_model, "_omni_lora_bundle", lora_bundle)
                         setattr(out_model, "_omni_clean_base_patcher", source_patcher)
-                    except Exception:
-                        pass
+                    except (AttributeError, TypeError) as attr_exc:
+                        report_exception(
+                            "nodes.attach_output_model_attrs",
+                            "Could not attach OmniLoRA bundle metadata directly onto output MODEL",
+                            attr_exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="nodes",
+                        )
                     if hasattr(out_model, "model_options") and isinstance(getattr(out_model, "model_options", None), dict):
                         out_model.model_options["_omni_lora_bundle"] = lora_bundle
                         out_model.model_options["_omni_clean_base_patcher"] = source_patcher

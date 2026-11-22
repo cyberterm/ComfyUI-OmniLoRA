@@ -5,7 +5,7 @@ Drop into `ComfyUI/custom_nodes/omni_lora` or install via Comfy Registry (`comfy
 Queries ComfyUI's native `ModelPatcher`, `BaseModel`, `model_sampling`, `latent_format`, and `extra_conds`
 directly so any current or future ComfyUI diffusion/flow model works automatically.
 Supports Intel Arc XPU (`torch.xpu` in native `bf16` with strict FP64-free guards),
-AMD ROCm, NVIDIA CUDA, Google Cloud TPU (`torch_xla`), Huawei Ascend NPU, Intel Gaudi HPU, Windows DirectML, Apple MPS, and CPU.
+AMD ROCm, NVIDIA CUDA, Google Cloud TPU (`torch_xla`), Huawei Ascend NPU, Intel Gaudi HPU, Apple MPS, and CPU.
 """
 
 import os as _os
@@ -65,7 +65,7 @@ register_omni_lora_routes()
 
 WEB_DIRECTORY = "./web"
 
-__version__ = "1.1.2"
+__version__ = "1.1.4"
 
 __all__ = [
     "NODE_CLASS_MAPPINGS",

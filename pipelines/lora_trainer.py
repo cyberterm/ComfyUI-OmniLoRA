@@ -2,7 +2,7 @@
 Modular LoRA Training Pipeline (`LoRATrainingPipeline`).
 
 Follows ComfyUI's node-graph & `model_management` philosophy:
-1. HardwareBackend resolves `xpu` / `cuda` / `rocm` / `npu` / `hpu` / `dml` / `mps` / `cpu`
+1. HardwareBackend resolves `xpu` / `cuda` / `rocm` / `tpu` / `npu` / `hpu` / `mps` / `cpu`
 2. ComfyModelAdapter attaches or constructs the frozen backbone in the resolved dtype (`bf16` or `fp16`)
 3. LoRAInjector attaches low-rank A/B matrices to discovered target layers
 4. Trainer runs `torch.amp.autocast` (plus `FP32GradScaler` when `fp16` is selected
@@ -39,6 +39,7 @@ from ..backends.base import (
     safe_to_device,
     sanitize_module_no_fp64,
 )
+from ..diagnostics import report_exception
 from ..lora.layers import LoRAConfig, LoRAInjector, LoRALinear
 from ..models.base import BaseModelAdapter
 
@@ -55,7 +56,17 @@ def _scoped_comfy_in_training() -> Iterator[None]:
         had_attr = hasattr(mm, "in_training")
         prev_val = bool(getattr(mm, "in_training", False))
         mm.in_training = True
-    except Exception:
+    except ImportError:
+        mm = None
+    except Exception as exc:
+        report_exception(
+            "trainer.comfy_in_training_enter",
+            "Failed to set comfy.model_management.in_training = True",
+            exc,
+            level=logging.WARNING,
+            once=True,
+            logger_name="trainer",
+        )
         mm = None
     try:
         yield
@@ -63,8 +74,15 @@ def _scoped_comfy_in_training() -> Iterator[None]:
         if mm is not None:
             try:
                 mm.in_training = prev_val if had_attr else False
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception(
+                    "trainer.comfy_in_training_exit",
+                    "Failed to restore comfy.model_management.in_training on exit",
+                    exc,
+                    level=logging.WARNING,
+                    reraise_in_strict=True,
+                    logger_name="trainer",
+                )
 
 
 def _with_scoped_comfy_in_training(fn: Any) -> Any:
@@ -122,7 +140,15 @@ def _clone_tensors_for_grad(obj: Any) -> Any:
         if type(obj) is not dict:
             try:
                 return type(obj)(cloned_dict)
-            except Exception:
+            except (TypeError, ValueError) as exc:
+                report_exception(
+                    "trainer.clone_dict_subclass",
+                    f"Falling back to plain dict when cloning {type(obj).__name__}",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="trainer",
+                )
                 return cloned_dict
         return cloned_dict
     if is_dataclass(obj) and not isinstance(obj, type):
@@ -132,7 +158,15 @@ def _clone_tensors_for_grad(obj: Any) -> Any:
                 for f_name in obj.__dataclass_fields__
             }
             return dc_replace(obj, **updates)
-        except Exception:
+        except (TypeError, ValueError, AttributeError) as exc:
+            report_exception(
+                "trainer.clone_dataclass",
+                f"Could not clone dataclass {type(obj).__name__}; returning original",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="trainer",
+            )
             return obj
     return obj
 
@@ -181,7 +215,15 @@ def _snapshot_tensors_for_recompute(
                         return promoted
                     return cached_snap
                 wref = weakref.ref(obj)
-            except Exception:
+            except (TypeError, RuntimeError, AttributeError) as exc:
+                report_exception(
+                    "trainer.snapshot_memo_probe",
+                    "Skipped tensor snapshot memoization due to weakref/pointer probe error",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="trainer",
+                )
                 wref = None
         with torch.no_grad():
             if offload_to_cpu and obj.device.type != "cpu" and (obj.numel() * obj.element_size() >= 65536):
@@ -217,7 +259,15 @@ def _snapshot_tensors_for_recompute(
         if type(obj) is not dict:
             try:
                 return type(obj)(snap_dict)
-            except Exception:
+            except (TypeError, ValueError) as exc:
+                report_exception(
+                    "trainer.snapshot_dict_subclass",
+                    f"Falling back to plain dict when snapshotting {type(obj).__name__}",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="trainer",
+                )
                 return snap_dict
         return snap_dict
     if is_dataclass(obj) and not isinstance(obj, type):
@@ -229,7 +279,15 @@ def _snapshot_tensors_for_recompute(
                 for f_name in obj.__dataclass_fields__
             }
             return dc_replace(obj, **updates)
-        except Exception:
+        except (TypeError, ValueError, AttributeError) as exc:
+            report_exception(
+                "trainer.snapshot_dataclass",
+                f"Could not snapshot dataclass {type(obj).__name__}; returning original",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="trainer",
+            )
             return obj
     return obj
 
@@ -592,69 +650,6 @@ def _install_chunked_sdpa_wrapper() -> None:
 
     target_chunk_bytes = 64 * 1024 * 1024  # 64 MB per query chunk
 
-    def _pure_fp32_sdpa(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        dropout_p: float = 0.0,
-        is_causal: bool = False,
-        scale: Optional[float] = None,
-        enable_gqa: bool = False,
-    ) -> torch.Tensor:
-        scale_f = float(scale) if scale is not None else (1.0 / math.sqrt(max(1.0, float(q.shape[-1]))))
-        dml_ctx = (
-            torch.inference_mode(False)
-            if (q.device.type in ("privateuseone", "dml") and torch.is_inference_mode_enabled())
-            else contextlib.nullcontext()
-        )
-        with dml_ctx:
-            if q.device.type in ("privateuseone", "dml"):
-                if is_inference_tensor(q) or not q.is_contiguous() or q.storage_offset() != 0:
-                    q = q.clone()
-                if is_inference_tensor(k) or not k.is_contiguous() or k.storage_offset() != 0:
-                    k = k.clone()
-                if is_inference_tensor(v) or not v.is_contiguous() or v.storage_offset() != 0:
-                    v = v.clone()
-            if not (q.dtype == k.dtype == v.dtype):
-                target_dt = (
-                    v.dtype
-                    if v.dtype in (torch.float16, torch.bfloat16)
-                    else (k.dtype if k.dtype in (torch.float16, torch.bfloat16) else q.dtype)
-                )
-                if q.dtype != target_dt:
-                    q = q.to(dtype=target_dt)
-                if k.dtype != target_dt:
-                    k = k.to(dtype=target_dt)
-                if v.dtype != target_dt:
-                    v = v.to(dtype=target_dt)
-            if enable_gqa and k.ndim >= 4 and q.ndim >= 4 and k.shape[-3] != q.shape[-3]:
-                rep = max(1, int(q.shape[-3]) // max(1, int(k.shape[-3])))
-                k = k.repeat_interleave(rep, dim=-3)
-                v = v.repeat_interleave(rep, dim=-3)
-            kt = k.transpose(-2, -1)
-            if q.device.type in ("privateuseone", "dml"):
-                kt = kt.contiguous()
-            scores = torch.matmul(q, kt) * scale_f
-            if is_causal:
-                q_len, k_len = int(q.shape[-2]), int(k.shape[-2])
-                causal_mask = torch.ones((q_len, k_len), dtype=torch.bool, device="cpu").tril()
-                scores = scores.masked_fill(
-                    (~causal_mask).to(device=scores.device),
-                    -65504.0 if scores.dtype == torch.float16 else -1e9,
-                )
-            if attn_mask is not None:
-                if attn_mask.dtype == torch.bool or not attn_mask.is_floating_point():
-                    mask_bool = attn_mask if attn_mask.dtype == torch.bool else attn_mask.to(dtype=torch.bool)
-                    scores = scores.masked_fill(
-                        ~mask_bool.to(device=scores.device),
-                        -65504.0 if scores.dtype == torch.float16 else -1e9,
-                    )
-                else:
-                    scores = scores + attn_mask.to(device=scores.device, dtype=scores.dtype)
-            probs = torch.softmax(scores.to(dtype=torch.float32), dim=-1).to(dtype=v.dtype)
-            return torch.matmul(probs, v)
-
     def _wrapped_sdpa(
         query: torch.Tensor,
         key: torch.Tensor,
@@ -685,7 +680,6 @@ def _install_chunked_sdpa_wrapper() -> None:
         ):
             attn_mask = attn_mask[:, None, None, :]
         q_dev_type = getattr(query.device, "type", "cpu") if isinstance(query, torch.Tensor) else "cpu"
-        active_sdpa = _pure_fp32_sdpa if q_dev_type in ("privateuseone", "dml") else orig_sdpa
 
         # When RoPE (`freqs_cis` in FP32) promotes 16-bit `query`/`key` to `float32` before SDPA,
         # PyTorch's `F.scaled_dot_product_attention` does not automatically downcast `float32` inputs
@@ -709,31 +703,42 @@ def _install_chunked_sdpa_wrapper() -> None:
             )
         ):
             ac_dt: Optional[torch.dtype] = None
-            if q_dev_type not in ("privateuseone", "dml"):
-                try:
-                    if torch.is_autocast_enabled(q_dev_type):
-                        cand_dt = torch.get_autocast_dtype(q_dev_type)
-                        if cand_dt in (torch.float16, torch.bfloat16):
-                            ac_dt = cand_dt
-                except TypeError:
-                    if q_dev_type != "cpu":
-                        try:
-                            if torch.is_autocast_enabled():
-                                cand_dt = torch.get_autocast_gpu_dtype()
-                                if cand_dt in (torch.float16, torch.bfloat16):
-                                    ac_dt = cand_dt
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+            try:
+                if torch.is_autocast_enabled(q_dev_type):
+                    cand_dt = torch.get_autocast_dtype(q_dev_type)
+                    if cand_dt in (torch.float16, torch.bfloat16):
+                        ac_dt = cand_dt
+            except TypeError:
+                if q_dev_type != "cpu":
+                    try:
+                        if torch.is_autocast_enabled():
+                            cand_dt = torch.get_autocast_gpu_dtype()
+                            if cand_dt in (torch.float16, torch.bfloat16):
+                                ac_dt = cand_dt
+                    except (RuntimeError, AttributeError) as exc:
+                        report_exception(
+                            "trainer.sdpa_autocast_legacy_probe",
+                            "Legacy autocast dtype probe failed in SDPA wrapper",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="trainer",
+                        )
+            except (RuntimeError, AttributeError) as exc:
+                report_exception(
+                    "trainer.sdpa_autocast_probe",
+                    "Autocast dtype probe failed in SDPA wrapper",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="trainer",
+                )
             if ac_dt is None:
                 for t_cand in (value, key, query):
                     if t_cand.dtype in (torch.float16, torch.bfloat16):
                         ac_dt = t_cand.dtype
                         break
             if ac_dt in (torch.float16, torch.bfloat16):
-                if q_dev_type in ("privateuseone", "dml") and ac_dt == torch.bfloat16:
-                    ac_dt = torch.float16
                 if query.dtype != ac_dt:
                     query = query.to(dtype=ac_dt)
                 if key.dtype != ac_dt:
@@ -784,14 +789,14 @@ def _install_chunked_sdpa_wrapper() -> None:
             )
             needs_proactive_chunking = (
                 (non_flash_head_dim and full_attn_bytes > target_chunk_bytes)
-                or (q_dev_type in ("xpu", "dml", "privateuseone", "mps", "cpu") and full_attn_bytes > target_chunk_bytes)
+                or (q_dev_type in ("xpu", "mps", "cpu") and full_attn_bytes > target_chunk_bytes)
                 or (not is_cuda_fused_16bit and full_attn_bytes > 256 * 1024 * 1024)
             )
             if needs_proactive_chunking:
                 chunk_q = max(128, min(1024, target_chunk_bytes // bytes_per_q_token))
                 if query.shape[2] > chunk_q:
                     return _run_chunked_sdpa(
-                        active_sdpa,
+                        orig_sdpa,
                         query,
                         key,
                         value,
@@ -802,18 +807,6 @@ def _install_chunked_sdpa_wrapper() -> None:
                         enable_gqa,
                         chunk_q,
                     )
-
-        if q_dev_type in ("privateuseone", "dml"):
-            return _pure_fp32_sdpa(
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                dropout_p=dropout_p,
-                is_causal=is_causal,
-                scale=scale,
-                enable_gqa=enable_gqa,
-            )
 
         sdpa_kwargs: Dict[str, Any] = {}
         if scale is not None:
@@ -850,8 +843,15 @@ def _install_chunked_sdpa_wrapper() -> None:
                 if dev_mod is not None and hasattr(dev_mod, "empty_cache"):
                     try:
                         dev_mod.empty_cache()
-                    except Exception:
-                        pass
+                    except (RuntimeError, AttributeError) as cache_exc:
+                        report_exception(
+                            "trainer.sdpa_oom_empty_cache",
+                            "Failed to empty device cache during SDPA OOM fallback",
+                            cache_exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="trainer",
+                        )
                 heads = max(query.shape[1], key.shape[1])
                 elem_bytes = max(2, query.element_size())
                 bytes_per_q_token = max(1, query.shape[0] * heads * key.shape[2] * elem_bytes)
@@ -886,14 +886,13 @@ def _install_chunked_sdpa_wrapper() -> None:
     setattr(_wrapped_sdpa, "_omni_orig_fn", orig_sdpa)
     F.scaled_dot_product_attention = _wrapped_sdpa
 
-    # Install cross-backend & DirectML (`privateuseone` / `dml`) normalization (`layer_norm`, `rms_norm`, `group_norm`),
-    # zero-offset 16-bit-preserving `linear`/`conv1d`/`conv2d`/`conv3d`, and 5D-max `pixel_unshuffle`/`pixel_shuffle`
-    # guards so:
+    # Install cross-backend normalization (`layer_norm`, `rms_norm`, `group_norm`) and
+    # 16-bit-preserving `linear`/`conv1d`/`conv2d`/`conv3d` guards so:
     # 1. All dtype alignments are pure, deterministic functions of `input.dtype` and `weight.dtype` (guaranteeing
     #    100% identical op graphs during forward and activation-checkpoint backward recomputation).
     # 2. `F.rms_norm` unifies `weight` to `input.dtype` when `weight` is a frozen parameter of different dtype,
     #    preventing PyTorch's `Mismatch dtype between input and weight... Cannot dispatch to fused implementation` fallback.
-    # 3. DX12 shaders on DirectML never hang or fail with inference version_counter / 6D descriptor errors.
+    # 3. `F.conv2d` preserves 64-byte alignment for Intel XPU / CPU oneDNN kernels on sliced/permuted views.
     def _adapt_norm_last_dim_inline(input_t: torch.Tensor, normalized_shape: Any) -> torch.Tensor:
         if (
             isinstance(input_t, torch.Tensor)
@@ -911,10 +910,10 @@ def _install_chunked_sdpa_wrapper() -> None:
         return input_t
 
     orig_layer_norm = getattr(F, "_omni_orig_layer_norm", getattr(F, "layer_norm", None))
-    if orig_layer_norm is not None and not getattr(F.layer_norm, "_omni_dml_safe", False):
+    if orig_layer_norm is not None and not getattr(F.layer_norm, "_omni_op_safe", False):
         setattr(F, "_omni_orig_layer_norm", orig_layer_norm)
 
-        def _dml_safe_layer_norm(
+        def _omni_safe_layer_norm(
             input: torch.Tensor,
             normalized_shape: List[int],
             weight: Optional[torch.Tensor] = None,
@@ -923,34 +922,6 @@ def _install_chunked_sdpa_wrapper() -> None:
         ) -> torch.Tensor:
             if isinstance(input, torch.Tensor):
                 input = _adapt_norm_last_dim_inline(input, normalized_shape)
-                if input.device.type in ("privateuseone", "dml"):
-                    ctx = (
-                        torch.inference_mode(False)
-                        if torch.is_inference_mode_enabled()
-                        else contextlib.nullcontext()
-                    )
-                    with ctx:
-                        if is_inference_tensor(input) or not input.is_contiguous() or input.storage_offset() != 0:
-                            input = input.clone()
-                        orig_dt = (
-                            torch.float16
-                            if (isinstance(weight, torch.Tensor) and weight.dtype in (torch.float16, torch.bfloat16))
-                            else (torch.float16 if input.dtype == torch.bfloat16 else input.dtype)
-                        )
-                        ndim_norm = len(normalized_shape)
-                        norm_dims = tuple(range(input.ndim - ndim_norm, input.ndim))
-                        x_fp32 = input.to(dtype=torch.float32)
-                        mean = x_fp32.mean(dim=norm_dims, keepdim=True)
-                        diff = x_fp32 - mean
-                        var = (diff * diff).mean(dim=norm_dims, keepdim=True)
-                        out_fp32 = diff * torch.rsqrt(var + float(eps))
-                        if isinstance(weight, torch.Tensor):
-                            w_32 = safe_to_device(weight, device=input.device, dtype=torch.float32)
-                            out_fp32 = out_fp32 * w_32
-                        if isinstance(bias, torch.Tensor):
-                            b_32 = safe_to_device(bias, device=input.device, dtype=torch.float32)
-                            out_fp32 = out_fp32 + b_32
-                        return out_fp32.to(dtype=orig_dt)
                 if (
                     isinstance(weight, torch.Tensor)
                     and not weight.requires_grad
@@ -965,14 +936,14 @@ def _install_chunked_sdpa_wrapper() -> None:
                     bias = safe_to_device(bias, device=input.device, dtype=input.dtype)
             return orig_layer_norm(input, normalized_shape, weight=weight, bias=bias, eps=eps)
 
-        setattr(_dml_safe_layer_norm, "_omni_dml_safe", True)
-        F.layer_norm = _dml_safe_layer_norm
+        setattr(_omni_safe_layer_norm, "_omni_op_safe", True)
+        F.layer_norm = _omni_safe_layer_norm
 
     orig_rms_norm = getattr(F, "_omni_orig_rms_norm", getattr(F, "rms_norm", None))
-    if orig_rms_norm is not None and not getattr(F.rms_norm, "_omni_dml_safe", False):
+    if orig_rms_norm is not None and not getattr(F.rms_norm, "_omni_op_safe", False):
         setattr(F, "_omni_orig_rms_norm", orig_rms_norm)
 
-        def _dml_safe_rms_norm(
+        def _omni_safe_rms_norm(
             input: torch.Tensor,
             normalized_shape: List[int],
             weight: Optional[torch.Tensor] = None,
@@ -980,26 +951,6 @@ def _install_chunked_sdpa_wrapper() -> None:
         ) -> torch.Tensor:
             if isinstance(input, torch.Tensor):
                 input = _adapt_norm_last_dim_inline(input, normalized_shape)
-                if input.device.type in ("privateuseone", "dml"):
-                    ctx = (
-                        torch.inference_mode(False)
-                        if torch.is_inference_mode_enabled()
-                        else contextlib.nullcontext()
-                    )
-                    with ctx:
-                        if is_inference_tensor(input) or not input.is_contiguous() or input.storage_offset() != 0:
-                            input = input.clone()
-                        orig_dt = torch.float16 if input.dtype == torch.bfloat16 else input.dtype
-                        eps_val = float(eps) if eps is not None else 1e-6
-                        ndim_norm = len(normalized_shape)
-                        norm_dims = tuple(range(input.ndim - ndim_norm, input.ndim))
-                        x_fp32 = input.to(dtype=torch.float32)
-                        ms = (x_fp32 * x_fp32).mean(dim=norm_dims, keepdim=True)
-                        out_fp32 = x_fp32 * torch.rsqrt(ms + eps_val)
-                        if isinstance(weight, torch.Tensor):
-                            w_32 = safe_to_device(weight, device=input.device, dtype=torch.float32)
-                            out_fp32 = out_fp32 * w_32
-                        return out_fp32.to(dtype=orig_dt)
                 if (
                     isinstance(weight, torch.Tensor)
                     and not weight.requires_grad
@@ -1008,14 +959,14 @@ def _install_chunked_sdpa_wrapper() -> None:
                     weight = safe_to_device(weight, device=input.device, dtype=input.dtype)
             return orig_rms_norm(input, normalized_shape, weight=weight, eps=eps)
 
-        setattr(_dml_safe_rms_norm, "_omni_dml_safe", True)
-        F.rms_norm = _dml_safe_rms_norm
+        setattr(_omni_safe_rms_norm, "_omni_op_safe", True)
+        F.rms_norm = _omni_safe_rms_norm
 
     orig_group_norm = getattr(F, "_omni_orig_group_norm", getattr(F, "group_norm", None))
-    if orig_group_norm is not None and not getattr(F.group_norm, "_omni_dml_safe", False):
+    if orig_group_norm is not None and not getattr(F.group_norm, "_omni_op_safe", False):
         setattr(F, "_omni_orig_group_norm", orig_group_norm)
 
-        def _dml_safe_group_norm(
+        def _omni_safe_group_norm(
             input: torch.Tensor,
             num_groups: int,
             weight: Optional[torch.Tensor] = None,
@@ -1023,36 +974,6 @@ def _install_chunked_sdpa_wrapper() -> None:
             eps: float = 1e-5,
         ) -> torch.Tensor:
             if isinstance(input, torch.Tensor):
-                if input.device.type in ("privateuseone", "dml"):
-                    ctx = (
-                        torch.inference_mode(False)
-                        if torch.is_inference_mode_enabled()
-                        else contextlib.nullcontext()
-                    )
-                    with ctx:
-                        if is_inference_tensor(input) or not input.is_contiguous() or input.storage_offset() != 0:
-                            input = input.clone()
-                        orig_dt = (
-                            torch.float16
-                            if (isinstance(weight, torch.Tensor) and weight.dtype in (torch.float16, torch.bfloat16))
-                            else (torch.float16 if input.dtype == torch.bfloat16 else input.dtype)
-                        )
-                        shape = input.shape
-                        b, c = int(shape[0]), int(shape[1])
-                        g = int(num_groups)
-                        x_fp32 = input.to(dtype=torch.float32).reshape(b, g, -1)
-                        mean = x_fp32.mean(dim=-1, keepdim=True)
-                        diff = x_fp32 - mean
-                        var = (diff * diff).mean(dim=-1, keepdim=True)
-                        out_fp32 = (diff * torch.rsqrt(var + float(eps))).reshape(shape)
-                        bcast = [1, c] + [1] * (input.ndim - 2)
-                        if isinstance(weight, torch.Tensor):
-                            w_32 = safe_to_device(weight, device=input.device, dtype=torch.float32).reshape(bcast)
-                            out_fp32 = out_fp32 * w_32
-                        if isinstance(bias, torch.Tensor):
-                            b_32 = safe_to_device(bias, device=input.device, dtype=torch.float32).reshape(bcast)
-                            out_fp32 = out_fp32 + b_32
-                        return out_fp32.to(dtype=orig_dt)
                 if (
                     isinstance(weight, torch.Tensor)
                     and not weight.requires_grad
@@ -1067,46 +988,19 @@ def _install_chunked_sdpa_wrapper() -> None:
                     bias = safe_to_device(bias, device=input.device, dtype=input.dtype)
             return orig_group_norm(input, num_groups, weight=weight, bias=bias, eps=eps)
 
-        setattr(_dml_safe_group_norm, "_omni_dml_safe", True)
-        F.group_norm = _dml_safe_group_norm
+        setattr(_omni_safe_group_norm, "_omni_op_safe", True)
+        F.group_norm = _omni_safe_group_norm
 
     orig_linear = getattr(F, "_omni_orig_linear", getattr(F, "linear", None))
-    if orig_linear is not None and not getattr(F.linear, "_omni_dml_safe", False):
+    if orig_linear is not None and not getattr(F.linear, "_omni_op_safe", False):
         setattr(F, "_omni_orig_linear", orig_linear)
 
-        def _dml_safe_linear(
+        def _omni_safe_linear(
             input: torch.Tensor,
             weight: torch.Tensor,
             bias: Optional[torch.Tensor] = None,
         ) -> torch.Tensor:
             if isinstance(input, torch.Tensor):
-                if input.device.type in ("privateuseone", "dml"):
-                    ctx = (
-                        torch.inference_mode(False)
-                        if torch.is_inference_mode_enabled()
-                        else contextlib.nullcontext()
-                    )
-                    with ctx:
-                        if (
-                            isinstance(weight, torch.Tensor)
-                            and weight.dtype in (torch.float16, torch.bfloat16)
-                            and input.dtype == torch.float32
-                        ):
-                            target_dt = torch.float16 if input.device.type in ("privateuseone", "dml") else weight.dtype
-                            input = input.to(dtype=target_dt)
-                        if is_inference_tensor(input) or not input.is_contiguous() or input.storage_offset() != 0:
-                            input = input.clone()
-                        if isinstance(weight, torch.Tensor):
-                            if weight.device != input.device or weight.dtype != input.dtype:
-                                weight = safe_to_device(weight, device=input.device, dtype=input.dtype)
-                            if is_inference_tensor(weight) or not weight.is_contiguous() or weight.storage_offset() != 0:
-                                weight = weight.clone()
-                        if isinstance(bias, torch.Tensor):
-                            if bias.device != input.device or bias.dtype != input.dtype:
-                                bias = safe_to_device(bias, device=input.device, dtype=input.dtype)
-                            if is_inference_tensor(bias) or not bias.is_contiguous() or bias.storage_offset() != 0:
-                                bias = bias.clone()
-                        return orig_linear(input, weight, bias)
                 if (
                     isinstance(weight, torch.Tensor)
                     and not weight.requires_grad
@@ -1124,7 +1018,15 @@ def _install_chunked_sdpa_wrapper() -> None:
                                     target_dt = weight.dtype
                             else:
                                 target_dt = weight.dtype
-                        except Exception:
+                        except (TypeError, RuntimeError, AttributeError) as exc:
+                            report_exception(
+                                "trainer.linear_autocast_probe",
+                                "Autocast dtype probe failed in F.linear wrapper; using weight dtype",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="trainer",
+                            )
                             target_dt = weight.dtype
                         input = input.to(dtype=target_dt)
                     weight = safe_to_device(weight, device=input.device, dtype=target_dt)
@@ -1134,14 +1036,14 @@ def _install_chunked_sdpa_wrapper() -> None:
                     bias = safe_to_device(bias, device=input.device, dtype=input.dtype)
             return orig_linear(input, weight, bias)
 
-        setattr(_dml_safe_linear, "_omni_dml_safe", True)
-        F.linear = _dml_safe_linear
+        setattr(_omni_safe_linear, "_omni_op_safe", True)
+        F.linear = _omni_safe_linear
 
     orig_conv1d = getattr(F, "_omni_orig_conv1d", getattr(F, "conv1d", None))
-    if orig_conv1d is not None and not getattr(F.conv1d, "_omni_dml_safe", False):
+    if orig_conv1d is not None and not getattr(F.conv1d, "_omni_op_safe", False):
         setattr(F, "_omni_orig_conv1d", orig_conv1d)
 
-        def _dml_safe_conv1d(
+        def _omni_safe_conv1d(
             input: torch.Tensor,
             weight: torch.Tensor,
             bias: Optional[torch.Tensor] = None,
@@ -1155,23 +1057,26 @@ def _install_chunked_sdpa_wrapper() -> None:
                     not weight.requires_grad
                     and (weight.device != input.device or weight.dtype != input.dtype)
                 ):
-                    if input.device.type in ("privateuseone", "dml"):
-                        target_dt = torch.float16 if input.dtype in (torch.float16, torch.bfloat16, torch.float32) else input.dtype
-                        if input.dtype != target_dt:
-                            input = input.to(dtype=target_dt)
-                    else:
-                        target_dt = input.dtype
-                        if input.dtype == torch.float32 and weight.dtype in (torch.float16, torch.bfloat16):
-                            try:
-                                dev_t = input.device.type
-                                if torch.is_autocast_enabled(dev_t):  # type: ignore[arg-type]
-                                    ac_dt = torch.get_autocast_dtype(dev_t)  # type: ignore[arg-type]
-                                    target_dt = ac_dt if ac_dt in (torch.float16, torch.bfloat16) else weight.dtype
-                                else:
-                                    target_dt = weight.dtype
-                            except Exception:
+                    target_dt = input.dtype
+                    if input.dtype == torch.float32 and weight.dtype in (torch.float16, torch.bfloat16):
+                        try:
+                            dev_t = input.device.type
+                            if torch.is_autocast_enabled(dev_t):  # type: ignore[arg-type]
+                                ac_dt = torch.get_autocast_dtype(dev_t)  # type: ignore[arg-type]
+                                target_dt = ac_dt if ac_dt in (torch.float16, torch.bfloat16) else weight.dtype
+                            else:
                                 target_dt = weight.dtype
-                            input = input.to(dtype=target_dt)
+                        except (TypeError, RuntimeError, AttributeError) as exc:
+                            report_exception(
+                                "trainer.conv_autocast_probe",
+                                "Autocast dtype probe failed in conv wrapper; using weight dtype",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="trainer",
+                            )
+                            target_dt = weight.dtype
+                        input = input.to(dtype=target_dt)
                     weight = safe_to_device(weight, device=input.device, dtype=target_dt)
                     if isinstance(bias, torch.Tensor) and (bias.device != input.device or bias.dtype != target_dt):
                         bias = safe_to_device(bias, device=input.device, dtype=target_dt)
@@ -1179,14 +1084,14 @@ def _install_chunked_sdpa_wrapper() -> None:
                     bias = safe_to_device(bias, device=input.device, dtype=input.dtype)
             return orig_conv1d(input, weight, bias, stride, padding, dilation, groups)
 
-        setattr(_dml_safe_conv1d, "_omni_dml_safe", True)
-        F.conv1d = _dml_safe_conv1d
+        setattr(_omni_safe_conv1d, "_omni_op_safe", True)
+        F.conv1d = _omni_safe_conv1d
 
     orig_conv2d = getattr(F, "_omni_orig_conv2d", getattr(F, "conv2d", None))
-    if orig_conv2d is not None and not getattr(F.conv2d, "_omni_dml_safe", False):
+    if orig_conv2d is not None and not getattr(F.conv2d, "_omni_op_safe", False):
         setattr(F, "_omni_orig_conv2d", orig_conv2d)
 
-        def _dml_safe_conv2d(
+        def _omni_safe_conv2d(
             input: torch.Tensor,
             weight: torch.Tensor,
             bias: Optional[torch.Tensor] = None,
@@ -1196,33 +1101,6 @@ def _install_chunked_sdpa_wrapper() -> None:
             groups: int = 1,
         ) -> torch.Tensor:
             if isinstance(input, torch.Tensor):
-                if input.device.type in ("privateuseone", "dml"):
-                    ctx = (
-                        torch.inference_mode(False)
-                        if torch.is_inference_mode_enabled()
-                        else contextlib.nullcontext()
-                    )
-                    with ctx:
-                        if (
-                            isinstance(weight, torch.Tensor)
-                            and weight.dtype in (torch.float16, torch.bfloat16)
-                            and input.dtype == torch.float32
-                        ):
-                            target_dt = torch.float16 if input.device.type in ("privateuseone", "dml") else weight.dtype
-                            input = input.to(dtype=target_dt)
-                        if is_inference_tensor(input) or not input.is_contiguous() or input.storage_offset() != 0:
-                            input = input.clone()
-                        if isinstance(weight, torch.Tensor):
-                            if weight.device != input.device or weight.dtype != input.dtype:
-                                weight = safe_to_device(weight, device=input.device, dtype=input.dtype)
-                            if is_inference_tensor(weight) or not weight.is_contiguous() or weight.storage_offset() != 0:
-                                weight = weight.clone()
-                        if isinstance(bias, torch.Tensor):
-                            if bias.device != input.device or bias.dtype != input.dtype:
-                                bias = safe_to_device(bias, device=input.device, dtype=input.dtype)
-                            if is_inference_tensor(bias) or not bias.is_contiguous() or bias.storage_offset() != 0:
-                                bias = bias.clone()
-                        return orig_conv2d(input, weight, bias, stride, padding, dilation, groups)
                 if (
                     isinstance(weight, torch.Tensor)
                     and not weight.requires_grad
@@ -1237,7 +1115,15 @@ def _install_chunked_sdpa_wrapper() -> None:
                                 target_dt = ac_dt if ac_dt in (torch.float16, torch.bfloat16) else weight.dtype
                             else:
                                 target_dt = weight.dtype
-                        except Exception:
+                        except (TypeError, RuntimeError, AttributeError) as exc:
+                            report_exception(
+                                "trainer.linear_autocast_probe",
+                                "Autocast dtype probe failed in F.conv2d wrapper; using weight dtype",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="trainer",
+                            )
                             target_dt = weight.dtype
                         input = input.to(dtype=target_dt)
                     weight = safe_to_device(weight, device=input.device, dtype=target_dt)
@@ -1257,14 +1143,14 @@ def _install_chunked_sdpa_wrapper() -> None:
                         weight = weight.clone()
             return orig_conv2d(input, weight, bias, stride, padding, dilation, groups)
 
-        setattr(_dml_safe_conv2d, "_omni_dml_safe", True)
-        F.conv2d = _dml_safe_conv2d
+        setattr(_omni_safe_conv2d, "_omni_op_safe", True)
+        F.conv2d = _omni_safe_conv2d
 
     orig_conv3d = getattr(F, "_omni_orig_conv3d", getattr(F, "conv3d", None))
-    if orig_conv3d is not None and not getattr(F.conv3d, "_omni_train_dml_safe", False):
+    if orig_conv3d is not None and not getattr(F.conv3d, "_omni_op_safe", False):
         setattr(F, "_omni_orig_conv3d", orig_conv3d)
 
-        def _dml_safe_conv3d(
+        def _omni_safe_conv3d(
             input: torch.Tensor,
             weight: torch.Tensor,
             bias: Optional[torch.Tensor] = None,
@@ -1278,197 +1164,41 @@ def _install_chunked_sdpa_wrapper() -> None:
                     not weight.requires_grad
                     and (weight.device != input.device or weight.dtype != input.dtype)
                 ):
-                    if input.device.type in ("privateuseone", "dml"):
-                        target_dt = torch.float16 if input.dtype in (torch.float16, torch.bfloat16, torch.float32) else input.dtype
-                        if input.dtype != target_dt:
-                            input = input.to(dtype=target_dt)
-                    else:
-                        target_dt = input.dtype
-                        if input.dtype == torch.float32 and weight.dtype in (torch.float16, torch.bfloat16):
-                            try:
-                                dev_t = input.device.type
-                                if torch.is_autocast_enabled(dev_t):  # type: ignore[arg-type]
-                                    ac_dt = torch.get_autocast_dtype(dev_t)  # type: ignore[arg-type]
-                                    target_dt = ac_dt if ac_dt in (torch.float16, torch.bfloat16) else weight.dtype
-                                else:
-                                    target_dt = weight.dtype
-                            except Exception:
+                    target_dt = input.dtype
+                    if input.dtype == torch.float32 and weight.dtype in (torch.float16, torch.bfloat16):
+                        try:
+                            dev_t = input.device.type
+                            if torch.is_autocast_enabled(dev_t):  # type: ignore[arg-type]
+                                ac_dt = torch.get_autocast_dtype(dev_t)  # type: ignore[arg-type]
+                                target_dt = ac_dt if ac_dt in (torch.float16, torch.bfloat16) else weight.dtype
+                            else:
                                 target_dt = weight.dtype
-                            input = input.to(dtype=target_dt)
+                        except (TypeError, RuntimeError, AttributeError) as exc:
+                            report_exception(
+                                "trainer.conv_autocast_probe",
+                                "Autocast dtype probe failed in conv wrapper; using weight dtype",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="trainer",
+                            )
+                            target_dt = weight.dtype
+                        input = input.to(dtype=target_dt)
                     weight = safe_to_device(weight, device=input.device, dtype=target_dt)
                     if isinstance(bias, torch.Tensor) and (bias.device != input.device or bias.dtype != target_dt):
                         bias = safe_to_device(bias, device=input.device, dtype=target_dt)
                 elif isinstance(bias, torch.Tensor) and (bias.device != input.device or bias.dtype != input.dtype):
                     bias = safe_to_device(bias, device=input.device, dtype=input.dtype)
-            if (
-                isinstance(input, torch.Tensor)
-                and input.device.type in ("privateuseone", "dml")
-                and input.ndim == 5
-                and isinstance(weight, torch.Tensor)
-                and weight.ndim == 5
-                and isinstance(padding, (int, tuple, list))
-            ):
-                ctx = (
-                    torch.inference_mode(False)
-                    if torch.is_inference_mode_enabled()
-                    else contextlib.nullcontext()
-                )
-                with ctx:
-                    if is_inference_tensor(input) or not input.is_contiguous() or input.storage_offset() != 0:
-                        input = input.clone()
-                    if weight.device != input.device or weight.dtype != input.dtype:
-                        weight = safe_to_device(weight, device=input.device, dtype=input.dtype)
-                    if is_inference_tensor(weight) or not weight.is_contiguous() or weight.storage_offset() != 0:
-                        weight = weight.clone()
-                    if isinstance(bias, torch.Tensor):
-                        if bias.device != input.device or bias.dtype != input.dtype:
-                            bias = safe_to_device(bias, device=input.device, dtype=input.dtype)
-                        if is_inference_tensor(bias) or not bias.is_contiguous() or bias.storage_offset() != 0:
-                            bias = bias.clone()
-                    s_3 = (stride, stride, stride) if isinstance(stride, int) else tuple(stride)
-                    p_3 = (padding, padding, padding) if isinstance(padding, int) else tuple(padding)
-                    d_3 = (dilation, dilation, dilation) if isinstance(dilation, int) else tuple(dilation)
-                    s_t, s_h, s_w = int(s_3[0]), int(s_3[1]), int(s_3[2])
-                    p_t, p_h, p_w = int(p_3[0]), int(p_3[1]), int(p_3[2])
-                    d_t, d_h, d_w = int(d_3[0]), int(d_3[1]), int(d_3[2])
-                    k_t = int(weight.shape[2])
-                    b, c, t_len, h, w = input.shape
-                    if k_t == 1 and s_t == 1 and p_t == 0:
-                        x_4d = input.permute(0, 2, 1, 3, 4).contiguous().reshape(b * t_len, c, h, w)
-                        w_4d = weight.squeeze(2).clone()
-                        out_4d = F.conv2d(
-                            x_4d,
-                            w_4d,
-                            bias,
-                            stride=(s_h, s_w),
-                            padding=(p_h, p_w),
-                            dilation=(d_h, d_w),
-                            groups=groups,
-                        )
-                        _, c_out, h_out, w_out = out_4d.shape
-                        return out_4d.reshape(b, t_len, c_out, h_out, w_out).permute(0, 2, 1, 3, 4).contiguous()
-                    if p_t > 0:
-                        input = F.pad(input, (0, 0, 0, 0, p_t, p_t))
-                    t_padded = int(input.shape[2])
-                    eff_k_t = (k_t - 1) * d_t + 1
-                    t_out_len = max(1, (t_padded - eff_k_t) // s_t + 1)
-                    frames: List[torch.Tensor] = []
-                    for t_idx in range(t_out_len):
-                        t_start = t_idx * s_t
-                        acc: Optional[torch.Tensor] = None
-                        for kt_idx in range(k_t):
-                            x_slice = input[:, :, t_start + kt_idx * d_t, :, :].clone()
-                            w_slice = weight[:, :, kt_idx, :, :].clone()
-                            conv_step = F.conv2d(
-                                x_slice,
-                                w_slice,
-                                bias if kt_idx == 0 else None,
-                                stride=(s_h, s_w),
-                                padding=(p_h, p_w),
-                                dilation=(d_h, d_w),
-                                groups=groups,
-                            )
-                            acc = conv_step if acc is None else (acc + conv_step)
-                        assert acc is not None
-                        frames.append(acc.unsqueeze(2))
-                    return torch.cat(frames, dim=2)
             return orig_conv3d(input, weight, bias, stride, padding, dilation, groups)
 
-        setattr(_dml_safe_conv3d, "_omni_dml_safe", True)
-        setattr(_dml_safe_conv3d, "_omni_train_dml_safe", True)
-        F.conv3d = _dml_safe_conv3d
-
-    orig_pixel_unshuffle = getattr(F, "_omni_orig_pixel_unshuffle", getattr(F, "pixel_unshuffle", None))
-    if orig_pixel_unshuffle is not None and not getattr(F.pixel_unshuffle, "_omni_dml_safe", False):
-        setattr(F, "_omni_orig_pixel_unshuffle", orig_pixel_unshuffle)
-
-        def _dml_safe_pixel_unshuffle(input: torch.Tensor, downscale_factor: int) -> torch.Tensor:
-            if (
-                isinstance(input, torch.Tensor)
-                and input.device.type in ("privateuseone", "dml")
-                and input.ndim == 4
-            ):
-                ctx = (
-                    torch.inference_mode(False)
-                    if torch.is_inference_mode_enabled()
-                    else contextlib.nullcontext()
-                )
-                with ctx:
-                    r = int(downscale_factor)
-                    b, c, h, w = input.shape
-                    if is_inference_tensor(input) or not input.is_contiguous() or input.storage_offset() != 0:
-                        input = input.clone()
-                    # Merge (B * C) so intermediate tensor is 5D (within DirectML's 5D tensor descriptor limit), never 6D
-                    x_5d = input.reshape(b * c, h // r, r, w // r, r).permute(0, 2, 4, 1, 3).contiguous()
-                    return x_5d.reshape(b, c * r * r, h // r, w // r)
-            return orig_pixel_unshuffle(input, downscale_factor)
-
-        setattr(_dml_safe_pixel_unshuffle, "_omni_dml_safe", True)
-        F.pixel_unshuffle = _dml_safe_pixel_unshuffle
-
-    orig_pixel_shuffle = getattr(F, "_omni_orig_pixel_shuffle", getattr(F, "pixel_shuffle", None))
-    if orig_pixel_shuffle is not None and not getattr(F.pixel_shuffle, "_omni_dml_safe", False):
-        setattr(F, "_omni_orig_pixel_shuffle", orig_pixel_shuffle)
-
-        def _dml_safe_pixel_shuffle(input: torch.Tensor, upscale_factor: int) -> torch.Tensor:
-            if (
-                isinstance(input, torch.Tensor)
-                and input.device.type in ("privateuseone", "dml")
-                and input.ndim == 4
-            ):
-                ctx = (
-                    torch.inference_mode(False)
-                    if torch.is_inference_mode_enabled()
-                    else contextlib.nullcontext()
-                )
-                with ctx:
-                    r = int(upscale_factor)
-                    b, c_in, h, w = input.shape
-                    c_out = c_in // (r * r)
-                    if is_inference_tensor(input) or not input.is_contiguous() or input.storage_offset() != 0:
-                        input = input.clone()
-                    # Merge (B * C_out) so intermediate tensor is 5D (within DirectML's 5D tensor descriptor limit), never 6D
-                    x_5d = input.reshape(b * c_out, r, r, h, w).permute(0, 3, 1, 4, 2).contiguous()
-                    return x_5d.reshape(b, c_out, h * r, w * r)
-            return orig_pixel_shuffle(input, upscale_factor)
-
-        setattr(_dml_safe_pixel_shuffle, "_omni_dml_safe", True)
-        F.pixel_shuffle = _dml_safe_pixel_shuffle
+        setattr(_omni_safe_conv3d, "_omni_op_safe", True)
+        F.conv3d = _omni_safe_conv3d
 
 
 _OUT_KWARG_WRAPPERS_INSTALLED: bool = False
-_SEQ_PROMOTE_OPS: Tuple[str, ...] = ("cat", "stack", "hstack", "vstack", "dstack", "column_stack", "row_stack")
 _MATMUL_PROMOTE_OPS: Tuple[str, ...] = ("bmm", "matmul", "mm", "addmm", "baddbmm")
 _FP32_AUTOCAST_GUARD_TORCH_OPS: Tuple[str, ...] = ("mv", "addmv", "addbmm", "addr", "einsum")
 _TRAINING_TENSOR_MM_OPS: Tuple[str, ...] = ("__matmul__", "matmul", "bmm", "mm", "mv", "addmm", "baddbmm")
-
-
-def _unify_16bit_seq_tensors(tensors: Any) -> Any:
-    """
-    When `torch.cat` or `torch.stack` on DirectML (`privateuseone` / `dml`) receives a mix of
-    `float32` and `float16` tensors, unify to `float16` so DirectML shaders do not fail on mixed-dtype
-    sequence concatenation.
-    """
-    if not isinstance(tensors, (tuple, list)) or len(tensors) < 2:
-        return tensors
-    has_fp32 = False
-    target_16bit: Optional[torch.dtype] = None
-    first_dev_type = "cpu"
-    for t in tensors:
-        if isinstance(t, torch.Tensor):
-            first_dev_type = t.device.type
-            if t.dtype == torch.float32:
-                has_fp32 = True
-            elif t.dtype in (torch.float16, torch.bfloat16) and target_16bit is None:
-                target_16bit = t.dtype
-    if not has_fp32 or target_16bit is None or first_dev_type not in ("privateuseone", "dml"):
-        return tensors
-    target_16bit = torch.float16
-    converted = [
-        (t.to(dtype=target_16bit) if isinstance(t, torch.Tensor) and t.dtype == torch.float32 else t)
-        for t in tensors
-    ]
-    return tuple(converted) if isinstance(tensors, tuple) else converted
 
 
 def _unify_16bit_matmul_args(args: Tuple[Any, ...]) -> Tuple[Any, ...]:
@@ -1486,7 +1216,7 @@ def _unify_16bit_matmul_args(args: Tuple[Any, ...]) -> Tuple[Any, ...]:
             if a.dtype == torch.float32:
                 has_fp32 = True
             elif a.dtype in (torch.float16, torch.bfloat16) and target_16bit is None:
-                target_16bit = torch.float16 if a.device.type in ("privateuseone", "dml") else a.dtype
+                target_16bit = a.dtype
     if not has_fp32 or target_16bit is None:
         return args
     return tuple(
@@ -1501,7 +1231,7 @@ def _active_fp16_autocast_device_type(t: torch.Tensor) -> Optional[str]:
     `dtype == torch.float16`, otherwise `None`.
     """
     dev_type = t.device.type
-    if dev_type in ("meta", "privateuseone", "dml"):
+    if dev_type == "meta":
         return None
     try:
         if torch.is_autocast_enabled(dev_type) and torch.get_autocast_dtype(dev_type) == torch.float16:
@@ -1513,10 +1243,24 @@ def _active_fp16_autocast_device_type(t: torch.Tensor) -> Optional[str]:
                     return dev_type
             elif torch.is_autocast_enabled() and torch.get_autocast_gpu_dtype() == torch.float16:
                 return dev_type
-        except Exception:
-            pass
-    except Exception:
-        pass
+        except (RuntimeError, AttributeError) as exc:
+            report_exception(
+                "trainer.fp16_autocast_legacy_probe",
+                "Legacy FP16 autocast probe failed",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="trainer",
+            )
+    except (RuntimeError, AttributeError) as exc:
+        report_exception(
+            "trainer.fp16_autocast_probe",
+            "FP16 autocast probe failed",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="trainer",
+        )
     return None
 
 
@@ -1595,16 +1339,11 @@ def _install_out_kwarg_autograd_wrappers() -> None:
         setattr(torch, f"_omni_orig_{op_name}", orig_fn)
 
         def _make_wrapper(target_fn: Any, name: str) -> Any:
-            is_seq_op = name in _SEQ_PROMOTE_OPS
             is_mm_op = name in _MATMUL_PROMOTE_OPS
             is_lerp_op = name == "lerp"
 
             def _wrapped(*args: Any, **kwargs: Any) -> Any:
-                if is_seq_op and len(args) >= 1:
-                    unified_seq = _unify_16bit_seq_tensors(args[0])
-                    if unified_seq is not args[0]:
-                        args = (unified_seq,) + args[1:]
-                elif is_mm_op and len(args) >= 2:
+                if is_mm_op and len(args) >= 2:
                     args = _unify_16bit_matmul_args(args)
                     fp32_ac_dev = _should_keep_fp32_under_fp16_autocast(args, kwargs)
                     if fp32_ac_dev is not None:
@@ -1642,8 +1381,15 @@ def _install_out_kwarg_autograd_wrappers() -> None:
 
         try:
             setattr(torch, op_name, _make_wrapper(orig_fn, op_name))
-        except Exception:
-            pass
+        except (AttributeError, TypeError) as exc:
+            report_exception(
+                f"trainer.install_out_kwarg_wrapper.{op_name}",
+                f"Could not install out-kwarg autograd wrapper for torch.{op_name}",
+                exc,
+                level=logging.WARNING,
+                once=True,
+                logger_name="trainer",
+            )
 
     for op_name in _FP32_AUTOCAST_GUARD_TORCH_OPS:
         fn = getattr(torch, op_name, None)
@@ -1666,8 +1412,15 @@ def _install_out_kwarg_autograd_wrappers() -> None:
 
         try:
             setattr(torch, op_name, _make_fp32_guard_wrapper(orig_fn))
-        except Exception:
-            pass
+        except (AttributeError, TypeError) as exc:
+            report_exception(
+                f"trainer.install_fp32_guard.{op_name}",
+                f"Could not install FP32 autocast guard for torch.{op_name}",
+                exc,
+                level=logging.WARNING,
+                once=True,
+                logger_name="trainer",
+            )
 
     for attr_name in _TRAINING_TENSOR_MM_OPS:
         fn = getattr(torch.Tensor, attr_name, None)
@@ -1691,8 +1444,15 @@ def _install_out_kwarg_autograd_wrappers() -> None:
 
         try:
             setattr(torch.Tensor, attr_name, _make_tensor_mm_wrapper(orig_fn))
-        except Exception:
-            pass
+        except (AttributeError, TypeError) as exc:
+            report_exception(
+                f"trainer.install_tensor_mm_wrapper.{attr_name}",
+                f"Could not install FP32 autocast guard for torch.Tensor.{attr_name}",
+                exc,
+                level=logging.WARNING,
+                once=True,
+                logger_name="trainer",
+            )
 
     _OUT_KWARG_WRAPPERS_INSTALLED = True
 
@@ -1713,8 +1473,6 @@ _TRAINING_WRAPPED_F_OPS: Tuple[Tuple[str, str], ...] = (
     ("conv1d", "_omni_orig_conv1d"),
     ("conv2d", "_omni_orig_conv2d"),
     ("conv3d", "_omni_orig_conv3d"),
-    ("pixel_unshuffle", "_omni_orig_pixel_unshuffle"),
-    ("pixel_shuffle", "_omni_orig_pixel_shuffle"),
 )
 
 
@@ -1734,7 +1492,7 @@ def _acquire_training_op_wrappers() -> None:
                 cur = getattr(F, attr_name, None)
                 if cur is None:
                     continue
-                if getattr(cur, "_omni_chunked_sdpa_safe", False) or getattr(cur, "_omni_dml_safe", False):
+                if getattr(cur, "_omni_chunked_sdpa_safe", False) or getattr(cur, "_omni_op_safe", False):
                     _TRAINING_OP_SAVED_F[attr_name] = getattr(F, orig_attr, cur)
                 else:
                     _TRAINING_OP_SAVED_F[attr_name] = cur
@@ -1791,15 +1549,29 @@ def _release_training_op_wrappers(force: bool = False) -> None:
             if saved is not None:
                 try:
                     setattr(F, attr_name, saved)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        f"trainer.restore_F_op.{attr_name}",
+                        f"Failed to restore torch.nn.functional.{attr_name} after training",
+                        exc,
+                        level=logging.WARNING,
+                        reraise_in_strict=True,
+                        logger_name="trainer",
+                    )
         for op_name in _OUT_KWARG_TORCH_OPS + _FP32_AUTOCAST_GUARD_TORCH_OPS:
             saved = _TRAINING_OP_SAVED_TORCH.get(op_name, getattr(torch, f"_omni_orig_{op_name}", None))
             if saved is not None:
                 try:
                     setattr(torch, op_name, saved)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        f"trainer.restore_torch_op.{op_name}",
+                        f"Failed to restore torch.{op_name} after training",
+                        exc,
+                        level=logging.WARNING,
+                        reraise_in_strict=True,
+                        logger_name="trainer",
+                    )
         for attr_name in _TRAINING_TENSOR_MM_OPS:
             saved_entry = _TRAINING_OP_SAVED_TENSOR_OPS.get(attr_name)
             if saved_entry is not None:
@@ -1809,13 +1581,27 @@ def _release_training_op_wrappers(force: bool = False) -> None:
                         setattr(torch.Tensor, attr_name, saved_fn)
                     elif attr_name in torch.Tensor.__dict__:
                         delattr(torch.Tensor, attr_name)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        f"trainer.restore_tensor_op.{attr_name}",
+                        f"Failed to restore torch.Tensor.{attr_name} after training",
+                        exc,
+                        level=logging.WARNING,
+                        reraise_in_strict=True,
+                        logger_name="trainer",
+                    )
             elif attr_name in torch.Tensor.__dict__ and getattr(torch.Tensor.__dict__[attr_name], "_omni_fp32_autocast_safe", False):
                 try:
                     delattr(torch.Tensor, attr_name)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    report_exception(
+                        f"trainer.delete_tensor_op.{attr_name}",
+                        f"Failed to remove wrapped torch.Tensor.{attr_name} after training",
+                        exc,
+                        level=logging.WARNING,
+                        reraise_in_strict=True,
+                        logger_name="trainer",
+                    )
         _TRAINING_OP_SAVED_F.clear()
         _TRAINING_OP_SAVED_TORCH.clear()
         _TRAINING_OP_SAVED_TENSOR_OPS.clear()
@@ -1855,11 +1641,7 @@ def _inplace_safe_outer_autograd_context(gradient_checkpointing: bool = True) ->
     max_non_diff_clone_bytes = 8 * 1024 * 1024  # Cap only non-differentiable constant/RoPE/mask tensors
 
     def _outer_pack(t: torch.Tensor) -> torch.Tensor:
-        if (
-            isinstance(t, nn.Parameter)
-            or is_custom_quantized_tensor(t)
-            or t.device.type in ("privateuseone", "dml")
-        ):
+        if isinstance(t, nn.Parameter) or is_custom_quantized_tensor(t):
             return t
         if not t.requires_grad and (
             (t.ndim >= 2 and t.numel() >= 16384)
@@ -1936,14 +1718,6 @@ def _checkpoint_block_inplace_safe(
 
     dev = _find_first_tensor_device(args) or _find_first_tensor_device(kwargs)
     dev_type = dev.type if (dev is not None and dev.type != "cpu") else None
-    if dev_type in ("privateuseone", "dml"):
-        # DirectML does not use a stream-ordered caching allocator; keep activation `ID3D12Resource`
-        # buffers alive in standard `SavedVariable`s until backward finishes so no buffer is released
-        # on the CPU while a D3D12 command list referencing it is still open.
-        fwd_args = _clone_tensors_for_grad(args)
-        fwd_kwargs = _clone_tensors_for_grad(kwargs)
-        dml_out = _clone_tensors_for_grad(orig_fn(*fwd_args, **fwd_kwargs))
-        return _ensure_nonleaf_grad_outputs(dml_out)
     dev_idx = dev.index if dev is not None else None
     dev_mod = getattr(torch, dev_type, None) if (preserve_rng and dev_type) else None
 
@@ -1955,9 +1729,25 @@ def _checkpoint_block_inplace_safe(
         except TypeError:
             try:
                 dev_rng_state = dev_mod.get_rng_state()
-            except Exception:
+            except (RuntimeError, AttributeError) as exc:
+                report_exception(
+                    "trainer.ckpt_get_rng_fallback",
+                    "Could not capture device RNG state for checkpoint recompute",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="trainer",
+                )
                 dev_rng_state = None
-        except Exception:
+        except (RuntimeError, AttributeError) as exc:
+            report_exception(
+                "trainer.ckpt_get_rng",
+                "Could not capture device RNG state for checkpoint recompute",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="trainer",
+            )
             dev_rng_state = None
 
     ac_dev_type = dev_type or "cuda"
@@ -1970,10 +1760,24 @@ def _checkpoint_block_inplace_safe(
         try:
             ac_enabled = bool(torch.is_autocast_enabled())
             ac_dtype = torch.get_autocast_gpu_dtype()
-        except Exception:
-            pass
-    except Exception:
-        pass
+        except (RuntimeError, AttributeError) as exc:
+            report_exception(
+                "trainer.ckpt_autocast_legacy_probe",
+                "Legacy autocast probe failed in activation checkpointing",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="trainer",
+            )
+    except (RuntimeError, AttributeError) as exc:
+        report_exception(
+            "trainer.ckpt_autocast_probe",
+            "Autocast probe failed in activation checkpointing",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="trainer",
+        )
 
     mm_mod_fwd = sys.modules.get("comfy.model_management")
     fwd_in_training = bool(getattr(mm_mod_fwd, "in_training", False)) if mm_mod_fwd is not None else False
@@ -2051,9 +1855,25 @@ def _checkpoint_block_inplace_safe(
                 except TypeError:
                     try:
                         prev_dev_rng = dev_mod.get_rng_state()
-                    except Exception:
+                    except (RuntimeError, AttributeError) as exc:
+                        report_exception(
+                            "trainer.ckpt_rec_get_rng_fallback",
+                            "Could not capture current device RNG state before recompute",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="trainer",
+                        )
                         prev_dev_rng = None
-                except Exception:
+                except (RuntimeError, AttributeError) as exc:
+                    report_exception(
+                        "trainer.ckpt_rec_get_rng",
+                        "Could not capture current device RNG state before recompute",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="trainer",
+                    )
                     prev_dev_rng = None
 
             rec_mm_mod = sys.modules.get("comfy.model_management")
@@ -2063,7 +1883,15 @@ def _checkpoint_block_inplace_safe(
                 if not prev_rec_in_training:
                     try:
                         rec_mm_mod.in_training = True  # type: ignore[attr-defined]
-                    except Exception:
+                    except Exception as exc:
+                        report_exception(
+                            "trainer.ckpt_rec_in_training_enter",
+                            "Failed to set comfy.model_management.in_training during recompute",
+                            exc,
+                            level=logging.WARNING,
+                            once=True,
+                            logger_name="trainer",
+                        )
                         prev_rec_in_training = None
 
             try:
@@ -2078,10 +1906,24 @@ def _checkpoint_block_inplace_safe(
                     except TypeError:
                         try:
                             dev_mod.set_rng_state(dev_rng_state)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
+                        except (RuntimeError, AttributeError) as exc:
+                            report_exception(
+                                "trainer.ckpt_rec_set_rng_fallback",
+                                "Could not restore saved device RNG state for recompute",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="trainer",
+                            )
+                    except (RuntimeError, AttributeError) as exc:
+                        report_exception(
+                            "trainer.ckpt_rec_set_rng",
+                            "Could not restore saved device RNG state for recompute",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="trainer",
+                        )
 
                 ac_ctx = (
                     torch.amp.autocast(device_type=ac_dev_type, dtype=ac_dtype, enabled=True)
@@ -2102,8 +1944,16 @@ def _checkpoint_block_inplace_safe(
                 if rec_mm_mod is not None and prev_rec_in_training is False:
                     try:
                         rec_mm_mod.in_training = False  # type: ignore[attr-defined]
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        report_exception(
+                            "trainer.ckpt_rec_in_training_exit",
+                            "Failed to restore comfy.model_management.in_training after recompute",
+                            exc,
+                            level=logging.WARNING,
+                            once=True,
+                            reraise_in_strict=True,
+                            logger_name="trainer",
+                        )
                 if preserve_rng and prev_cpu_rng is not None:
                     torch.set_rng_state(prev_cpu_rng)
                 if preserve_rng and dev_mod is not None and prev_dev_rng is not None:
@@ -2115,10 +1965,24 @@ def _checkpoint_block_inplace_safe(
                     except TypeError:
                         try:
                             dev_mod.set_rng_state(prev_dev_rng)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
+                        except (RuntimeError, AttributeError) as exc:
+                            report_exception(
+                                "trainer.ckpt_rec_restore_rng_fallback",
+                                "Could not restore post-recompute device RNG state",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="trainer",
+                            )
+                    except (RuntimeError, AttributeError) as exc:
+                        report_exception(
+                            "trainer.ckpt_rec_restore_rng",
+                            "Could not restore post-recompute device RNG state",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="trainer",
+                        )
 
         cand = recomputed.get(slot)
         if cand is not None and (expected_shape is None or tuple(cand.shape) == expected_shape):
@@ -2188,9 +2052,9 @@ class StepMetrics:
 class LoRATrainingPipeline:
     """
     Hardware-agnostic PyTorch LoRA training pipeline.
-    Executes identically across all 8 backends (`xpu`, `cuda`, `rocm`, `npu`, `hpu`, `dml`, `mps`, `cpu`).
-    Strictly avoids `torch.float64` (`.double()`) so GPUs without hardware FP64 (eg Intel Arc,
-    Apple MPS, DirectML) never raise `Required aspect fp64 is not supported on the device`.
+    Executes identically across all 8 backends (`xpu`, `cuda`, `rocm`, `tpu`, `npu`, `hpu`, `mps`, `cpu`).
+    Strictly avoids `torch.float64` (`.double()`) so GPUs without hardware FP64 (e.g. Intel Arc,
+    Apple MPS) never raise `Required aspect fp64 is not supported on the device`.
     """
 
     def __init__(
@@ -2216,8 +2080,8 @@ class LoRATrainingPipeline:
         """
         Pure-FP32 L2 gradient norm clipping:
         - Never uses `torch.float64` (`.double()`).
-        - Avoids `aten::linalg_vector_norm` on `float16` tensors (which is unsupported in
-          `torch-directml` `privateuseone` and overflows when squared norms exceed `65504.0`).
+        - Avoids `aten::linalg_vector_norm` on `float16` tensors (which overflows when squared norms
+          exceed `65504.0`).
         - Accumulates squared norms in `torch.float32` on the target device via a single batched
           stack reduction and a single host read.
         """
@@ -2267,14 +2131,14 @@ class LoRATrainingPipeline:
     def _build_fp32_safe_optimizer(self, trainable_params: List[nn.Parameter]) -> torch.optim.Optimizer:
         """
         Construct the requested optimizer (`radamw`, `adamw`, `adafactor`, `sgd`) with `foreach=False`
-        so multi-tensor kernels never allocate internal `float64` step counters on XPU/MPS/DML.
+        so multi-tensor kernels never allocate internal `float64` step counters on XPU/MPS.
         - `radamw` (and legacy alias `radam`) enables `decoupled_weight_decay=True` for AdamW weight decay + automatic variance warmup.
         - `adafactor` implements Shazeer & Stern (2018) factored 2nd moments (`exp_avg_sq_row` + `exp_avg_sq_col`,
           zero 1st-moment `exp_avg`, zero persistent `master_param`), on-device RMS update clipping (`d=1.0`),
           and unbiased 16-bit stochastic rounding, cutting optimizer VRAM by ~75-85%.
         - Supports `LoRA+` differential learning rates (`lora_plus_lr_ratio > 1.0`), assigning
           `lr` to `lora_A` (`lora_down`) and `lr * lora_plus_lr_ratio` to `lora_B` (`lora_up`).
-        - When any trainable LoRA parameter is in `torch.float16` or on DirectML (`privateuseone`) with
+        - When any trainable LoRA parameter is in `torch.float16` or `torch.bfloat16` with
           `radamw`/`adamw`/`sgd`, maintains 32-bit `master_param`, `exp_avg`, and `exp_avg_sq` optimizer
           state tensors and executes all moment updates in pure `float32` elementwise ops (`*`, `+`, `/`, `sqrt`).
         """
@@ -2383,7 +2247,7 @@ class LoRATrainingPipeline:
                                 w_f32 = w_f32 * (1.0 - g_lr * g_wd)
                             w_f32 = w_f32 - update * g_lr
 
-                            if p.dtype in (torch.float16, torch.bfloat16) and p.device.type not in ("privateuseone", "dml"):
+                            if p.dtype in (torch.float16, torch.bfloat16):
                                 # Unbiased stochastic rounding for 16-bit parameter storage without FP32 master weights
                                 mantissa_eps = 0.0009765625 if p.dtype == torch.float16 else 0.0078125
                                 min_ulp = 6.103515625e-5 if p.dtype == torch.float16 else 1.17549435e-38
@@ -2391,15 +2255,20 @@ class LoRATrainingPipeline:
                                     ulp = (w_f32.abs() * mantissa_eps).clamp(min=min_ulp)
                                     dither = (torch.rand_like(w_f32) - 0.5) * ulp
                                     w_f32 = w_f32 + dither
-                                except Exception:
-                                    pass
+                                except RuntimeError as exc:
+                                    report_exception(
+                                        "trainer.adafactor_stochastic_round",
+                                        "Adafactor stochastic rounding fell back to round-to-nearest",
+                                        exc,
+                                        level=logging.DEBUG,
+                                        once=True,
+                                        logger_name="trainer",
+                                    )
 
                             p.copy_(w_f32.to(dtype=p.dtype))
                     return loss
 
             return PureFP32Adafactor(param_groups, lr=lr, weight_decay=wd)
-
-        has_lr_warmup = int(getattr(self.config, "warmup_steps", 0) or 0) > 0
 
         if opt_name == "sgd":
             opt: torch.optim.Optimizer = torch.optim.SGD(
@@ -2420,12 +2289,20 @@ class LoRATrainingPipeline:
                 foreach=False,
             )
         elif opt_name in ("radamw", "radam"):
-            # When an explicit LR warmup schedule (`warmup_steps > 0`) is already active,
-            # stacking RAdam's analytic variance rectification (`rect`) on top of linear warmup
-            # suppresses the effective LR by ~6.6x across a 500-step LoRA run. Use `betas=(0.9, 0.99)`
-            # (`rho_inf = 199`) and only apply analytic `rect` when `warmup_steps == 0`.
-            if has_lr_warmup:
-                opt = torch.optim.AdamW(
+            # Always construct genuine RAdamW (`betas=(0.9, 0.99)`, `rho_inf = 199`) regardless of
+            # `warmup_steps` so selecting `radamw` never silently falls back to AdamW.
+            try:
+                opt = torch.optim.RAdam(
+                    param_groups,
+                    lr=lr,
+                    betas=(0.9, 0.99),
+                    weight_decay=wd,
+                    eps=1e-8,
+                    decoupled_weight_decay=True,
+                    foreach=False,
+                )
+            except TypeError:
+                opt = torch.optim.RAdam(
                     param_groups,
                     lr=lr,
                     betas=(0.9, 0.99),
@@ -2433,26 +2310,6 @@ class LoRATrainingPipeline:
                     eps=1e-8,
                     foreach=False,
                 )
-            else:
-                try:
-                    opt = torch.optim.RAdam(
-                        param_groups,
-                        lr=lr,
-                        betas=(0.9, 0.99),
-                        weight_decay=wd,
-                        eps=1e-8,
-                        decoupled_weight_decay=True,
-                        foreach=False,
-                    )
-                except TypeError:
-                    opt = torch.optim.RAdam(
-                        param_groups,
-                        lr=lr,
-                        betas=(0.9, 0.99),
-                        weight_decay=wd,
-                        eps=1e-8,
-                        foreach=False,
-                    )
         else:
             opt = torch.optim.AdamW(
                 param_groups,
@@ -2464,7 +2321,7 @@ class LoRATrainingPipeline:
             )
 
         needs_fp32_master_step = any(
-            p.dtype in (torch.float16, torch.bfloat16) or p.device.type in ("privateuseone", "dml")
+            p.dtype in (torch.float16, torch.bfloat16)
             for p in trainable_params
         )
         if needs_fp32_master_step:
@@ -2527,7 +2384,7 @@ class LoRATrainingPipeline:
                                 bias_corr1 = 1.0 - (beta1 ** t)
                                 bias_corr2 = 1.0 - (beta2 ** t)
 
-                                if opt_name in ("radamw", "radam") and not has_lr_warmup:
+                                if opt_name in ("radamw", "radam"):
                                     rho_inf = 2.0 / (1.0 - beta2) - 1.0
                                     beta2_t = beta2 ** t
                                     rho_t = rho_inf - 2.0 * float(t) * beta2_t / max(1e-12, 1.0 - beta2_t)
@@ -2615,8 +2472,15 @@ class LoRATrainingPipeline:
         if orig_step_func is not None and not hasattr(optimizer.step, "__func__"):
             try:
                 setattr(optimizer.step, "__func__", orig_step_func)
-            except Exception:
-                pass
+            except (AttributeError, TypeError) as exc:
+                report_exception(
+                    "trainer.scheduler_step_func_restore",
+                    "Could not preserve optimizer.step.__func__ after LambdaLR wrapping",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="trainer",
+                )
         return scheduler, sched_name, effective_warmup
 
     @_with_scoped_comfy_in_training
@@ -2676,8 +2540,15 @@ class LoRATrainingPipeline:
             try:
                 self.backend.synchronize()
                 self.backend.empty_cache()
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception(
+                    "trainer.setup_pre_budget_cache_clear",
+                    "Backend synchronize/empty_cache failed before VRAM budget enforcement",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="trainer",
+                )
 
             # Enforce deterministic VRAM ledger budget: keeps LoRA adapters + norms on GPU,
             # places frozen base weights on GPU up to `max_resident_model_mb`, and leaves overflow
@@ -2885,8 +2756,15 @@ class LoRATrainingPipeline:
                 try:
                     if exc.__traceback__ is not None:
                         traceback.clear_frames(exc.__traceback__)
-                except Exception:
-                    pass
+                except RuntimeError as tb_exc:
+                    report_exception(
+                        "trainer.oom_clear_frames",
+                        "Could not clear OOM traceback frames during recovery",
+                        tb_exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="trainer",
+                    )
                 gc.collect()
                 ckpt_newly_enabled = False
                 if not self.config.gradient_checkpointing:
@@ -2903,8 +2781,15 @@ class LoRATrainingPipeline:
                 gc.collect()
                 try:
                     self.backend.empty_cache()
-                except Exception:
-                    pass
+                except RuntimeError as cache_exc:
+                    report_exception(
+                        "trainer.oom_empty_cache",
+                        "Backend empty_cache failed during OOM recovery",
+                        cache_exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="trainer",
+                    )
                 if demoted_mb <= 0 and not ckpt_newly_enabled:
                     raise
                 logging.warning(
@@ -2948,7 +2833,7 @@ class LoRATrainingPipeline:
 
         # Proactive WDDM / Level Zero PCIe spill guard & user reserve_vram_gb ceiling across all steps:
         # If `reserved_mb` (allocator pool) exceeds the user's requested reserve ceiling or 95% of
-        # physical VRAM on XPU/DML (e.g. when a larger resolution image or emulated QuantizedTensor op
+        # physical VRAM on XPU (e.g. when a larger resolution image or emulated QuantizedTensor op
         # expands the pool above physical VRAM into shared system RAM on Step 4+), first release unused
         # cached allocator blocks (`empty_cache`) and only demote resident `base_layer` weights if needed.
         if self.backend.backend_id not in ("cpu", "mps"):
@@ -2956,7 +2841,7 @@ class LoRATrainingPipeline:
             ceiling_mb = (
                 max(1024.0, mem_snap.total_vram_mb - reserve_user_mb)
                 if reserve_user_mb > 0.0
-                else (mem_snap.total_vram_mb * 0.95 if self.backend.backend_id in ("xpu", "dml") else 0.0)
+                else (mem_snap.total_vram_mb * 0.95 if self.backend.backend_id == "xpu" else 0.0)
             )
             if (
                 mem_snap.total_vram_mb > 0
@@ -2967,8 +2852,15 @@ class LoRATrainingPipeline:
                     try:
                         self.backend.empty_cache()
                         mem_snap = self.backend.get_memory_snapshot()
-                    except Exception:
-                        pass
+                    except RuntimeError as cache_exc:
+                        report_exception(
+                            "trainer.pool_trim_empty_cache",
+                            "Backend empty_cache failed during allocator pool trim",
+                            cache_exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="trainer",
+                        )
                 if mem_snap.reserved_mb > ceiling_mb:
                     trim_count = int(getattr(self.backbone, "_omni_pool_trim_count", 0))
                     if trim_count < 3:
@@ -2978,8 +2870,15 @@ class LoRATrainingPipeline:
                             try:
                                 self.backend.empty_cache()
                                 mem_snap = self.backend.get_memory_snapshot()
-                            except Exception:
-                                pass
+                            except RuntimeError as cache_exc:
+                                report_exception(
+                                    "trainer.xpu_pool_trim_empty_cache",
+                                    "XPU empty_cache failed during allocator pool trim",
+                                    cache_exc,
+                                    level=logging.DEBUG,
+                                    once=True,
+                                    logger_name="trainer",
+                                )
                         if mem_snap.reserved_mb > ceiling_mb:
                             setattr(self.backbone, "_omni_pool_trim_count", trim_count + 1)
                             target_after_mb = (
@@ -2992,8 +2891,15 @@ class LoRATrainingPipeline:
                             if demoted_mb > 0:
                                 try:
                                     self.backend.empty_cache()
-                                except Exception:
-                                    pass
+                                except RuntimeError as cache_exc:
+                                    report_exception(
+                                        "trainer.post_demote_empty_cache",
+                                        "Backend empty_cache failed after proactive layer demotion",
+                                        cache_exc,
+                                        level=logging.DEBUG,
+                                        once=True,
+                                        logger_name="trainer",
+                                    )
                                 mem_snap = self.backend.get_memory_snapshot()
                                 logging.info(
                                     f"[OmniLoRA] Proactively offloaded {demoted_mb:.0f} MB of resident base weights to CPU "

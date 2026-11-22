@@ -2468,7 +2468,7 @@ def verify_real_model_on_backend(
 ) -> Dict[str, Any]:
     """
     Execute an unmocked real-forward training + real ComfyUI LoraLoader verification directly on
-    the active accelerator (`xpu`, `cuda`, `rocm`, `mps`, `dml`, `cpu`) in its native precision
+    the active accelerator (`xpu`, `cuda`, `rocm`, `tpu`, `mps`, `cpu`) in its native precision
     (`bf16` / `fp16` / `fp32`), returning structured metrics for the cloud verification table.
 
     Unlike mocked/bridged benchmarks, every forward, backward, gradient checkpoint recompute,

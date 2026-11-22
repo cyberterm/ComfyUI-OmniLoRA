@@ -9,11 +9,13 @@ and strictly avoids `fp64` (`double`), which is not supported in hardware on con
 
 from __future__ import annotations
 
+import logging
 from typing import Dict
 
 import torch
 import torch.nn as nn
 
+from ..diagnostics import report_exception
 from .base import (
     DeviceCapabilities,
     HardwareBackend,
@@ -51,8 +53,8 @@ class XPUBackend(HardwareBackend):
             count = int(torch.xpu.device_count())
             if count > 0:
                 return max(0, min(int(self.device_index), count - 1))
-        except Exception:
-            pass
+        except (RuntimeError, ValueError, TypeError) as exc:
+            report_exception("xpu.device_count", "torch.xpu.device_count() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.xpu")
         return 0
 
     def _probe_bf16_support(self) -> bool:
@@ -70,15 +72,15 @@ class XPUBackend(HardwareBackend):
             try:
                 if bool(torch.xpu.is_bf16_supported()):
                     return True
-            except Exception:
-                pass
+            except (RuntimeError, AttributeError) as exc:
+                report_exception("xpu.is_bf16_supported", "torch.xpu.is_bf16_supported() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.xpu")
 
         try:
             dev = self.get_device()
             a = torch.ones((2, 2), device=dev, dtype=torch.bfloat16)
             b = (a + a).float()
             return bool(b.shape == (2, 2))
-        except Exception:
+        except RuntimeError:
             return False
 
     def configure_environment(self) -> Dict[str, str]:
@@ -109,8 +111,8 @@ class XPUBackend(HardwareBackend):
             try:
                 self.device_index = self._valid_device_index()
                 torch.xpu.set_device(self.device_index)
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("xpu.set_device", "torch.xpu.set_device() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.xpu")
         return applied
 
     def get_device(self) -> torch.device:
@@ -178,16 +180,16 @@ class XPUBackend(HardwareBackend):
         if self.is_available():
             try:
                 torch.xpu.synchronize(self._valid_device_index())
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("xpu.synchronize", "torch.xpu.synchronize() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.xpu")
 
     def empty_cache(self) -> None:
         if self.is_available():
             try:
                 torch.xpu.synchronize(self._valid_device_index())
                 torch.xpu.empty_cache()
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("xpu.empty_cache", "torch.xpu.empty_cache() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.xpu")
 
     def get_memory_snapshot(self) -> MemorySnapshot:
         if not self.is_available():
@@ -216,8 +218,8 @@ class XPUBackend(HardwareBackend):
                         total = total_bytes / (1024**2)
                         cached_free = max(0.0, reserved - allocated)
                         free_mb = min(total, (free_bytes / (1024**2)) + cached_free)
-                except Exception:
-                    pass
+                except RuntimeError as exc:
+                    report_exception("xpu.mem_get_info", "torch.xpu.mem_get_info() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.xpu")
             return MemorySnapshot(
                 allocated_mb=round(allocated, 2),
                 reserved_mb=round(reserved, 2),
@@ -225,7 +227,8 @@ class XPUBackend(HardwareBackend):
                 total_vram_mb=round(total, 2),
                 free_vram_mb=round(free_mb, 2),
             )
-        except Exception:
+        except Exception as exc:
+            report_exception("xpu.memory_snapshot", "XPU memory snapshot query failed; using fallback", exc, level=logging.DEBUG, once=True, logger_name="backends.xpu")
             return MemorySnapshot(0.0, 0.0, 0.0, 16384.0, 16384.0)
 
     def manual_seed_all(self, seed: int) -> None:
@@ -233,8 +236,8 @@ class XPUBackend(HardwareBackend):
         if self.is_available():
             try:
                 torch.xpu.manual_seed_all(seed)
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("xpu.manual_seed_all", "torch.xpu.manual_seed_all() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.xpu")
 
     def optimize_module(self, module: nn.Module, mode: str = "eager", move_to_device: bool = True) -> nn.Module:
         module = sanitize_module_no_fp64(module)

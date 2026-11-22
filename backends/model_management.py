@@ -5,9 +5,9 @@ Automatically probes installed PyTorch backends in priority order:
   1. Intel XPU (`torch.xpu` — Arc / Battlemage / Max)
   2. AMD ROCm HIP (`torch.cuda` + `torch.version.hip`)
   3. NVIDIA CUDA (`torch.cuda`)
-  4. Huawei Ascend NPU (`torch_npu` / `torch.npu`)
-  5. Intel Gaudi HPU (`habana_frameworks.torch` / `torch.hpu`)
-  6. Windows DirectML (`torch_directml`)
+  4. Google Cloud TPU (`torch_xla`)
+  5. Huawei Ascend NPU (`torch_npu` / `torch.npu`)
+  6. Intel Gaudi HPU (`habana_frameworks.torch` / `torch.hpu`)
   7. Apple Metal MPS (`torch.backends.mps`)
   8. Host CPU (`cpu`)
 
@@ -24,7 +24,6 @@ from typing import Dict, Optional, Tuple, Type
 from .base import DeviceCapabilities, HardwareBackend
 from .cpu import CPUBackend
 from .cuda import CUDABackend
-from .dml import DirectMLBackend
 from .hpu import HPUBackend
 from .mps import MPSBackend
 from .npu import NPUBackend
@@ -49,7 +48,6 @@ BACKEND_REGISTRY: Dict[str, Type[HardwareBackend]] = {
     "tpu": TPUBackend,
     "npu": NPUBackend,
     "hpu": HPUBackend,
-    "dml": DirectMLBackend,
     "mps": MPSBackend,
     "cpu": CPUBackend,
 }
@@ -61,7 +59,6 @@ AUTO_PROBE_ORDER: Tuple[str, ...] = (
     "tpu",
     "npu",
     "hpu",
-    "dml",
     "mps",
     "cpu",
 )

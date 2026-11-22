@@ -4,9 +4,11 @@ Intel Gaudi HPU Hardware Backend (`habana_frameworks.torch` / `torch.hpu`).
 
 from __future__ import annotations
 
+import logging
 from typing import Dict
 import torch
 
+from ..diagnostics import report_exception
 from .base import (
     DeviceCapabilities,
     HardwareBackend,
@@ -44,8 +46,8 @@ class HPUBackend(HardwareBackend):
                 count = int(torch.hpu.device_count())
                 if count > 0:
                     return max(0, min(int(self.device_index), count - 1))
-        except Exception:
-            pass
+        except (RuntimeError, ValueError, TypeError) as exc:
+            report_exception("hpu.device_count", "torch.hpu.device_count() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.hpu")
         return 0
 
     def configure_environment(self) -> Dict[str, str]:
@@ -58,8 +60,8 @@ class HPUBackend(HardwareBackend):
             try:
                 self.device_index = self._valid_device_index()
                 torch.hpu.set_device(self.device_index)
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("hpu.set_device", "torch.hpu.set_device() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.hpu")
         return applied
 
     def get_device(self) -> torch.device:
@@ -79,8 +81,8 @@ class HPUBackend(HardwareBackend):
                     prop_mem = getattr(props, "total_memory", 0)
                     if prop_mem > 0:
                         total_mb = round(prop_mem / (1024**2), 1)
-            except Exception:
-                pass
+            except Exception as exc:
+                report_exception("hpu.device_properties", "torch.hpu.get_device_properties() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.hpu")
             if total_mb == 98304.0:
                 comfy_mem = query_comfy_device_memory_mb(self.get_device())
                 if comfy_mem is not None and comfy_mem[0] > 0:
@@ -103,15 +105,15 @@ class HPUBackend(HardwareBackend):
         if self.is_available():
             try:
                 torch.hpu.synchronize()
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("hpu.synchronize", "torch.hpu.synchronize() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.hpu")
 
     def empty_cache(self) -> None:
         if self.is_available() and hasattr(torch.hpu, "empty_cache"):
             try:
                 torch.hpu.empty_cache()
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("hpu.empty_cache", "torch.hpu.empty_cache() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.hpu")
 
     def get_memory_snapshot(self) -> MemorySnapshot:
         if not self.is_available():
@@ -128,7 +130,8 @@ class HPUBackend(HardwareBackend):
             max_alloc = torch.hpu.max_memory_allocated(idx) / (1024**2)
             free_mb = max(0.0, total_mb - max(alloc, res))
             return MemorySnapshot(round(alloc, 2), round(res, 2), round(max_alloc, 2), round(total_mb, 2), round(free_mb, 2))
-        except Exception:
+        except Exception as exc:
+            report_exception("hpu.memory_snapshot", "HPU memory snapshot query failed; using fallback", exc, level=logging.DEBUG, once=True, logger_name="backends.hpu")
             return MemorySnapshot(0.0, 0.0, 0.0, 98304.0, 98304.0)
 
     def manual_seed_all(self, seed: int) -> None:
@@ -136,6 +139,6 @@ class HPUBackend(HardwareBackend):
         if self.is_available() and hasattr(torch.hpu, "manual_seed_all"):
             try:
                 torch.hpu.manual_seed_all(seed)
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("hpu.manual_seed_all", "torch.hpu.manual_seed_all() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.hpu")
 

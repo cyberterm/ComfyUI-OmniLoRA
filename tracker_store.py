@@ -431,8 +431,8 @@ def _parse_cursors_param(raw: str) -> Dict[str, int]:
                     except (TypeError, ValueError):
                         pass
                 return cursors
-        except Exception:
-            pass
+        except (ValueError, TypeError) as exc:
+            logging.debug(f"[OmniLoRA] Could not parse JSON cursors parameter: {exc}")
     for pair in stripped.split(","):
         if ":" not in pair:
             continue
@@ -524,8 +524,8 @@ def register_omni_lora_routes(prompt_server: Optional[Any] = None) -> bool:
             data = await request.json()
             if isinstance(data, dict):
                 node_id = data.get("node_id")
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.debug(f"[OmniLoRA] Could not parse /omni_lora/checkpoint JSON payload: {exc}")
         TRACKER_STORE.request_checkpoint(node_id)
         return web.json_response(
             {"status": "queued", "message": "Checkpoint will be saved at the end of the current step."},
@@ -540,8 +540,8 @@ def register_omni_lora_routes(prompt_server: Optional[Any] = None) -> bool:
             if isinstance(data, dict):
                 run_id = data.get("run_id")
                 keep_active = bool(data.get("keep_active", False))
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.debug(f"[OmniLoRA] Could not parse /omni_lora/clear JSON payload: {exc}")
         if run_id:
             removed = 1 if TRACKER_STORE.delete_run(str(run_id)) else 0
         else:

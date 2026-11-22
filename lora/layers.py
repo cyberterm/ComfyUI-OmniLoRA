@@ -3,11 +3,12 @@ Pure-PyTorch Low-Rank Adaptation (LoRA) Layers & Dynamic Injector.
 
 Designed with zero vendor-specific custom C++/CUDA kernels so all LoRA forward
 and backward passes execute cleanly through native PyTorch ATen / OneDNN XMX BF16
-primitives on XPU, CUDA, ROCm, Ascend NPU, Gaudi HPU, DirectML, MPS, and CPU.
+primitives on XPU, CUDA, ROCm, Ascend NPU, Gaudi HPU, MPS, and CPU.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..diagnostics import report_exception
 
 _NUMERIC_SEGMENT_RE = re.compile(r"(?:^|\.)\d+(?=\.|$)")
 
@@ -192,10 +195,24 @@ def _sync_stream_device(device: torch.device) -> None:
         except TypeError:
             try:
                 dev_mod.synchronize()
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except (RuntimeError, AttributeError) as exc:
+                report_exception(
+                    "lora.sync_stream_device_fallback",
+                    "Device synchronize() failed for streamed weight buffer",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="lora",
+                )
+        except (RuntimeError, AttributeError) as exc:
+            report_exception(
+                "lora.sync_stream_device",
+                "Device synchronize(device) failed for streamed weight buffer",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="lora",
+            )
 
 
 def prepare_streamed_weight_buffer(
@@ -209,10 +226,8 @@ def prepare_streamed_weight_buffer(
     """
     if target_device.type == "cpu" or min_numel <= 0:
         return
-    if target_device.type in ("privateuseone", "dml") and compute_dtype == torch.bfloat16:
-        compute_dtype = torch.float16
     if compute_dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        compute_dtype = torch.float16 if target_device.type in ("privateuseone", "dml") else torch.bfloat16
+        compute_dtype = torch.bfloat16
     key = (str(target_device), compute_dtype)
     buf = _STREAM_WEIGHT_BUFFERS.get(key)
     if buf is None or buf.device != target_device or buf.numel() < min_numel or is_inference_tensor(buf):
@@ -259,8 +274,6 @@ def _materialize_streamed_weight(
     per-tensor or per-channel `weight_scale` dequantization in-place.
     Guarantees zero dynamic GPU weight allocations across forward/checkpoint/backward passes.
     """
-    if target_device.type in ("privateuseone", "dml") and compute_dtype == torch.bfloat16:
-        compute_dtype = torch.float16
     if (
         weight.device == target_device
         and weight.dtype == compute_dtype
@@ -301,7 +314,7 @@ def _materialize_streamed_weight(
             q_view.copy_(w_src, non_blocking=use_async_dma)
             view.copy_(q_view, non_blocking=use_async_dma)
         except RuntimeError:
-            # Fallback if the target backend cannot allocate `w_src.dtype` (e.g. FP8 on older DML)
+            # Fallback if the target backend cannot allocate `w_src.dtype` (e.g. FP8 on older drivers)
             view.copy_(w_src.to(dtype=compute_dtype), non_blocking=False)
     else:
         view.copy_(w_src, non_blocking=use_async_dma)
@@ -334,7 +347,7 @@ def _resolve_linear_compute_dtype(
     - Preserves `float32` when both `x` and `weight` are `float32` and autocast is disabled.
     """
     dev_type = x.device.type
-    default_dt = torch.float16 if dev_type in ("privateuseone", "dml") else torch.bfloat16
+    default_dt = torch.bfloat16
     w_dtype = getattr(weight, "dtype", None) if isinstance(weight, torch.Tensor) else None
     orig_dtype = getattr(weight, "_omni_orig_dtype", None)
 
@@ -351,10 +364,24 @@ def _resolve_linear_compute_dtype(
                 ac_dt = torch.get_autocast_gpu_dtype()
                 if ac_dt in (torch.bfloat16, torch.float16):
                     compute_dtype = ac_dt
-        except Exception:
-            pass
-    except Exception:
-        pass
+        except (RuntimeError, AttributeError) as exc:
+            report_exception(
+                "lora.linear_autocast_legacy_probe",
+                "Legacy autocast dtype probe failed in _resolve_linear_compute_dtype",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="lora",
+            )
+    except (RuntimeError, AttributeError) as exc:
+        report_exception(
+            "lora.linear_autocast_probe",
+            "Autocast dtype probe failed in _resolve_linear_compute_dtype",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="lora",
+        )
 
     if compute_dtype is None:
         if x.dtype in (torch.bfloat16, torch.float16):
@@ -370,8 +397,6 @@ def _resolve_linear_compute_dtype(
         else:
             compute_dtype = default_dt
 
-    if dev_type in ("privateuseone", "dml") and compute_dtype == torch.bfloat16:
-        compute_dtype = torch.float16
     return compute_dtype
 
 
@@ -399,8 +424,6 @@ class _StreamedLinearFn(torch.autograd.Function):
         compute_dtype = _resolve_linear_compute_dtype(x, weight, weight_scale=weight_scale)
         ctx.compute_dtype = compute_dtype
         x_in = x if x.dtype == compute_dtype else x.to(dtype=compute_dtype)
-        if x_in.device.type in ("privateuseone", "dml") and (not x_in.is_contiguous() or x_in.storage_offset() != 0):
-            x_in = x_in.clone()
         w_dev = _materialize_streamed_weight(weight, x.device, compute_dtype, weight_scale=weight_scale)
         b_dev: Optional[torch.Tensor] = None
         if isinstance(bias, torch.Tensor):
@@ -421,11 +444,7 @@ class _StreamedLinearFn(torch.autograd.Function):
         compute_dtype: torch.dtype = getattr(ctx, "compute_dtype", None) or _resolve_linear_compute_dtype(
             grad_output, weight, weight_scale=weight_scale
         )
-        if grad_output.device.type in ("privateuseone", "dml") and compute_dtype == torch.bfloat16:
-            compute_dtype = torch.float16
         g_out = grad_output if grad_output.dtype == compute_dtype else grad_output.to(dtype=compute_dtype)
-        if g_out.device.type in ("privateuseone", "dml") and (not g_out.is_contiguous() or g_out.storage_offset() != 0):
-            g_out = g_out.clone()
         w_dev = _materialize_streamed_weight(weight, g_out.device, compute_dtype, weight_scale=weight_scale)
         grad_x = torch.matmul(g_out, w_dev)
         target_grad_dtype = getattr(ctx, "x_dtype", grad_output.dtype)
@@ -583,8 +602,6 @@ class LoRALinear(nn.Module):
 
         if lora_dtype == torch.float64 or is_fp8_dtype(lora_dtype):
             lora_dtype = torch.bfloat16
-        if resolved_device.type in ("privateuseone", "dml") and lora_dtype == torch.bfloat16:
-            lora_dtype = torch.float16
 
         if self.is_conv:
             weight = getattr(base_layer, "weight", None)
@@ -671,7 +688,7 @@ class LoRALinear(nn.Module):
           `_QuantizedCallbackLinearFn` so block-quantized weights dequantize on the fly
           without holding dequantized copies in `SavedVariable`.
         - For bitsandbytes layers (`Linear4bit`, `Linear8bitLt`, `Params4bit`, `Int8Params`),
-          explicitly rejects non-CUDA execution (`xpu`, `dml`, `mps`, `npu`, `hpu`, `cpu`) and
+          explicitly rejects non-CUDA execution (`xpu`, `mps`, `npu`, `hpu`, `cpu`) and
           wraps CUDA execution so any missing/broken `libbitsandbytes` binary raises a clear,
           actionable error instead of crashing.
         - For standard/FP8/INT8 Linear layers with a 2D `weight` tensor, uses `_StreamedLinearFn`
@@ -778,17 +795,21 @@ class LoRALinear(nn.Module):
         if lora_in.dtype != target_dt:
             lora_in = lora_in.to(dtype=target_dt)
         dev_type = lora_in.device.type
-        if (torch.is_grad_enabled() and getattr(lora_in, "_base", None) is not None) or (
-            dev_type in ("privateuseone", "dml")
-            and (not lora_in.is_contiguous() or lora_in.storage_offset() != 0)
-        ):
+        if torch.is_grad_enabled() and getattr(lora_in, "_base", None) is not None:
             lora_in = lora_in.clone()
         if target_dt == torch.float32 and dev_type in ("cuda", "xpu", "cpu", "mps", "npu", "hpu"):
             try:
                 with torch.amp.autocast(device_type=dev_type, enabled=False):
                     return self.lora_B(self.lora_A(lora_in)) * self.scaling
-            except Exception:
-                pass
+            except (RuntimeError, TypeError, AttributeError) as exc:
+                report_exception(
+                    "lora.fp32_branch_autocast_disable",
+                    "Could not disable autocast for FP32 LoRA branch; running directly",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="lora",
+                )
         return self.lora_B(self.lora_A(lora_in)) * self.scaling
 
     def forward(self, x: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
@@ -1438,8 +1459,15 @@ def trace_single_block_dataflow(
         try:
             with torch.no_grad():
                 model(**sample_inputs)
-        except Exception:
-            pass
+        except Exception as exc:
+            report_exception(
+                "lora.role_trace_forward",
+                "Structural role trace forward pass exited early; using partial/static roles",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="lora",
+            )
         finally:
             for h in hooks:
                 h.remove()
@@ -1460,8 +1488,15 @@ def trace_single_block_dataflow(
 
     try:
         setattr(model, "_omni_traced_block_roles", dict(roles))
-    except Exception:
-        pass
+    except (AttributeError, TypeError) as exc:
+        report_exception(
+            "lora.role_trace_cache_attr",
+            "Could not cache traced block roles on model",
+            exc,
+            level=logging.DEBUG,
+            once=True,
+            logger_name="lora",
+        )
     return roles
 
 
@@ -1835,22 +1870,22 @@ class LoRAInjector:
         safetensors `mmap` backing, and uniform device placement for `LoraLoader` and `KSampler`.
         Also resets any model-level prefix KV caches (such as `QwenImage21Transformer2DModel.reset_prefix_cache`).
         """
-        # Wait for any in-flight GPU kernels on XPU/CUDA/DML before replacing or releasing GPU parameters
+        # Wait for any in-flight GPU kernels on XPU/CUDA/NPU/HPU before replacing or releasing GPU parameters
         for dev_attr in ("xpu", "cuda", "npu", "hpu"):
             dev_mod = getattr(torch, dev_attr, None)
             if dev_mod is not None and hasattr(dev_mod, "is_available") and hasattr(dev_mod, "synchronize"):
                 try:
                     if dev_mod.is_available():
                         dev_mod.synchronize()
-                except Exception:
-                    pass
-        try:
-            first_p = next(model.parameters(), None)
-            if first_p is not None and first_p.device.type in ("privateuseone", "dml"):
-                with torch.inference_mode(False), torch.no_grad():
-                    _ = torch.zeros(1, dtype=torch.float32, device=first_p.device).to(device="cpu")
-        except Exception:
-            pass
+                except (RuntimeError, AttributeError) as exc:
+                    report_exception(
+                        f"lora.uninject_sync.{dev_attr}",
+                        f"Device {dev_attr}.synchronize() failed during LoRA uninject",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="lora",
+                    )
 
         restored = 0
         target_dev: Optional[torch.device] = (
@@ -1865,8 +1900,15 @@ class LoRAInjector:
                         try:
                             child.lora_A.weight.grad = None
                             child.lora_B.weight.grad = None
-                        except Exception:
-                            pass
+                        except (AttributeError, RuntimeError) as exc:
+                            report_exception(
+                                "lora.uninject_clear_grad",
+                                "Could not clear LoRA adapter gradients during uninject",
+                                exc,
+                                level=logging.DEBUG,
+                                once=True,
+                                logger_name="lora",
+                            )
                         base = child.base_layer
                         while isinstance(base, LoRALinear):
                             base = base.base_layer
@@ -1889,8 +1931,15 @@ class LoRAInjector:
                 if hasattr(sub, "reset_prefix_cache") and callable(getattr(sub, "reset_prefix_cache")):
                     try:
                         sub.reset_prefix_cache()  # type: ignore[operator]
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        report_exception(
+                            "lora.uninject_reset_prefix_cache",
+                            f"reset_prefix_cache() failed on {type(sub).__name__} during uninject",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="lora",
+                        )
 
                 orig_map: Optional[Dict[str, Tuple[torch.Tensor, bool]]] = getattr(sub, "_omni_orig_params", None)
                 restored_param_names: set[str] = set()
@@ -1923,7 +1972,15 @@ class LoRAInjector:
                                 else:
                                     restored_t = orig_t.detach().to(device=dest_d)
                                     setattr(sub, pname, nn.Parameter(restored_t, requires_grad=bool(orig_req_grad)))
-                            except Exception:
+                            except Exception as exc:
+                                report_exception(
+                                    "lora.uninject_restore_param",
+                                    f"Could not move restored parameter '{pname}' to {dest_d}; keeping original device",
+                                    exc,
+                                    level=logging.WARNING,
+                                    once=True,
+                                    logger_name="lora",
+                                )
                                 if is_custom_quantized_tensor(orig_t):
                                     assign_module_parameter(sub, pname, orig_t)
                                 elif isinstance(orig_t, nn.Parameter):
@@ -1949,7 +2006,15 @@ class LoRAInjector:
                                         assign_module_parameter(sub, bname, move_custom_quantized_tensor(orig_b, dest_d))
                                     else:
                                         sub._buffers[bname] = orig_b.detach().to(device=dest_d)
-                                except Exception:
+                                except Exception as exc:
+                                    report_exception(
+                                        "lora.uninject_restore_buffer",
+                                        f"Could not move restored buffer '{bname}' to {dest_d}; keeping original device",
+                                        exc,
+                                        level=logging.WARNING,
+                                        once=True,
+                                        logger_name="lora",
+                                    )
                                     sub._buffers[bname] = orig_b
                     orig_buf_map.clear()
                     delattr(sub, "_omni_orig_buffers")
@@ -1964,7 +2029,15 @@ class LoRAInjector:
                             else:
                                 try:
                                     setattr(sub, s_attr, orig_s.detach().to(device=dest_d))
-                                except Exception:
+                                except Exception as exc:
+                                    report_exception(
+                                        "lora.uninject_restore_scale",
+                                        f"Could not move restored scale '{s_attr}' to {dest_d}; keeping original device",
+                                        exc,
+                                        level=logging.WARNING,
+                                        once=True,
+                                        logger_name="lora",
+                                    )
                                     setattr(sub, s_attr, orig_s)
                     orig_scale_map.clear()
                     delattr(sub, "_omni_orig_scales")
@@ -1996,19 +2069,41 @@ class LoRAInjector:
                 if hasattr(sub, "comfy_patched_weights"):
                     try:
                         delattr(sub, "comfy_patched_weights")
-                    except Exception:
+                    except (AttributeError, TypeError) as exc:
+                        report_exception(
+                            "lora.uninject_del_comfy_patched",
+                            "Could not delete comfy_patched_weights attribute; setting False",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="lora",
+                        )
                         setattr(sub, "comfy_patched_weights", False)
                 if hasattr(sub, "_v_signature"):
                     try:
                         setattr(sub, "_v_signature", None)
-                    except Exception:
-                        pass
+                    except (AttributeError, TypeError) as exc:
+                        report_exception(
+                            "lora.uninject_clear_v_signature",
+                            "Could not clear _v_signature cache on module",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="lora",
+                        )
                 comb = getattr(sub, "_combined_linear", None)
                 if comb is not None and hasattr(comb, "_v_weight"):
                     try:
                         setattr(comb, "_v_weight", None)
-                    except Exception:
-                        pass
+                    except (AttributeError, TypeError) as exc:
+                        report_exception(
+                            "lora.uninject_clear_v_weight",
+                            "Could not clear _combined_linear._v_weight cache on module",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="lora",
+                        )
 
                 for p in sub.parameters(recurse=False):
                     if p.grad is not None:
@@ -2047,8 +2142,15 @@ class LoRAInjector:
                                                 requires_grad=param.requires_grad,
                                             ),
                                         )
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    report_exception(
+                                        "lora.uninject_unify_param",
+                                        f"Could not unify parameter '{pname}' onto {unify_dev} after uninject",
+                                        exc,
+                                        level=logging.WARNING,
+                                        once=True,
+                                        logger_name="lora",
+                                    )
                         for bname, buf in list(sub.named_buffers(recurse=False)):
                             if isinstance(buf, torch.Tensor) and buf.device != unify_dev:
                                 try:
@@ -2060,15 +2162,29 @@ class LoRAInjector:
                                         )
                                     else:
                                         setattr(sub, bname, buf.detach().to(device=unify_dev))
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    report_exception(
+                                        "lora.uninject_unify_buffer",
+                                        f"Could not unify buffer '{bname}' onto {unify_dev} after uninject",
+                                        exc,
+                                        level=logging.WARNING,
+                                        once=True,
+                                        logger_name="lora",
+                                    )
                         for s_attr in ("scale_weight", "weight_scale"):
                             s_val = getattr(sub, s_attr, None)
                             if isinstance(s_val, torch.Tensor) and s_val.device != unify_dev:
                                 try:
                                     setattr(sub, s_attr, s_val.detach().to(device=unify_dev))
-                                except Exception:
-                                    pass
+                                except Exception as exc:
+                                    report_exception(
+                                        "lora.uninject_unify_scale",
+                                        f"Could not unify scale '{s_attr}' onto {unify_dev} after uninject",
+                                        exc,
+                                        level=logging.WARNING,
+                                        once=True,
+                                        logger_name="lora",
+                                    )
                 if hasattr(model, "_omni_initial_device"):
                     delattr(model, "_omni_initial_device")
 
@@ -2129,8 +2245,15 @@ class LoRAInjector:
                     if raw_map:
                         setattr(backbone, "_omni_native_lora_key_map", raw_map)
                         return raw_map
-        except Exception:
-            pass
+        except Exception as exc:
+            report_exception(
+                "lora.capture_comfy_key_map",
+                "Could not capture ComfyUI native LoRA key map; using offline fallback",
+                exc,
+                level=logging.DEBUG,
+                once=True,
+                logger_name="lora",
+            )
         return None
 
     @classmethod
@@ -2327,8 +2450,15 @@ class LoRAInjector:
             elif comp == "alpha" and inferred_alpha is None:
                 try:
                     inferred_alpha = float(tensor.detach().cpu().to(dtype=torch.float32).item())
-                except Exception:
-                    pass
+                except (ValueError, TypeError, RuntimeError) as exc:
+                    report_exception(
+                        "lora.inspect_alpha_tensor",
+                        "Could not read scalar alpha tensor from LoRA state dict",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="lora",
+                    )
 
         if inferred_rank is None:
             for rk_key in ("omni_lora.rank", "ss_network_dim", "lora_rank"):
@@ -2336,8 +2466,15 @@ class LoRAInjector:
                     try:
                         inferred_rank = max(1, int(float(meta[rk_key])))
                         break
-                    except Exception:
-                        pass
+                    except (ValueError, TypeError) as exc:
+                        report_exception(
+                            "lora.inspect_meta_rank",
+                            f"Could not parse LoRA rank metadata key '{rk_key}'",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="lora",
+                        )
         resolved_rank = inferred_rank if inferred_rank is not None and inferred_rank > 0 else 16
 
         meta_rslora = str(meta.get("omni_lora.use_rslora", "")).strip().lower() in ("true", "1", "yes")
@@ -2347,8 +2484,15 @@ class LoRAInjector:
                 try:
                     meta_alpha = float(meta[al_key])
                     break
-                except Exception:
-                    pass
+                except (ValueError, TypeError) as exc:
+                    report_exception(
+                        "lora.inspect_meta_alpha",
+                        f"Could not parse LoRA alpha metadata key '{al_key}'",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="lora",
+                    )
 
         if meta_alpha is not None and meta_alpha > 0:
             # If a checkpoint recorded the effective rsLoRA alpha (`nominal * sqrt(rank)`, e.g. 181.019 for rank=32)
@@ -2382,8 +2526,15 @@ class LoRAInjector:
                 try:
                     steps_trained = max(0, int(float(meta[st_key])))
                     break
-                except Exception:
-                    pass
+                except (ValueError, TypeError) as exc:
+                    report_exception(
+                        "lora.inspect_meta_steps",
+                        f"Could not parse LoRA steps metadata key '{st_key}'",
+                        exc,
+                        level=logging.DEBUG,
+                        once=True,
+                        logger_name="lora",
+                    )
 
         arch = meta.get("modelspec.architecture") or meta.get("omni_lora.architecture") or "auto"
         trigger_word = meta.get("omni_lora.trigger_word") or meta.get("ss_trigger_word") or ""
@@ -2603,8 +2754,15 @@ class LoRAInjector:
                                 if getattr(module, "use_rslora", False)
                                 else alpha_val
                             )
-                    except Exception:
-                        pass
+                    except (ValueError, TypeError, RuntimeError) as exc:
+                        report_exception(
+                            "lora.load_alpha_tensor",
+                            f"Could not apply alpha tensor for layer '{module_name}'",
+                            exc,
+                            level=logging.DEBUG,
+                            once=True,
+                            logger_name="lora",
+                        )
 
                 target_a.requires_grad_(True)
                 target_b.requires_grad_(True)

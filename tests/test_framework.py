@@ -60,7 +60,7 @@ ensure_comfy_importable()
 
 class TestOmniLoRAFramework(unittest.TestCase):
     def test_all_eight_backends_registered(self) -> None:
-        expected = {"xpu", "rocm", "cuda", "tpu", "npu", "hpu", "dml", "mps", "cpu"}
+        expected = {"xpu", "rocm", "cuda", "tpu", "npu", "hpu", "mps", "cpu"}
         self.assertEqual(set(BACKEND_REGISTRY.keys()), expected)
         for backend_id, backend_cls in BACKEND_REGISTRY.items():
             self.assertEqual(backend_cls.__module__, f"omni_lora.backends.{backend_id}")
@@ -108,10 +108,21 @@ class TestOmniLoRAFramework(unittest.TestCase):
         self.assertFalse(arc_plan.requires_grad_scaler)
         self.assertEqual(arc_plan.recommended_conditioning_mode, "precache_offload")
 
-        dml_plan = detect_and_configure(preferred_backend="dml", requested_dtype="auto", allow_fallback=False)
-        self.assertEqual(dml_plan.vram_state, VRAMState.NORMAL_VRAM)
-        self.assertEqual(dml_plan.resolved_dtype, "fp16")
-        self.assertTrue(dml_plan.requires_grad_scaler)
+        from omni_lora.backends import DeviceCapabilities, select_optimal_dtype
+
+        fp16_only_caps = DeviceCapabilities(
+            backend_name="FP16-Only GPU",
+            device_type="cuda",
+            device_name="Simulated Turing GPU",
+            device_index=0,
+            total_vram_mb=16384.0,
+            supports_bf16=False,
+            supports_fp16=True,
+            supports_tf32=False,
+        )
+        fp16_dt, fp16_needs_scaler = select_optimal_dtype(fp16_only_caps, "auto")
+        self.assertEqual(fp16_dt, "fp16")
+        self.assertTrue(fp16_needs_scaler)
 
         hpu_plan = detect_and_configure(preferred_backend="hpu", requested_dtype="auto", allow_fallback=False)
         self.assertEqual(hpu_plan.vram_state, VRAMState.HIGH_VRAM)
@@ -821,7 +832,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
         self.assertIsNotNone(lora_wrapped.lora_B.weight.grad)
 
         # 3. Verify external bitsandbytes (Linear4bit / Params4bit) models are cleanly rejected
-        # on unsupported backends (e.g., XPU, CPU, MPS, DirectML) instead of crashing.
+        # on unsupported backends (e.g., XPU, CPU, MPS) instead of crashing.
         from omni_lora.backends import is_bitsandbytes_module, is_bitsandbytes_tensor
 
         class Params4bit(nn.Parameter):
@@ -1449,7 +1460,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
         Verify:
         A. Configurable `lora_dtype`:
            - `"bf16"` default on BF16-capable backends, with automatic fallback to `"fp16"`
-             when `supports_bf16=False` (e.g., DirectML).
+             when `supports_bf16=False` (e.g., pre-Ampere FP16-only GPUs).
            - `"fp32"` keeps master `lora_A` / `lora_B` parameters in `torch.float32` even when
              the base model and compute autocast run in `torch.bfloat16`.
            - `"fp16"` stores `lora_A` / `lora_B` in `torch.float16` and activates `FP32GradScaler`.
@@ -1499,19 +1510,32 @@ class TestOmniLoRAFramework(unittest.TestCase):
         step_m = pipeline_fp32.train_step(1)
         self.assertGreater(step_m.loss, 0.0)
 
-        # Verify automatic fallback from default `lora_dtype="bf16"` to `torch.float16` on DML (`supports_bf16=False`)
-        dml_backend = resolve_backend("dml", dtype="auto", allow_fallback=False)
-        self.assertFalse(dml_backend.get_capabilities().supports_bf16)
-        pipeline_dml = LoRATrainingPipeline(
-            backend=dml_backend,
+        # Verify automatic fallback from default `lora_dtype="bf16"` to `torch.float16` when `supports_bf16=False`
+        from omni_lora.backends import DeviceCapabilities
+
+        fp16_only_backend = resolve_backend("cpu", dtype="fp16", allow_fallback=True)
+        fp16_only_caps = DeviceCapabilities(
+            backend_name="Simulated FP16 GPU",
+            device_type="cuda",
+            device_name="Simulated Turing GPU",
+            device_index=0,
+            total_vram_mb=16384.0,
+            supports_bf16=False,
+            supports_fp16=True,
+            supports_tf32=False,
+        )
+        fp16_only_backend.get_capabilities = lambda: fp16_only_caps  # type: ignore[method-assign]
+        self.assertFalse(fp16_only_backend.get_capabilities().supports_bf16)
+        pipeline_fp16_only = LoRATrainingPipeline(
+            backend=fp16_only_backend,
             model_adapter=adapter,
             config=TrainingConfig(
-                backend="dml",
+                backend="cpu",
                 dtype="fp16",
                 lora=LoRAConfig(rank=4, alpha=4.0, lora_dtype="bf16"),
             ),
         )
-        self.assertEqual(pipeline_dml._resolve_lora_torch_dtype(), torch.float16)
+        self.assertEqual(pipeline_fp16_only._resolve_lora_torch_dtype(), torch.float16)
 
         # C & D: Verify configurable `loss_type` ("l2" default, "huber", "l1") and `min_snr_gamma` (0.0 default vs >0.0)
         self.assertEqual(adapter.loss_type, "l2")
@@ -1814,13 +1838,13 @@ class TestOmniLoRAFramework(unittest.TestCase):
         finally:
             adapter._forward_backbone = orig_fwd  # type: ignore[method-assign]
 
-    def test_directml_privateuseone_storageless_tensor_and_fp16_master_optimizer(self) -> None:
+    def test_storageless_tensor_and_fp16_master_optimizer(self) -> None:
         """
-        Regression test for Windows DirectML (`dml` / `privateuseone`) and `fp16` backends:
+        Regression test for storageless custom tensors and `fp16` master-weight optimizers:
         1. Tensors whose `.data_ptr()` raises `RuntimeError: Cannot access data pointer of Tensor
-           that doesn't have storage` (as in `torch-directml` `privateuseone:0`) are safely handled
-           by `HardwareBackend._inspect_module_memory_profile` and `enforce_vram_budget`.
-        2. `safe_to_device` casts `bfloat16` tensors on CPU first when targeting `float16` or DirectML.
+           that doesn't have storage` are safely handled by `HardwareBackend._inspect_module_memory_profile`
+           and `enforce_vram_budget`.
+        2. `safe_to_device` casts `bfloat16` tensors on CPU first when targeting `float16`.
         3. `_build_fp32_safe_optimizer` uses `_fp32_master_step` for `float16` LoRA weights so `eps=1e-8`
            never underflows to `0.0` (`0.0 / 0.0 = NaN` on Step 1 when `lora_B=0`) across `radamw`, `adamw`, and `sgd`.
         """
@@ -1835,9 +1859,9 @@ class TestOmniLoRAFramework(unittest.TestCase):
                 raise RuntimeError("Cannot access data pointer of Tensor that doesn't have storage")
 
         raw_t = torch.randn(8, 8, dtype=torch.float16)
-        dml_like_t = StorageLessTensor(raw_t)
-        sid = _safe_tensor_storage_id(dml_like_t)
-        self.assertEqual(sid, id(dml_like_t))
+        storageless_t = StorageLessTensor(raw_t)
+        sid = _safe_tensor_storage_id(storageless_t)
+        self.assertEqual(sid, id(storageless_t))
 
         mod = nn.Linear(8, 8, bias=False)
         mod.weight = nn.Parameter(StorageLessTensor(torch.randn(8, 8, dtype=torch.float16)), requires_grad=False)
@@ -1851,21 +1875,6 @@ class TestOmniLoRAFramework(unittest.TestCase):
         bf16_cpu = torch.randn(4, 4, dtype=torch.bfloat16)
         fp16_out = safe_to_device(bf16_cpu, device=torch.device("cpu"), dtype=torch.float16)
         self.assertEqual(fp16_out.dtype, torch.float16)
-
-        # Verify DirectML FP64-free scalar operator guards (`1.0 - t`, `1.0 / t`, `t ** 2`, `addcmul_`)
-        dml_sim_t = torch.tensor([0.25, 0.5, 0.75], dtype=torch.float16)
-        setattr(dml_sim_t, "_omni_simulate_dml_no_fp64", True)
-        rsub_out = 1.0 - dml_sim_t
-        self.assertEqual(rsub_out.dtype, torch.float16)
-        self.assertTrue(torch.allclose(rsub_out, torch.tensor([0.75, 0.5, 0.25], dtype=torch.float16)))
-        rdiv_out = 1.0 / dml_sim_t
-        self.assertEqual(rdiv_out.dtype, torch.float16)
-        pow_out = dml_sim_t ** 2
-        self.assertEqual(pow_out.dtype, torch.float16)
-        acc_t = dml_sim_t.clone()
-        setattr(acc_t, "_omni_simulate_dml_no_fp64", True)
-        acc_t.addcmul_(dml_sim_t, torch.ones_like(dml_sim_t), value=0.5)
-        self.assertEqual(acc_t.dtype, torch.float16)
 
         # Verify RAdamW, AdamW, Adafactor, and SGD on float16 LoRA parameters never produce NaN on Step 1 when lora_B=0
         for opt_type in ("radamw", "adamw", "adafactor", "sgd"):
@@ -2109,7 +2118,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
         def _flaky_oom_loss(*args: Any, **kwargs: Any) -> torch.Tensor:
             if oom_triggered["count"] == 0:
                 oom_triggered["count"] += 1
-                raise RuntimeError("UR_RESULT_ERROR_OUT_OF_RESOURCES: simulated XPU/CUDA/DirectML OOM on first attempt")
+                raise RuntimeError("UR_RESULT_ERROR_OUT_OF_RESOURCES: simulated XPU/CUDA OOM on first attempt")
             return orig_compute_loss(*args, **kwargs)
 
         adapter.compute_training_loss = _flaky_oom_loss  # type: ignore[method-assign]
@@ -4301,7 +4310,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
         """
         Verify critical regression invariants:
         1. `omni_lora.nodes` exports `_strip_numeric_segments` and target filtering on fallback linear modules executes cleanly.
-        2. Calling `install_comfy_runtime_hooks()` after `LoRATrainingPipeline.setup()` never strips `_omni_dml_safe` wrappers.
+        2. Calling `install_comfy_runtime_hooks()` after `LoRATrainingPipeline.setup()` never strips `_omni_op_safe` wrappers.
         """
         import torch.nn.functional as F_mod
         from omni_lora import nodes as omni_nodes
@@ -4324,16 +4333,16 @@ class TestOmniLoRAFramework(unittest.TestCase):
         pipe = LoRATrainingPipeline(backend=plan.backend, model_adapter=adapter, config=cfg)
         pipe.setup(external_backbone=model)
         try:
-            self.assertTrue(getattr(F_mod.conv3d, "_omni_dml_safe", False))
-            self.assertTrue(getattr(F_mod.pixel_unshuffle, "_omni_dml_safe", False))
-            self.assertTrue(getattr(F_mod.pixel_shuffle, "_omni_dml_safe", False))
-            self.assertTrue(getattr(F_mod.rms_norm, "_omni_dml_safe", False))
+            self.assertTrue(getattr(F_mod.conv3d, "_omni_op_safe", False))
+            self.assertTrue(getattr(F_mod.conv2d, "_omni_op_safe", False))
+            self.assertTrue(getattr(F_mod.linear, "_omni_op_safe", False))
+            self.assertTrue(getattr(F_mod.rms_norm, "_omni_op_safe", False))
 
             install_comfy_runtime_hooks()
-            self.assertTrue(getattr(F_mod.conv3d, "_omni_dml_safe", False))
-            self.assertTrue(getattr(F_mod.pixel_unshuffle, "_omni_dml_safe", False))
-            self.assertTrue(getattr(F_mod.pixel_shuffle, "_omni_dml_safe", False))
-            self.assertTrue(getattr(F_mod.rms_norm, "_omni_dml_safe", False))
+            self.assertTrue(getattr(F_mod.conv3d, "_omni_op_safe", False))
+            self.assertTrue(getattr(F_mod.conv2d, "_omni_op_safe", False))
+            self.assertTrue(getattr(F_mod.linear, "_omni_op_safe", False))
+            self.assertTrue(getattr(F_mod.rms_norm, "_omni_op_safe", False))
         finally:
             if pipe.backbone is not None:
                 LoRAInjector.uninject(pipe.backbone)
@@ -5786,14 +5795,14 @@ class TestOmniLoRAFramework(unittest.TestCase):
             self.assertTrue(getattr(torch.cat, "_omni_out_kwarg_safe", False))
             self.assertTrue(getattr(torch.lerp, "_omni_out_kwarg_safe", False))
             self.assertTrue(getattr(F.scaled_dot_product_attention, "_omni_chunked_sdpa_safe", False))
-            self.assertTrue(getattr(F.linear, "_omni_dml_safe", False))
-            self.assertTrue(getattr(F.conv2d, "_omni_dml_safe", False))
-            self.assertTrue(getattr(F.layer_norm, "_omni_dml_safe", False))
+            self.assertTrue(getattr(F.linear, "_omni_op_safe", False))
+            self.assertTrue(getattr(F.conv2d, "_omni_op_safe", False))
+            self.assertTrue(getattr(F.layer_norm, "_omni_op_safe", False))
             with _inplace_safe_outer_autograd_context(gradient_checkpointing=False):
                 self.assertTrue(getattr(torch.cat, "_omni_out_kwarg_safe", False))
             # Outer scope still holds the lease -> wrappers remain active
             self.assertTrue(getattr(torch.cat, "_omni_out_kwarg_safe", False))
-            self.assertTrue(getattr(F.linear, "_omni_dml_safe", False))
+            self.assertTrue(getattr(F.linear, "_omni_op_safe", False))
 
         # Outermost scope exited -> exact pre-scope callables restored!
         self.assertIs(torch.cat, orig_cat)
@@ -5828,7 +5837,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
         )
         pipe.setup(external_backbone=tiny_mod)
         self.assertTrue(getattr(torch.cat, "_omni_out_kwarg_safe", False))
-        self.assertTrue(getattr(F.linear, "_omni_dml_safe", False))
+        self.assertTrue(getattr(F.linear, "_omni_op_safe", False))
         if pipe.backbone is not None:
             LoRAInjector.uninject(pipe.backbone)
         pipe.cleanup()
@@ -6060,27 +6069,38 @@ class TestOmniLoRAFramework(unittest.TestCase):
             else:
                 sys.modules.pop("comfy_kitchen", None)
 
-    def test_bug1_4_dml_safe_markers_idempotent_and_restored(self) -> None:
-        """Bug 1.4: F.pixel_unshuffle, F.pixel_shuffle, and F.conv3d carry _omni_dml_safe=True and scope cleanly."""
+    def test_bug1_4_runtime_and_training_op_markers_idempotent_and_restored(self) -> None:
+        """Bug 1.4: Runtime RMSNorm hooks are idempotent and scoped training op wrappers carry _omni_op_safe=True and restore cleanly."""
         from omni_lora.models import install_comfy_runtime_hooks
         from omni_lora.pipelines.lora_trainer import _scoped_training_op_wrappers
 
         install_comfy_runtime_hooks()
-        self.assertTrue(getattr(F.pixel_unshuffle, "_omni_dml_safe", False))
-        self.assertTrue(getattr(F.pixel_shuffle, "_omni_dml_safe", False))
-        self.assertTrue(getattr(F.conv3d, "_omni_dml_safe", False))
+        if hasattr(F, "rms_norm"):
+            self.assertTrue(getattr(F.rms_norm, "_omni_runtime_hook", False))
+            first_f_rms = F.rms_norm
+        else:
+            first_f_rms = None
+        if hasattr(torch, "rms_norm"):
+            self.assertTrue(getattr(torch.rms_norm, "_omni_runtime_hook", False))
+            first_t_rms = torch.rms_norm
+        else:
+            first_t_rms = None
 
-        first_unshuffle = F.pixel_unshuffle
-        first_shuffle = F.pixel_shuffle
-        first_conv3d = F.conv3d
         install_comfy_runtime_hooks()
-        self.assertIs(F.pixel_unshuffle, first_unshuffle)
-        self.assertIs(F.pixel_shuffle, first_shuffle)
-        self.assertIs(F.conv3d, first_conv3d)
+        if first_f_rms is not None:
+            self.assertIs(F.rms_norm, first_f_rms)
+        if first_t_rms is not None:
+            self.assertIs(torch.rms_norm, first_t_rms)
 
         with _scoped_training_op_wrappers():
-            self.assertTrue(getattr(F.conv3d, "_omni_train_dml_safe", False))
-        self.assertFalse(getattr(F.conv3d, "_omni_train_dml_safe", False))
+            self.assertTrue(getattr(F.conv3d, "_omni_op_safe", False))
+            self.assertTrue(getattr(F.linear, "_omni_op_safe", False))
+            if hasattr(F, "rms_norm"):
+                self.assertTrue(getattr(F.rms_norm, "_omni_op_safe", False))
+        self.assertFalse(getattr(F.conv3d, "_omni_op_safe", False))
+        self.assertFalse(getattr(F.linear, "_omni_op_safe", False))
+        if first_f_rms is not None:
+            self.assertIs(F.rms_norm, first_f_rms)
         install_comfy_runtime_hooks()
 
     def test_bug1_5_lora_linear_device_mismatch_raises(self) -> None:
@@ -7240,7 +7260,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
         self.assertTrue(torch.isfinite(p2d.float()).all())
         self.assertTrue(torch.isfinite(p1d.float()).all())
 
-        # _fp32_master_step for radamw (warmup=0 vs warmup=10), adam, sgd on fp16
+        # _fp32_master_step for radamw (warmup=0 and warmup=10 both run genuine RAdamW), adam, sgd on fp16
         for opt_name, w_steps in (("radamw", 0), ("radamw", 10), ("adam", 0), ("sgd", 0)):
             p_fp16 = nn.Parameter(torch.ones((3, 3), dtype=torch.float16))
             p_init = p_fp16.detach().clone()
@@ -7257,6 +7277,8 @@ class TestOmniLoRAFramework(unittest.TestCase):
                 ),
             )
             opt = pipe_opt._build_fp32_safe_optimizer([p_fp16])
+            if opt_name == "radamw":
+                self.assertIsInstance(opt, torch.optim.RAdam)
             for _ in range(6):
                 p_fp16.grad = torch.full_like(p_fp16, 0.25)
                 opt.step()
@@ -7270,6 +7292,303 @@ class TestOmniLoRAFramework(unittest.TestCase):
             self.assertEqual(p_fp16.dtype, torch.float16)
             self.assertTrue(torch.isfinite(p_fp16.float()).all())
             self.assertFalse(torch.equal(p_fp16, p_init))
+
+        # Numerical parity: radamw with warmup_steps > 0 must build genuine torch.optim.RAdam
+        # and _fp32_master_step must match torch.optim.RAdam(..., decoupled_weight_decay=True)
+        # across both unrectified (steps 1..5) and rectified (steps 6..10) phases.
+        p_ref = nn.Parameter(torch.linspace(-0.5, 0.5, 9, dtype=torch.float32).reshape(3, 3))
+        p_master = nn.Parameter(p_ref.detach().clone().to(dtype=torch.bfloat16))
+        p_fp32_built = nn.Parameter(p_ref.detach().clone())
+        pipe_radam_warmup = LoRATrainingPipeline(
+            backend=plan.backend,
+            model_adapter=dummy_adapter,
+            config=TrainingConfig(
+                backend="cpu",
+                dtype="fp32",
+                optimizer_type="radamw",
+                learning_rate=1e-2,
+                warmup_steps=50,
+                weight_decay=1e-2,
+            ),
+        )
+        opt_fp32_built = pipe_radam_warmup._build_fp32_safe_optimizer([p_fp32_built])
+        self.assertIsInstance(opt_fp32_built, torch.optim.RAdam)
+        opt_master = pipe_radam_warmup._build_fp32_safe_optimizer([p_master])
+        self.assertIsInstance(opt_master, torch.optim.RAdam)
+        try:
+            opt_ref = torch.optim.RAdam(
+                [p_ref], lr=1e-2, betas=(0.9, 0.99), weight_decay=1e-2, eps=1e-8, decoupled_weight_decay=True, foreach=False
+            )
+            has_decoupled_kw = True
+        except TypeError:
+            opt_ref = torch.optim.RAdam(
+                [p_ref], lr=1e-2, betas=(0.9, 0.99), weight_decay=1e-2, eps=1e-8, foreach=False
+            )
+            has_decoupled_kw = False
+        # Seed master_param with exact fp32 initial values so bf16 init rounding doesn't skew parity
+        for step_idx in range(1, 11):
+            g = torch.full((3, 3), 0.1 * step_idx, dtype=torch.float32)
+            p_ref.grad = g.clone()
+            p_fp32_built.grad = g.clone()
+            p_master.grad = g.to(dtype=torch.bfloat16)
+            opt_ref.step()
+            opt_fp32_built.step()
+            opt_master.step()
+            self.assertTrue(
+                torch.allclose(p_fp32_built.detach(), p_ref.detach(), atol=1e-6, rtol=1e-5),
+                f"FP32 radamw diverged from torch.optim.RAdam at step {step_idx}",
+            )
+            if has_decoupled_kw:
+                self.assertTrue(
+                    torch.allclose(opt_master.state[p_master]["master_param"], p_ref.detach(), atol=5e-3, rtol=5e-3),
+                    f"FP32-master radamw diverged from torch.optim.RAdam at step {step_idx}",
+                )
+
+    def test_diagnostics_and_repo_wide_silent_exception_guard(self) -> None:
+        """
+        Verify `omni_lora.diagnostics` deduplication (`log_once`), `OMNILORA_STRICT_ERRORS=1`
+        re-raise behavior (`report_exception`), and enforce via AST inspection that EVERY
+        production `.py` file in `omni_lora` (excluding `tests/`) contains zero bare `except:`
+        or silent `except Exception: pass` handlers.
+        """
+        import ast
+        import logging
+        import os
+        import unittest.mock
+        from pathlib import Path
+
+        from omni_lora.diagnostics import (
+            clear_log_once_cache,
+            log_once,
+            report_exception,
+            strict_errors_enabled,
+        )
+
+        clear_log_once_cache()
+        try:
+            with self.assertLogs("omni_lora.test_diag", level="DEBUG") as cm:
+                self.assertTrue(log_once("k1", logging.WARNING, "first", RuntimeError("boom"), logger_name="test_diag"))
+                self.assertFalse(log_once("k1", logging.WARNING, "dup", RuntimeError("boom2"), logger_name="test_diag"))
+                # Different exception type under same key logs once more
+                self.assertTrue(log_once("k1", logging.WARNING, "diff", ValueError("bad"), logger_name="test_diag"))
+            self.assertEqual(len(cm.output), 2)
+
+            with unittest.mock.patch.dict(os.environ, {"OMNILORA_STRICT_ERRORS": "0"}, clear=False):
+                self.assertFalse(strict_errors_enabled())
+                with self.assertLogs("omni_lora.test_diag", level="WARNING") as cm_non_strict:
+                    report_exception(
+                        "k2",
+                        "recoverable",
+                        RuntimeError("non-strict"),
+                        level=logging.WARNING,
+                        reraise_in_strict=True,
+                        logger_name="test_diag",
+                    )
+                self.assertEqual(len(cm_non_strict.output), 1)
+
+            with unittest.mock.patch.dict(os.environ, {"OMNILORA_STRICT_ERRORS": "1"}, clear=False):
+                self.assertTrue(strict_errors_enabled())
+                with self.assertRaises(RuntimeError):
+                    report_exception(
+                        "k3",
+                        "strict failure",
+                        RuntimeError("must-reraise"),
+                        level=logging.WARNING,
+                        reraise_in_strict=True,
+                        logger_name="test_diag",
+                    )
+        finally:
+            clear_log_once_cache()
+
+        # Repo-wide AST regression guard across every production .py file (excluding tests/)
+        repo_root = Path(__file__).resolve().parent.parent
+        guarded_files = sorted(
+            p
+            for p in repo_root.rglob("*.py")
+            if "__pycache__" not in p.parts and "tests" not in p.parts
+        )
+        self.assertGreaterEqual(len(guarded_files), 15)
+        violations: List[str] = []
+        for py_path in guarded_files:
+            tree = ast.parse(py_path.read_text(encoding="utf-8"), filename=str(py_path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ExceptHandler):
+                    continue
+                if node.type is None:
+                    violations.append(f"{py_path.name}:{node.lineno}: bare `except:`")
+                elif (
+                    isinstance(node.type, ast.Name)
+                    and node.type.id in ("Exception", "BaseException")
+                    and len(node.body) == 1
+                    and isinstance(node.body[0], ast.Pass)
+                ):
+                    violations.append(f"{py_path.name}:{node.lineno}: silent `except {node.type.id}: pass`")
+        self.assertEqual(violations, [], f"Silent exception handlers found: {violations}")
+
+    def test_optimizer_reference_equivalence_and_quantized_backward_parity(self) -> None:
+        """
+        Verify:
+        1. `PureFP32Adafactor` matches the exact Shazeer & Stern (2018) factored (2D) & unfactored (1D)
+           reference update equations (with RMS clipping and decoupled weight decay) over 5 steps.
+        2. `_fp32_master_step` for `adamw` and `sgd` (Nesterov) matches `torch.optim.AdamW` and
+           `torch.optim.SGD` step-for-step over 5 steps.
+        3. Quantized `LoRALinear` (`int8_qlora` and `fp8_e4m3fn` when supported) produces exact
+           forward outputs and backward gradients on `x`, `lora_A.weight`, and `lora_B.weight`
+           matching a dense dequantized reference `F.linear` layer.
+        """
+        from omni_lora.backends.base import quantize_weight_fp8_or_int8
+
+        plan = detect_and_configure(preferred_backend="cpu", requested_dtype="fp32", allow_fallback=True)
+        dummy_adapter = ComfyModelAdapter(model_id="flux_dev", comfy_model=nn.Linear(4, 4))
+
+        # 1. PureFP32Adafactor exact numerical equivalence (2D factored + 1D unfactored)
+        torch.manual_seed(123)
+        w2_init = torch.randn(4, 6, dtype=torch.float32) * 0.5
+        w1_init = torch.randn(6, dtype=torch.float32) * 0.5
+        p2 = nn.Parameter(w2_init.clone())
+        p1 = nn.Parameter(w1_init.clone())
+        lr_ada, wd_ada = 1e-2, 1e-2
+        pipe_ada = LoRATrainingPipeline(
+            backend=plan.backend,
+            model_adapter=dummy_adapter,
+            config=TrainingConfig(
+                backend="cpu",
+                dtype="fp32",
+                optimizer_type="adafactor",
+                learning_rate=lr_ada,
+                weight_decay=wd_ada,
+            ),
+        )
+        opt_ada = pipe_ada._build_fp32_safe_optimizer([p2, p1])
+
+        ref_w2 = w2_init.clone()
+        ref_w1 = w1_init.clone()
+        ref_r = torch.zeros(4, dtype=torch.float32)
+        ref_c = torch.zeros(6, dtype=torch.float32)
+        ref_v1 = torch.zeros(6, dtype=torch.float32)
+        eps1 = 1e-30
+        for step_t in range(1, 6):
+            g2 = torch.randn(4, 6, dtype=torch.float32) * 0.3
+            g1 = torch.randn(6, dtype=torch.float32) * 0.3
+            p2.grad = g2.clone()
+            p1.grad = g1.clone()
+            opt_ada.step()
+
+            rho_t = min(0.999, 1.0 - (float(step_t) ** -0.8))
+            g2_sq = g2 * g2 + eps1
+            ref_r = ref_r * rho_t + g2_sq.mean(dim=-1) * (1.0 - rho_t)
+            ref_c = ref_c * rho_t + g2_sq.mean(dim=-2) * (1.0 - rho_t)
+            r_mean = ref_r.mean(dim=-1, keepdim=True).clamp(min=eps1)
+            u2 = g2 * (torch.rsqrt((ref_r / r_mean).clamp(min=eps1)).unsqueeze(-1) * torch.rsqrt(ref_c.clamp(min=eps1)).unsqueeze(-2))
+            u2 = u2 / (torch.sqrt((u2 * u2).mean()) / 1.0).clamp(min=1.0)
+            ref_w2 = ref_w2 * (1.0 - lr_ada * wd_ada) - u2 * lr_ada
+
+            g1_sq = g1 * g1 + eps1
+            ref_v1 = ref_v1 * rho_t + g1_sq * (1.0 - rho_t)
+            u1 = g1 * torch.rsqrt(ref_v1.clamp(min=eps1))
+            u1 = u1 / (torch.sqrt((u1 * u1).mean()) / 1.0).clamp(min=1.0)
+            ref_w1 = ref_w1 * (1.0 - lr_ada * wd_ada) - u1 * lr_ada
+
+            self.assertTrue(
+                torch.allclose(p2.detach(), ref_w2, atol=1e-6, rtol=1e-5),
+                f"PureFP32Adafactor 2D factored update diverged at step {step_t}",
+            )
+            self.assertTrue(
+                torch.allclose(p1.detach(), ref_w1, atol=1e-6, rtol=1e-5),
+                f"PureFP32Adafactor 1D unfactored update diverged at step {step_t}",
+            )
+
+        # 2. _fp32_master_step parity against PyTorch reference AdamW and SGD (Nesterov)
+        for opt_kind in ("adamw", "sgd"):
+            w0 = torch.linspace(-0.5, 0.5, 12, dtype=torch.float32).reshape(3, 4)
+            p_ref = nn.Parameter(w0.clone())
+            p_m = nn.Parameter(w0.clone().to(dtype=torch.bfloat16))
+            pipe_m = LoRATrainingPipeline(
+                backend=plan.backend,
+                model_adapter=dummy_adapter,
+                config=TrainingConfig(
+                    backend="cpu",
+                    dtype="fp32",
+                    optimizer_type=opt_kind,
+                    learning_rate=1e-2,
+                    weight_decay=1e-2,
+                    warmup_steps=0,
+                ),
+            )
+            opt_m = pipe_m._build_fp32_safe_optimizer([p_m])
+            if opt_kind == "adamw":
+                opt_ref: torch.optim.Optimizer = torch.optim.AdamW(
+                    [p_ref], lr=1e-2, betas=(0.9, 0.99), weight_decay=1e-2, eps=1e-8, foreach=False
+                )
+            else:
+                opt_ref = torch.optim.SGD(
+                    [p_ref], lr=1e-2, momentum=0.9, weight_decay=1e-2, nesterov=True, foreach=False
+                )
+            for step_t in range(1, 6):
+                g = torch.full((3, 4), 0.05 * step_t, dtype=torch.float32)
+                p_ref.grad = g.clone()
+                p_m.grad = g.to(dtype=torch.bfloat16)
+                opt_ref.step()
+                opt_m.step()
+                self.assertTrue(
+                    torch.allclose(opt_m.state[p_m]["master_param"], p_ref.detach(), atol=5e-3, rtol=5e-3),
+                    f"FP32-master {opt_kind} diverged from torch.optim reference at step {step_t}",
+                )
+
+        # 3. Quantized LoRALinear forward + backward gradient parity (INT8 QLoRA and FP8 when available)
+        modes_to_test = ["int8_qlora"]
+        if hasattr(torch, "float8_e4m3fn"):
+            modes_to_test.append("fp8_e4m3fn")
+        for q_mode in modes_to_test:
+            torch.manual_seed(77)
+            base_lin = nn.Linear(8, 6, bias=True, dtype=torch.float32)
+            q_w, q_scale = quantize_weight_fp8_or_int8(
+                base_lin.weight.detach(),
+                mode=q_mode,
+                dest_device=torch.device("cpu"),
+                supports_fp8=True,
+            )
+            base_lin.weight = nn.Parameter(q_w, requires_grad=False)
+            base_lin.bias.requires_grad_(False)
+            base_lin.register_buffer("_omni_weight_scale", q_scale, persistent=False)
+
+            lora_layer = LoRALinear(base_lin, rank=4, alpha=8.0, lora_dtype=torch.float32)
+            with torch.no_grad():
+                lora_layer.lora_A.weight.normal_(0.0, 0.1)
+                lora_layer.lora_B.weight.normal_(0.0, 0.1)
+
+            # Build exact dense dequantized reference
+            w_deq = q_w.detach().to(dtype=torch.float32) * q_scale.detach().to(dtype=torch.float32)
+            ref_a = nn.Parameter(lora_layer.lora_A.weight.detach().clone())
+            ref_b = nn.Parameter(lora_layer.lora_B.weight.detach().clone())
+
+            x_q = torch.randn(2, 5, 8, dtype=torch.float32, requires_grad=True)
+            x_ref = x_q.detach().clone().requires_grad_(True)
+
+            y_q = lora_layer(x_q)
+            y_ref = F.linear(x_ref, w_deq, base_lin.bias.detach()) + F.linear(F.linear(x_ref, ref_a), ref_b) * lora_layer.scaling
+            self.assertTrue(
+                torch.allclose(y_q, y_ref, atol=1e-4, rtol=1e-3),
+                f"Quantized LoRALinear ({q_mode}) forward output diverged from dense dequantized reference",
+            )
+
+            y_q.pow(2).mean().backward()
+            y_ref.pow(2).mean().backward()
+            self.assertIsNotNone(x_q.grad)
+            self.assertIsNotNone(lora_layer.lora_A.weight.grad)
+            self.assertIsNotNone(lora_layer.lora_B.weight.grad)
+            self.assertTrue(
+                torch.allclose(x_q.grad, x_ref.grad, atol=1e-4, rtol=1e-3),
+                f"Quantized LoRALinear ({q_mode}) dx gradient diverged from dense reference",
+            )
+            self.assertTrue(
+                torch.allclose(lora_layer.lora_A.weight.grad, ref_a.grad, atol=1e-4, rtol=1e-3),
+                f"Quantized LoRALinear ({q_mode}) lora_A gradient diverged from dense reference",
+            )
+            self.assertTrue(
+                torch.allclose(lora_layer.lora_B.weight.grad, ref_b.grad, atol=1e-4, rtol=1e-3),
+                f"Quantized LoRALinear ({q_mode}) lora_B gradient diverged from dense reference",
+            )
 
     def test_backend_quantization_turing_fp16_and_dataset_edge_cases(self) -> None:
         """
@@ -7451,9 +7770,6 @@ class TestOmniLoRAFramework(unittest.TestCase):
 
         uninstall_comfy_runtime_hooks()
         orig_f_rms = getattr(F, "rms_norm", None)
-        orig_f_unshuffle = getattr(F, "pixel_unshuffle", None)
-        orig_f_shuffle = getattr(F, "pixel_shuffle", None)
-        orig_f_conv3d = getattr(F, "conv3d", None)
         orig_t_rms = getattr(torch, "rms_norm", None)
 
         def _stub_adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -7465,8 +7781,8 @@ class TestOmniLoRAFramework(unittest.TestCase):
         sys.modules["comfy_kitchen"] = fake_ck
         try:
             install_comfy_runtime_hooks()
-            if orig_f_unshuffle is not None:
-                self.assertTrue(getattr(F.pixel_unshuffle, "_omni_dml_safe", False))
+            if orig_f_rms is not None:
+                self.assertTrue(getattr(F.rms_norm, "_omni_runtime_hook", False))
             self.assertTrue(getattr(fake_ck.adaln, "_omni_train_safe", False))
             self.assertTrue(hasattr(fake_ck, "_omni_orig_adaln"))
 
@@ -7477,15 +7793,6 @@ class TestOmniLoRAFramework(unittest.TestCase):
             if orig_f_rms is not None:
                 self.assertIs(F.rms_norm, orig_f_rms)
                 self.assertFalse(hasattr(F, "_omni_orig_rms_norm"))
-            if orig_f_unshuffle is not None:
-                self.assertIs(F.pixel_unshuffle, orig_f_unshuffle)
-                self.assertFalse(hasattr(F, "_omni_orig_pixel_unshuffle"))
-            if orig_f_shuffle is not None:
-                self.assertIs(F.pixel_shuffle, orig_f_shuffle)
-                self.assertFalse(hasattr(F, "_omni_orig_pixel_shuffle"))
-            if orig_f_conv3d is not None:
-                self.assertIs(F.conv3d, orig_f_conv3d)
-                self.assertFalse(hasattr(F, "_omni_orig_conv3d"))
             if orig_t_rms is not None:
                 self.assertIs(torch.rms_norm, orig_t_rms)
                 self.assertFalse(hasattr(torch, "_omni_orig_rms_norm"))
@@ -7791,7 +8098,7 @@ def _format_cloud_verification_summary(
 def run_cloud_verification_suite(preferred_backend: str = "auto") -> int:
     """
     Unmocked Real-Forward Multi-Backend Verification Runner:
-    1. Detects and prints the active hardware accelerator (`xpu`, `cuda`, `rocm`, `dml`, `mps`, `npu`, `hpu`, `cpu`),
+    1. Detects and prints the active hardware accelerator (`xpu`, `cuda`, `rocm`, `tpu`, `mps`, `npu`, `hpu`, `cpu`),
        VRAM capacity, precision support (`bf16` / `fp16` / `fp32`), and recommended VRAM tier.
     2. Executes ALL 44 genuine, UNMOCKED ComfyUI Image & Video architectures in `RealForwardModelRegistry`
        directly on the active hardware backend in its native precision (`bf16` / `fp16` / `fp32`) —
@@ -7927,7 +8234,7 @@ if __name__ == "__main__":
     import sys
 
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--backend", type=str, default=None, help="Run unmocked real-forward table on specified backend (auto, xpu, cuda, rocm, dml, mps, cpu)")
+    parser.add_argument("--backend", type=str, default=None, help="Run unmocked real-forward table on specified backend (auto, xpu, cuda, rocm, tpu, mps, cpu)")
     parser.add_argument("--cloud-verify", action="store_true", help="Run formatted 44-model unmocked real-forward table before unit tests")
     known_args, remaining_argv = parser.parse_known_args()
 

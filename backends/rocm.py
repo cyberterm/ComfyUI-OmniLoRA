@@ -4,10 +4,12 @@ AMD ROCm HIP Hardware Backend (`torch.cuda` + `torch.version.hip`).
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Dict
 import torch
 
+from ..diagnostics import report_exception
 from .base import DeviceCapabilities
 from .cuda import CUDABackend
 
@@ -34,8 +36,8 @@ class ROCmBackend(CUDABackend):
             try:
                 self.device_index = self._valid_device_index()
                 torch.cuda.set_device(self.device_index)
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("rocm.set_device", "ROCm torch.cuda.set_device() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.rocm")
         return applied
 
     def get_capabilities(self) -> DeviceCapabilities:

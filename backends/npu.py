@@ -4,9 +4,11 @@ Huawei Ascend NPU Hardware Backend (`torch_npu` / `torch.npu`).
 
 from __future__ import annotations
 
+import logging
 from typing import Dict
 import torch
 
+from ..diagnostics import report_exception
 from .base import (
     DeviceCapabilities,
     HardwareBackend,
@@ -43,8 +45,8 @@ class NPUBackend(HardwareBackend):
             count = int(torch.npu.device_count())
             if count > 0:
                 return max(0, min(int(self.device_index), count - 1))
-        except Exception:
-            pass
+        except (RuntimeError, ValueError, TypeError) as exc:
+            report_exception("npu.device_count", "torch.npu.device_count() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.npu")
         return 0
 
     def configure_environment(self) -> Dict[str, str]:
@@ -57,8 +59,8 @@ class NPUBackend(HardwareBackend):
             try:
                 self.device_index = self._valid_device_index()
                 torch.npu.set_device(self.device_index)
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("npu.set_device", "torch.npu.set_device() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.npu")
         return applied
 
     def get_device(self) -> torch.device:
@@ -109,16 +111,16 @@ class NPUBackend(HardwareBackend):
         if self.is_available():
             try:
                 torch.npu.synchronize(self._valid_device_index())
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("npu.synchronize", "torch.npu.synchronize() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.npu")
 
     def empty_cache(self) -> None:
         if self.is_available():
             try:
                 torch.npu.synchronize(self._valid_device_index())
                 torch.npu.empty_cache()
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("npu.empty_cache", "torch.npu.empty_cache() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.npu")
 
     def get_memory_snapshot(self) -> MemorySnapshot:
         if not self.is_available():
@@ -137,10 +139,11 @@ class NPUBackend(HardwareBackend):
                     if total_bytes > 0:
                         total = total_bytes / (1024**2)
                         free_mb = min(total, (free_bytes / (1024**2)) + max(0.0, res - alloc))
-                except Exception:
-                    pass
+                except RuntimeError as exc:
+                    report_exception("npu.mem_get_info", "torch.npu.mem_get_info() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.npu")
             return MemorySnapshot(round(alloc, 2), round(res, 2), round(max_alloc, 2), round(total, 2), round(free_mb, 2))
-        except Exception:
+        except Exception as exc:
+            report_exception("npu.memory_snapshot", "NPU memory snapshot query failed; using fallback", exc, level=logging.DEBUG, once=True, logger_name="backends.npu")
             return MemorySnapshot(0.0, 0.0, 0.0, 32768.0, 32768.0)
 
     def manual_seed_all(self, seed: int) -> None:
@@ -148,6 +151,6 @@ class NPUBackend(HardwareBackend):
         if self.is_available():
             try:
                 torch.npu.manual_seed_all(seed)
-            except Exception:
-                pass
+            except RuntimeError as exc:
+                report_exception("npu.manual_seed_all", "torch.npu.manual_seed_all() failed", exc, level=logging.DEBUG, once=True, logger_name="backends.npu")
 

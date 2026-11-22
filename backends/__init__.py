@@ -19,7 +19,6 @@ from .base import (
 )
 from .cpu import CPUBackend
 from .cuda import CUDABackend
-from .dml import DirectMLBackend
 from .hpu import HPUBackend
 from .model_management import (
     AUTO_PROBE_ORDER,
@@ -60,7 +59,6 @@ __all__ = [
     "TPUBackend",
     "NPUBackend",
     "HPUBackend",
-    "DirectMLBackend",
     "MPSBackend",
     "CPUBackend",
     "BACKEND_REGISTRY",
