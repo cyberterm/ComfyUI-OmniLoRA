@@ -219,12 +219,14 @@ The unmocked real-forward verification suite (`python -m omni_lora.tests.test_fr
 | :--- | :--- | :--- | :--- |
 | **`cuda`** | NVIDIA GeForce / RTX / Data Center GPUs | Actively tested on hardware | FlashAttention-2 / Cutlass Memory-Efficient SDPA, Tensor Core `bf16`/`tf32`, `expandable_segments:True` allocator, pinned-memory async PCIe layer streaming, plus `bitsandbytes` & GGUF support. |
 | **`xpu`** | Intel Arc (A770 16GB, B580 Battlemage) & Data Center Max | Actively tested on hardware | First-class `torch.xpu` backend with OneAPI Level Zero flags, XMX `bf16` runtime verification, 100% FP64-free execution, and proactive 64 MB query-chunked SDPA to stay below Level Zero's 4.00 GiB single-allocation limit. |
-| **`rocm`** | AMD Radeon RX 7000/9000 & Instinct MI200/MI300 (`HIP`) | Implemented & unit-tested *(community reports welcome)* | ROCm HIP detection (`torch.version.hip`), AOTriton / FlashAttention SDPA, Matrix Core `bf16`/`fp16`, and tuning flags. |
-| **`mps`** | Apple Silicon (M1 / M2 / M3 / M4 Pro, Max, Ultra) | Implemented & unit-tested *(community reports welcome)* | Metal Performance Shaders (`torch.backends.mps`) unified memory budget detection, `bf16`/`fp16` autocast, and chunked attention. |
-| **`tpu`** | Google Cloud TPU (`torch_xla`) | Implemented & unit-tested *(community reports welcome)* | XLA device resolution, native Matrix Multiply Unit `bf16`, and per-step `xm.mark_step()` graph execution. |
-| **`npu`** | Huawei Ascend 910A / 910B (`torch_npu` / CANN) | Implemented & unit-tested *(community reports welcome)* | DaVinci Cube `bf16` execution and CANN memory management. |
-| **`hpu`** | Intel Gaudi 2 / Gaudi 3 (`habana_frameworks.torch`) | Implemented & unit-tested *(community reports welcome)* | SynapseAI HPU eager/lazy mode `htcore.mark_step()` and `bf16` execution. |
+| **`rocm`** | AMD Radeon RX 7000/9000 & Instinct MI200/MI300 (`HIP`) | Implemented & unit-tested *([community reports welcome](https://github.com/cyberterm/ComfyUI-OmniLoRA/discussions/categories/benchmarks))* | ROCm HIP detection (`torch.version.hip`), AOTriton / FlashAttention SDPA, Matrix Core `bf16`/`fp16`, and tuning flags. |
+| **`mps`** | Apple Silicon (M1 / M2 / M3 / M4 Pro, Max, Ultra) | Implemented & unit-tested *([community reports welcome](https://github.com/cyberterm/ComfyUI-OmniLoRA/discussions/categories/benchmarks))* | Metal Performance Shaders (`torch.backends.mps`) unified memory budget detection, `bf16`/`fp16` autocast, and chunked attention. |
+| **`tpu`** | Google Cloud TPU (`torch_xla`) | Implemented & unit-tested *([community reports welcome](https://github.com/cyberterm/ComfyUI-OmniLoRA/discussions/categories/benchmarks))* | XLA device resolution, native Matrix Multiply Unit `bf16`, and per-step `xm.mark_step()` graph execution. |
+| **`npu`** | Huawei Ascend 910A / 910B (`torch_npu` / CANN) | Implemented & unit-tested *([community reports welcome](https://github.com/cyberterm/ComfyUI-OmniLoRA/discussions/categories/benchmarks))* | DaVinci Cube `bf16` execution and CANN memory management. |
+| **`hpu`** | Intel Gaudi 2 / Gaudi 3 (`habana_frameworks.torch`) | Implemented & unit-tested *([community reports welcome](https://github.com/cyberterm/ComfyUI-OmniLoRA/discussions/categories/benchmarks))* | SynapseAI HPU eager/lazy mode `htcore.mark_step()` and `bf16` execution. |
 | **`cpu`** | Host CPU (x86_64 AVX-512 / ARM64) | Actively tested (CI) | OneDNN `bf16`/`fp32` execution and offline workflow verification. |
+
+> **Have a benchmark, hardware report, or training recipe to share?** Post your `training_summary`, GPU/model stats, or sample outputs in [GitHub Discussions → Benchmarks](https://github.com/cyberterm/ComfyUI-OmniLoRA/discussions/categories/benchmarks) (or ask questions in [Discussions](https://github.com/cyberterm/ComfyUI-OmniLoRA/discussions)).
 
 ---
 
@@ -260,14 +262,18 @@ Instead of relying on static percentage heuristics, `enforce_vram_budget` inspec
   Yes. Comfy Kitchen INT8/SOL attention (`comfy_kitchen.int8_attention` / `sol_attn`), SageAttention (`sageattn`), and `comfy_kitchen` fused RoPE/AdaLN kernels are inference-only C++/Triton kernels without PyTorch autograd backward formulas. OmniLoRA automatically intercepts `transformer_options["optimized_attention_override"]`, `comfy.ldm.modules.attention`, pre-loaded `ComfyAttention` checkpoints, and `comfy_kitchen` / `comfy.quant_ops.ck` calls during training to route through differentiable PyTorch SDPA (`F.scaled_dot_product_attention`), and restores your inference attention backend as soon as training finishes.
 - **Can I use `.avif` or `.heic` images?**
   Yes. Pillow $\ge 11.2$, `imageio`, `opencv-python` (`cv2`), and `ffmpeg` are all checked automatically. If your Python environment has an older Pillow without AVIF support, run `pip install pillow-avif-plugin` or `pip install --upgrade Pillow>=11.2.0`.
+- **Hit a bug, OOM, or unsupported checkpoint?**
+  Please open a [GitHub Issue](https://github.com/cyberterm/ComfyUI-OmniLoRA/issues) — including your GPU/backend, model & weight format (BF16/FP8/GGUF) and console traceback. This makes issues much faster to reproduce and fix. For general questions or sharing runs, use [GitHub Discussions](https://github.com/cyberterm/ComfyUI-OmniLoRA/discussions).
 
 ---
 
 ## Running the Unmocked Real-Forward Test & Verification Suite
 
-You can run the full unit, autograd-fidelity, AST silent-exception guard, and 44-architecture unmocked ComfyUI verification suite from the repository root without starting the ComfyUI server:
+You can run the full unit, autograd-fidelity, AST silent-exception guard, and 44-architecture unmocked ComfyUI verification suite from your `ComfyUI/custom_nodes` directory (the parent folder containing `omni_lora/`) without starting the ComfyUI server:
 
 ```bash
+cd ComfyUI/custom_nodes
+
 # Run all unit tests + 7-invariant unmocked real-forward contract suites (44 architectures)
 python -m omni_lora.tests.test_framework
 
