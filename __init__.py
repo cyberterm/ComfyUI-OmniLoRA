@@ -27,6 +27,7 @@ if "_PKG_DIR" in globals():
     if globals().get("__spec__") is not None and getattr(__spec__, "submodule_search_locations", None) is None:
         __spec__.submodule_search_locations = list(__path__)
 
+from .backends.tpu import install_comfy_tpu_hooks
 from .models import install_comfy_runtime_hooks
 from .nodes import (
     OmniLoRADatasetLoader,
@@ -57,15 +58,16 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "OmniLoRALossTracker": "OmniLoRA Loss Tracker",
 }
 
-# Register non-intrusive ComfyUI LoraLoader cleanup hook
+# Register non-intrusive ComfyUI LoraLoader cleanup hook and native Cloud TPU runtime hook
 install_comfy_runtime_hooks()
+install_comfy_tpu_hooks()
 
 # Register /omni_lora/metrics HTTP catch-up route on PromptServer (for idle/sleep recovery)
 register_omni_lora_routes()
 
 WEB_DIRECTORY = "./web"
 
-__version__ = "1.1.4"
+__version__ = "1.2.0"
 
 __all__ = [
     "NODE_CLASS_MAPPINGS",

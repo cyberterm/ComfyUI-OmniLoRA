@@ -84,6 +84,11 @@ class EmulatedComfyEnvironment:
         self.interrupt_after_calls: Optional[int] = None
         self._orig_load_lora: Optional[Callable[..., Any]] = None
         self._orig_throw_interrupt: Optional[Callable[..., Any]] = None
+        self._orig_get_free_memory: Optional[Callable[..., Any]] = None
+        self._orig_get_total_memory: Optional[Callable[..., Any]] = None
+        self._orig_get_autocast_device: Optional[Callable[..., Any]] = None
+        self._orig_optimized_attention: Optional[Callable[..., Any]] = None
+        self._orig_optimized_attention_masked: Optional[Callable[..., Any]] = None
 
     def __enter__(self) -> "EmulatedComfyEnvironment":
         if self.lora_output_dir is None:
@@ -165,6 +170,54 @@ class EmulatedComfyEnvironment:
             orig_throw()
 
         comfy.model_management.throw_exception_if_processing_interrupted = _checked_interrupt
+
+        # Guard ComfyUI memory/autocast queries on Cloud TPU (`tpu` / `xla`), where upstream
+        # `comfy.model_management.get_free_memory` reads `stats['active_bytes.all.current']`
+        # which is absent in `torch-tpu` (`memory_stats() -> {}`).
+        if self.torch_device.type in ("tpu", "xla"):
+            self._orig_get_free_memory = getattr(comfy.model_management, "get_free_memory", None)
+            self._orig_get_total_memory = getattr(comfy.model_management, "get_total_memory", None)
+            self._orig_get_autocast_device = getattr(comfy.model_management, "get_autocast_device", None)
+            orig_free = self._orig_get_free_memory
+            orig_total = self._orig_get_total_memory
+            sim_bytes = int(max(1024.0, float(self.simulated_vram_mb)) * 1024 * 1024)
+            tpu_type = self.torch_device.type
+
+            def _tpu_safe_free_mem(dev: Any = None, torch_free_too: bool = False) -> Any:
+                if dev is not None and getattr(dev, "type", str(dev)) in ("tpu", "xla"):
+                    free_b = int(sim_bytes * 0.85)
+                    return (free_b, free_b) if torch_free_too else free_b
+                if callable(orig_free):
+                    return orig_free(dev, torch_free_too)
+                return (sim_bytes, sim_bytes) if torch_free_too else sim_bytes
+
+            def _tpu_safe_total_mem(dev: Any = None, torch_total_too: bool = False) -> Any:
+                if dev is not None and getattr(dev, "type", str(dev)) in ("tpu", "xla"):
+                    return (sim_bytes, sim_bytes) if torch_total_too else sim_bytes
+                if callable(orig_total):
+                    return orig_total(dev, torch_total_too=torch_total_too)
+                return (sim_bytes, sim_bytes) if torch_total_too else sim_bytes
+
+            def _tpu_safe_autocast_dev(dev: Any) -> str:
+                return "cpu" if getattr(dev, "type", str(dev)) == "cpu" else tpu_type
+
+            comfy.model_management.get_free_memory = _tpu_safe_free_mem
+            comfy.model_management.get_total_memory = _tpu_safe_total_mem
+            comfy.model_management.get_autocast_device = _tpu_safe_autocast_dev
+
+            # Prefer native PyTorch SDPA (`attention_pytorch`) over CPU-fallback `attention_sub_quad`
+            # on Cloud TPU so attention executes via fused TPU SDPA with FP32 softmax accumulation.
+            try:
+                import comfy.ldm.modules.attention as _c_attn  # type: ignore
+
+                attn_pt = getattr(_c_attn, "attention_pytorch", None)
+                if callable(attn_pt):
+                    self._orig_optimized_attention = getattr(_c_attn, "optimized_attention", None)
+                    self._orig_optimized_attention_masked = getattr(_c_attn, "optimized_attention_masked", None)
+                    _c_attn.optimized_attention = attn_pt
+                    _c_attn.optimized_attention_masked = attn_pt
+            except Exception:
+                pass
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
@@ -172,6 +225,21 @@ class EmulatedComfyEnvironment:
             comfy.lora.load_lora = self._orig_load_lora
         if self._orig_throw_interrupt is not None:
             comfy.model_management.throw_exception_if_processing_interrupted = self._orig_throw_interrupt
+        if self._orig_get_free_memory is not None:
+            comfy.model_management.get_free_memory = self._orig_get_free_memory
+        if self._orig_get_total_memory is not None:
+            comfy.model_management.get_total_memory = self._orig_get_total_memory
+        if self._orig_get_autocast_device is not None:
+            comfy.model_management.get_autocast_device = self._orig_get_autocast_device
+        if self._orig_optimized_attention is not None:
+            try:
+                import comfy.ldm.modules.attention as _c_attn  # type: ignore
+
+                _c_attn.optimized_attention = self._orig_optimized_attention
+                if self._orig_optimized_attention_masked is not None:
+                    _c_attn.optimized_attention_masked = self._orig_optimized_attention_masked
+            except Exception:
+                pass
         if self._tmp_dir is not None:
             try:
                 self._tmp_dir.cleanup()

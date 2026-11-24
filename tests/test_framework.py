@@ -67,7 +67,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
         # Verify "xla" alias resolves to TPUBackend
         xla_backend = resolve_backend(preferred="xla", allow_fallback=False)
         self.assertEqual(xla_backend.backend_id, "tpu")
-        self.assertEqual(xla_backend.device_type, "xla")
+        self.assertIn(xla_backend.device_type, ("tpu", "xla"))
 
     def test_universal_comfy_model_adapter_and_dynamic_specs(self) -> None:
         backend = resolve_backend(preferred="cpu", dtype="bf16", allow_fallback=True)
@@ -130,13 +130,13 @@ class TestOmniLoRAFramework(unittest.TestCase):
 
         tpu_plan = detect_and_configure(preferred_backend="tpu", requested_dtype="auto", allow_fallback=False)
         self.assertEqual(tpu_plan.backend.backend_id, "tpu")
-        self.assertEqual(tpu_plan.capabilities.device_type, "xla")
-        self.assertEqual(tpu_plan.capabilities.total_vram_mb, 16384.0)
-        self.assertEqual(tpu_plan.vram_state, VRAMState.NORMAL_VRAM)
+        self.assertIn(tpu_plan.capabilities.device_type, ("tpu", "xla"))
+        self.assertGreaterEqual(tpu_plan.capabilities.total_vram_mb, 16384.0)
+        self.assertIn(tpu_plan.vram_state, (VRAMState.NORMAL_VRAM, VRAMState.HIGH_VRAM))
         self.assertEqual(tpu_plan.resolved_dtype, "bf16")
         self.assertFalse(tpu_plan.requires_grad_scaler)
         tpu_snap = tpu_plan.backend.get_memory_snapshot()
-        self.assertEqual(tpu_snap.total_vram_mb, 16384.0)
+        self.assertGreaterEqual(tpu_snap.total_vram_mb, 16384.0)
         tpu_plan.backend.manual_seed_all(42)
 
         low_plan = detect_and_configure(
@@ -547,6 +547,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
             "omni_lora_dual_network_workflow.json",
             "omni_lora_image_edit_workflow.json",
             "omni_lora_masked_in_graph_workflow.json",
+            "omni_lora_precache_only_workflow.json",
             "omni_lora_resume_checkpoint_workflow.json",
             "omni_lora_staged_eval_workflow.json",
         )
@@ -555,8 +556,7 @@ class TestOmniLoRAFramework(unittest.TestCase):
         self.assertEqual(actual_sorted[0], "omni_lora_basic_workflow.json")
         pre_in_types = OmniLoRAPrecomputeConditioning.INPUT_TYPES()
         self.assertNotIn("model", pre_in_types.get("required", {}))
-        self.assertNotIn("model", pre_in_types.get("optional", {}))
-        for opt_k in ("pass_control_to_clip", "clip_vision_resolution", "clip_prompt_template"):
+        for opt_k in ("vae", "clip", "model", "pass_control_to_clip", "clip_vision_resolution", "clip_prompt_template", "disk_cache"):
             self.assertIn(opt_k, pre_in_types.get("optional", {}))
 
         # Verify every INT and FLOAT widget across all nodes has (default - min) and (max - min) aligned to `step`
@@ -601,11 +601,8 @@ class TestOmniLoRAFramework(unittest.TestCase):
 
                     if ntype == "OmniLoRAPrecomputeConditioning":
                         input_names = [inp["name"] for inp in node.get("inputs", [])]
-                        self.assertNotIn("model", input_names, f"OmniLoRAPrecomputeConditioning should not have a 'model' plug in {wf_name}")
-                        if wf_name == "omni_lora_image_edit_workflow.json":
-                            self.assertEqual(len(node["widgets_values"]), 4, f"Expected 4 widgets on OmniLoRAPrecomputeConditioning in {wf_name}")
-                        else:
-                            self.assertIn(len(node["widgets_values"]), (1, 4), f"Unexpected widget count on OmniLoRAPrecomputeConditioning in {wf_name}")
+                        self.assertIn("model", input_names, f"OmniLoRAPrecomputeConditioning should expose optional 'model' plug in {wf_name}")
+                        self.assertEqual(len(node["widgets_values"]), 5, f"Expected 5 widgets on OmniLoRAPrecomputeConditioning in {wf_name}")
 
                     if ntype == "OmniLoRATrainer":
                         self.assertEqual(node["inputs"][0]["name"], "model")
@@ -7808,6 +7805,186 @@ class TestOmniLoRAFramework(unittest.TestCase):
                 sys.modules.pop("comfy_kitchen", None)
             else:
                 sys.modules["comfy_kitchen"] = prev_ck
+
+    def test_precompute_portable_disk_cache_save_reload_and_invalidation(self) -> None:
+        """
+        Verify portable `.safetensors` disk caching inside `<dataset_path>/.omni_lora_cache/`:
+        1. `disk_cache="auto (load or save)"` saves unique batches into `.omni_lora_cache/*.safetensors`.
+        2. A subsequent run reloads directly from disk even with `vae=None, clip=None` (zero encoder calls)
+           and expands `num_repeats` in RAM.
+        3. Moving/copying the dataset folder to a new path (simulating Windows -> Colab Linux) still hits
+           the cache because fingerprinting uses relative names + byte sizes + captions (not paths/mtimes).
+        4. Changing a caption or connecting a model with mismatched `(latent_channels, context_dim)`
+           invalidates/skips the stale cache cleanly.
+        """
+        import os
+        import shutil
+        from PIL import Image
+        from omni_lora.conditioning_cache import (
+            CACHE_DIR_NAME,
+            compute_dataset_fingerprint,
+            find_and_load_conditioning_cache,
+            resolve_dataset_cache_dir,
+            resolve_encoder_signature,
+        )
+
+        class _StubVAE:
+            def __init__(self, channels: int = 16) -> None:
+                self.channels = channels
+                self.calls = 0
+
+            def encode(self, pixels: torch.Tensor) -> torch.Tensor:
+                self.calls += 1
+                b, h, w, _ = pixels.shape
+                return torch.full((b, self.channels, max(1, h // 8), max(1, w // 8)), 0.25, dtype=torch.float32)
+
+        class _StubCLIP:
+            def __init__(self, dim: int = 64) -> None:
+                self.dim = dim
+                self.calls = 0
+
+            def tokenize(self, text: str) -> Dict[str, Any]:
+                return {"stub": [[(ord(c) % 97 + 1, 1.0) for c in (text or "a")[:8]]]}
+
+            def encode_from_tokens(
+                self, tokens: Dict[str, Any], return_pooled: bool = True, return_dict: bool = True
+            ) -> Dict[str, Any]:
+                self.calls += 1
+                seq_len = max(2, len(tokens["stub"][0]))
+                cond = torch.full((1, seq_len, self.dim), float(seq_len) * 0.1, dtype=torch.float32)
+                pooled = torch.full((1, self.dim), 0.5, dtype=torch.float32)
+                attn_mask = torch.ones((1, seq_len), dtype=torch.long)
+                return {"cond": cond, "pooled_output": pooled, "attention_mask": attn_mask}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ds_dir = os.path.join(tmpdir, "local_dataset")
+            os.makedirs(ds_dir, exist_ok=True)
+            for idx, cap in enumerate(("a red cube", "a blue sphere")):
+                img = Image.new("RGB", (64, 64), color=(50 * idx + 40, 80, 120))
+                img.save(os.path.join(ds_dir, f"img_{idx}.png"))
+                with open(os.path.join(ds_dir, f"img_{idx}.txt"), "w", encoding="utf-8") as f:
+                    f.write(cap)
+
+            loader = OmniLoRADatasetLoader()
+            ds_obj, _ = loader.load_dataset(
+                dataset_path=ds_dir,
+                trigger_word="ohwx",
+                default_caption="photo",
+                resolution=64,
+                batch_size=1,
+                num_repeats=2,
+                aspect_ratio_bucketing=False,
+                center_crop=True,
+                random_flip=True,
+                caption_dropout=0.0,
+                use_alpha_mask=False,
+            )
+
+            pre = OmniLoRAPrecomputeConditioning()
+            vae = _StubVAE(channels=16)
+            clip = _StubCLIP(dim=64)
+
+            # 0. Before cache exists, check_lazy_status requests both vae and clip
+            self.assertEqual(
+                pre.check_lazy_status(dataset=ds_obj, disk_cache="auto (load or save)"),
+                ["vae", "clip"],
+            )
+
+            # 1. Initial run encodes via VAE + CLIP and saves `.omni_lora_cache/*.safetensors`
+            (bundle_1,) = pre.precompute(
+                dataset=ds_obj,
+                offload_encoders_after_cache=False,
+                vae=vae,
+                clip=clip,
+                disk_cache="auto (load or save)",
+            )
+            # After cache exists, check_lazy_status returns [] so ComfyUI skips VAELoader & CLIPLoader completely!
+            self.assertEqual(
+                pre.check_lazy_status(dataset=ds_obj, disk_cache="auto (load or save)"),
+                [],
+            )
+            # In rebuild or off mode, check_lazy_status still requests vae & clip
+            self.assertEqual(
+                pre.check_lazy_status(dataset=ds_obj, disk_cache="rebuild (overwrite)"),
+                ["vae", "clip"],
+            )
+            self.assertGreater(vae.calls, 0)
+            self.assertGreater(clip.calls, 0)
+            self.assertEqual(len(bundle_1.batches), 4)  # 2 unique * 2 repeats
+
+            cache_dir = resolve_dataset_cache_dir(ds_obj)
+            self.assertIsNotNone(cache_dir)
+            assert cache_dir is not None
+            cache_files = [f for f in os.listdir(cache_dir) if f.endswith(".safetensors")]
+            self.assertEqual(len(cache_files), 1)
+
+            # 2. Reload on a copied folder at a brand-new path with vae=None, clip=None (zero encoder calls)
+            cloud_dir = os.path.join(tmpdir, "colab_unzipped_dataset")
+            shutil.copytree(ds_dir, cloud_dir)
+            ds_cloud, _ = loader.load_dataset(
+                dataset_path=cloud_dir,
+                trigger_word="ohwx",
+                default_caption="photo",
+                resolution=64,
+                batch_size=1,
+                num_repeats=3,
+                aspect_ratio_bucketing=False,
+                center_crop=True,
+                random_flip=True,
+                caption_dropout=0.0,
+                use_alpha_mask=False,
+            )
+            (bundle_2,) = pre.precompute(
+                dataset=ds_cloud,
+                offload_encoders_after_cache=False,
+                vae=None,
+                clip=None,
+                disk_cache="auto (load or save)",
+            )
+            self.assertEqual(len(bundle_2.batches), 6)  # 2 unique * 3 repeats
+            self.assertTrue(torch.allclose(bundle_1.batches[0]["latents"].float(), bundle_2.batches[0]["latents"].float()))
+            self.assertTrue(
+                torch.allclose(bundle_1.batches[0]["prompt_embeds"].float(), bundle_2.batches[0]["prompt_embeds"].float())
+            )
+            self.assertIn("attention_mask", bundle_2.batches[0].get("extra_conds", {}))
+            self.assertIsNotNone(bundle_2.uncond_prompt_embeds)
+
+            # 3. Mismatched model dimensions must NOT load the incompatible cache
+            fp_cloud = compute_dataset_fingerprint(ds_cloud)
+            wrong_model_sig = {"vae_class": "", "clip_class": "", "model_arch": "", "latent_channels": 4, "context_dim": 768}
+            miss_wrong_dim = find_and_load_conditioning_cache(
+                cache_dir=os.path.join(cloud_dir, CACHE_DIR_NAME),
+                dataset_fp=fp_cloud,
+                encoder_sig=wrong_model_sig,
+                target_dtype=torch.float32,
+                dataset_root=cloud_dir,
+            )
+            self.assertIsNone(miss_wrong_dim)
+
+            # 4. Editing a caption invalidates the fingerprint so stale cache is not reused
+            with open(os.path.join(cloud_dir, "img_0.txt"), "w", encoding="utf-8") as f:
+                f.write("a green pyramid")
+            ds_edited, _ = loader.load_dataset(
+                dataset_path=cloud_dir,
+                trigger_word="ohwx",
+                default_caption="photo",
+                resolution=64,
+                batch_size=1,
+                num_repeats=1,
+                aspect_ratio_bucketing=False,
+                center_crop=True,
+                random_flip=True,
+                caption_dropout=0.0,
+                use_alpha_mask=False,
+            )
+            with self.assertRaises(ValueError):
+                pre.precompute(
+                    dataset=ds_edited,
+                    offload_encoders_after_cache=False,
+                    vae=None,
+                    clip=None,
+                    disk_cache="auto (load or save)",
+                )
             install_comfy_runtime_hooks()
 
     def test_example_workflows_and_version_metadata_parity(self) -> None:

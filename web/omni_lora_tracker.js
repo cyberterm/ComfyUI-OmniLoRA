@@ -1300,9 +1300,25 @@ class OmniLossTrackerWidget {
       const lrVal = Number(latest.lr);
       this.statLr.textContent = Number.isFinite(lrVal) && lrVal > 0 ? lrVal.toExponential(2) : "--";
 
-      if (run.status === "completed") {
-        const stepSec = Number(latest.step_sec);
-        this.statSpeed.textContent = Number.isFinite(stepSec) && stepSec > 0 ? `${stepSec.toFixed(2)}s/st · Done` : "Done";
+      if (run.status === "completed" || run.status === "interrupted") {
+        let avgStepSec = Number(run.avg_sec_per_step);
+        if (!Number.isFinite(avgStepSec) || avgStepSec <= 0) {
+          let sumSec = 0;
+          let countSec = 0;
+          for (let i = 0; i < run.data.length; i++) {
+            const s = Number(run.data[i].step_sec);
+            if (Number.isFinite(s) && s > 0) {
+              sumSec += s;
+              countSec++;
+            }
+          }
+          avgStepSec = countSec > 0 ? sumSec / countSec : Number(latest.step_sec);
+        }
+        const statusLabel = run.status === "completed" ? "Done" : "Stopped";
+        this.statSpeed.textContent =
+          Number.isFinite(avgStepSec) && avgStepSec > 0
+            ? `avg ${avgStepSec.toFixed(2)}s/st · ${statusLabel}`
+            : statusLabel;
       } else {
         const etaSec = Math.max(0, Math.round(Number(latest.eta_sec) || 0));
         const eta =
@@ -1343,6 +1359,11 @@ class OmniLossTrackerWidget {
   deleteRun(runId) {
     if (!runId) return;
     const targetId = String(runId);
+    const targetRun = this.runs.find((r) => r && r.id === targetId);
+    if (targetRun && targetRun.status === "active") {
+      // Never delete a training run that is currently in progress
+      return;
+    }
     this._dismissedRunIds.add(targetId);
     this.runs = this.runs.filter((r) => r.id !== targetId);
     if (this.activeRunId === targetId) {
@@ -1367,22 +1388,34 @@ class OmniLossTrackerWidget {
   }
 
   clearAllRuns() {
+    const activeRuns = [];
     this.runs.forEach((r) => {
-      if (r && r.id) this._dismissedRunIds.add(String(r.id));
+      if (!r || !r.id) return;
+      if (r.status === "active") {
+        activeRuns.push(r);
+      } else {
+        this._dismissedRunIds.add(String(r.id));
+      }
     });
-    this.runs = [];
-    this.activeRunId = null;
+    this.runs = activeRuns;
+    this.activeRunId = activeRuns.length > 0 ? activeRuns[activeRuns.length - 1].id : null;
     this.zoomDomain = null;
     this.rebuildKnownBuckets();
     this.updateRunHistoryUI();
     this.syncControlButtonsUI();
-    this.resetStatsUI();
+    const active = this.getActiveRun();
+    if (active) {
+      this.updateStatsFromRun(active);
+    } else {
+      this.resetStatsUI();
+    }
     this.saveState();
     this.render();
     if (this._modalCanvas) {
       this.render(this._modalCanvas);
     }
-    this.fetchMetricsSnapshot(`clear_runs=all&_t=${Date.now()}`).catch(() => {});
+    const clearParam = activeRuns.length > 0 ? "inactive" : "all";
+    this.fetchMetricsSnapshot(`clear_runs=${clearParam}&_t=${Date.now()}`).catch(() => {});
   }
 
   updateRunHistoryUI() {
@@ -1674,6 +1707,8 @@ class OmniLossTrackerWidget {
       if (!sr || !sr.run_id) return;
       if (sr.status === "active") {
         activeOnServer.add(sr.run_id);
+        // Never keep an actively running training session suppressed in _dismissedRunIds
+        this._dismissedRunIds.delete(sr.run_id);
       }
 
       const existing = this.runs.find((r) => r.id === sr.run_id);

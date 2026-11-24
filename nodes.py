@@ -31,6 +31,7 @@ import inspect
 import json
 import logging
 import math
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -42,6 +43,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .backends import detect_and_configure, sanitize_module_no_fp64, trim_process_working_set
+from .conditioning_cache import (
+    compute_dataset_fingerprint,
+    find_and_load_conditioning_cache,
+    has_matching_conditioning_cache,
+    resolve_dataset_cache_dir,
+    resolve_encoder_signature,
+    save_conditioning_cache,
+)
 from .dataset import OmniLoRADataset, OmniLoRADatasetConfig
 from .diagnostics import report_exception
 from .lora import LoRAConfig, LoRAInjector, release_streamed_weight_buffers
@@ -635,8 +644,6 @@ class OmniLoRAPrecomputeConditioning:
         return {
             "required": {
                 "dataset": ("OMNILORA_DATASET",),
-                "vae": ("VAE",),
-                "clip": ("CLIP",),
                 "offload_encoders_after_cache": (
                     "BOOLEAN",
                     {
@@ -646,6 +653,9 @@ class OmniLoRAPrecomputeConditioning:
                 ),
             },
             "optional": {
+                "vae": ("VAE", {"lazy": True}),
+                "clip": ("CLIP", {"lazy": True}),
+                "model": ("MODEL",),
                 "pass_control_to_clip": (
                     ["auto", "enabled", "disabled"],
                     {
@@ -671,13 +681,66 @@ class OmniLoRAPrecomputeConditioning:
                         "tooltip": "Optional user-defined prompt wrapper template applied before CLIP encoding (supports `{prompt}` substitution, or `{}` as a ComfyUI `llama_template` override on LLM/VLM tokenizers). Leave empty to use captions and ComfyUI's native tokenizer template as-is.",
                     },
                 ),
+                "disk_cache": (
+                    ["auto (load or save)", "off", "rebuild (overwrite)"],
+                    {
+                        "default": "auto (load or save)",
+                        "tooltip": "Save/load pre-encoded VAE latents and CLIP embeddings as a portable .safetensors file inside `<dataset_path>/.omni_lora_cache/`. In 'auto' mode, if a matching cache is found for your dataset + model, VAE and CLIP do not even need to be connected or loaded!",
+                    },
+                ),
             },
         }
 
     RETURN_TYPES = ("OMNILORA_CACHED_DATA",)
     RETURN_NAMES = ("cached_data",)
     FUNCTION = "precompute"
+    OUTPUT_NODE = True
     CATEGORY = "OmniLoRA/Training"
+
+    def check_lazy_status(
+        self,
+        dataset: OmniLoRADataset,
+        offload_encoders_after_cache: bool = True,
+        vae: Optional[Any] = None,
+        clip: Optional[Any] = None,
+        model: Optional[Any] = None,
+        pass_control_to_clip: str = "auto",
+        clip_vision_resolution: int = 384,
+        clip_prompt_template: str = "",
+        disk_cache: str = "auto (load or save)",
+    ) -> List[str]:
+        """
+        ComfyUI lazy-evaluation hook: when `disk_cache` is `"auto (load or save)"` and a
+        matching `.safetensors` pre-cache already exists in `<dataset_path>/.omni_lora_cache/`,
+        return `[]` so ComfyUI completely skips executing upstream `VAELoader` and `CLIPLoader`
+        (zero disk read, zero RAM, zero encoding).
+        """
+        cache_mode = str(disk_cache or "off").strip().lower()
+        if cache_mode.startswith("auto"):
+            cache_dir = resolve_dataset_cache_dir(dataset)
+            ds_raw = getattr(getattr(dataset, "config", None), "dataset_path", "")
+            dataset_root = os.path.abspath(ds_raw.strip()) if isinstance(ds_raw, str) and ds_raw.strip() else None
+            if cache_dir or dataset_root:
+                dataset_fp = compute_dataset_fingerprint(
+                    dataset,
+                    clip_prompt_template=str(clip_prompt_template or ""),
+                    pass_control_to_clip=str(pass_control_to_clip or "auto"),
+                    clip_vision_resolution=int(clip_vision_resolution),
+                )
+                encoder_sig = resolve_encoder_signature(vae=vae, clip=clip, model=model)
+                if has_matching_conditioning_cache(
+                    cache_dir=cache_dir,
+                    dataset_fp=dataset_fp,
+                    encoder_sig=encoder_sig,
+                    dataset_root=dataset_root,
+                ):
+                    return []
+        needed: List[str] = []
+        if vae is None:
+            needed.append("vae")
+        if clip is None:
+            needed.append("clip")
+        return needed
 
     @staticmethod
     def _clip_supports_images_kwarg(clip: Any) -> bool:
@@ -1336,6 +1399,173 @@ class OmniLoRAPrecomputeConditioning:
 
         try:
             with torch.no_grad():
+                # Pre-warm `prompt_cache` via batched encoding for single-encoder LLM/CLIP models
+                # (e.g. Qwen3.5-9B int8_convrot, Qwen2.5-VL, UMT5, T5, Gemma2, CLIP-L) so 9B+ text
+                # encoders stream/dequantize weights once per batch of 8 captions instead of once
+                # per caption (5-10x faster on CPU and avoids repeated XLA overhead on TPU).
+                cond_stage_model = getattr(clip, "cond_stage_model", None)
+                clip_name = getattr(cond_stage_model, "clip", None)
+                sub_encoder = getattr(cond_stage_model, clip_name, None) if isinstance(clip_name, str) else None
+                sub_special = getattr(sub_encoder, "special_tokens", None) if sub_encoder is not None else None
+                pad_tok_id = sub_special.get("pad") if isinstance(sub_special, dict) else None
+                clip_load_dev = getattr(getattr(clip, "patcher", None), "load_device", None)
+                clip_runs_on_cpu = getattr(clip_load_dev, "type", str(clip_load_dev or "")).startswith("cpu")
+                can_batch_clip = (
+                    clip_runs_on_cpu
+                    and sub_encoder is not None
+                    and callable(getattr(sub_encoder, "encode", None))
+                    and callable(getattr(clip, "load_model", None))
+                    and isinstance(pad_tok_id, int)
+                    and not hasattr(cond_stage_model, "clip_g")
+                )
+                if can_batch_clip:
+                    try:
+                        # Gather all unique text-only prompts (no VLM control image) + uncond ""
+                        unique_text_jobs: Dict[Tuple[str, str, bool, str], Tuple[str, Optional[str]]] = {}
+                        for b_idx in range(num_stage2):
+                            if use_streaming and streaming_batch_plans is not None:
+                                b_chunk = streaming_batch_plans[b_idx]
+                                for s_obj in b_chunk:
+                                    if use_clip_vision and bool(s_obj.has_control):
+                                        continue
+                                    f_txt, l_tpl = self._apply_prompt_template(
+                                        s_obj.caption, clip_prompt_template, clip_supports_llama_tpl
+                                    )
+                                    ck = (f_txt, "", False, l_tpl or "")
+                                    if ck not in unique_text_jobs:
+                                        unique_text_jobs[ck] = (f_txt, l_tpl)
+                            else:
+                                b_prompts = prompt_batches[b_idx]
+                                b_ctrls = resolved_ctrl_batches[b_idx]
+                                for p_j, p_txt in enumerate(b_prompts):
+                                    c_px_j = b_ctrls[p_j] if p_j < len(b_ctrls) else None
+                                    c_has_j = bool(
+                                        isinstance(c_px_j, torch.Tensor) and c_px_j.ndim >= 3 and c_px_j.numel() > 0
+                                    )
+                                    if use_clip_vision and c_has_j:
+                                        continue
+                                    f_txt, l_tpl = self._apply_prompt_template(
+                                        p_txt, clip_prompt_template, clip_supports_llama_tpl
+                                    )
+                                    ck = (f_txt, "", False, l_tpl or "")
+                                    if ck not in unique_text_jobs:
+                                        unique_text_jobs[ck] = (f_txt, l_tpl)
+                        # Include unconditional "" prompt in the batch too
+                        uncond_ck = ("", "", False, "")
+                        if uncond_ck not in unique_text_jobs:
+                            unique_text_jobs[uncond_ck] = ("", None)
+
+                        # Tokenize eligible single-chunk, unit-weight prompts
+                        tokenized_jobs: List[Tuple[Tuple[str, str, bool, str], List[int]]] = []
+                        for ck, (f_txt, l_tpl) in unique_text_jobs.items():
+                            tok_kw: Dict[str, Any] = {}
+                            if l_tpl is not None:
+                                tok_kw["llama_template"] = l_tpl
+                            try:
+                                toks = clip.tokenize(f_txt, **tok_kw) if tok_kw else clip.tokenize(f_txt)
+                            except TypeError:
+                                toks = clip.tokenize(f_txt)
+                            if (
+                                isinstance(toks, dict)
+                                and len(toks) == 1
+                                and clip_name in toks
+                                and isinstance(toks[clip_name], list)
+                                and len(toks[clip_name]) == 1
+                            ):
+                                seq = toks[clip_name][0]
+                                if (
+                                    isinstance(seq, list)
+                                    and len(seq) > 0
+                                    and all(
+                                        isinstance(item, (tuple, list))
+                                        and len(item) >= 2
+                                        and isinstance(item[0], int)
+                                        and float(item[1]) == 1.0
+                                        for item in seq
+                                    )
+                                ):
+                                    tokenized_jobs.append((ck, [int(item[0]) for item in seq]))
+
+                        if len(tokenized_jobs) >= 2:
+                            if callable(getattr(cond_stage_model, "reset_clip_options", None)):
+                                cond_stage_model.reset_clip_options()
+                            clip_layer_idx = getattr(clip, "layer_idx", None)
+                            if clip_layer_idx is not None and callable(getattr(cond_stage_model, "set_clip_options", None)):
+                                cond_stage_model.set_clip_options({"layer": clip_layer_idx})
+                            clip.load_model()
+                            exec_dev = getattr(getattr(clip, "patcher", None), "load_device", None)
+                            if exec_dev is not None and callable(getattr(cond_stage_model, "set_clip_options", None)):
+                                cond_stage_model.set_clip_options({"execution_device": exec_dev})
+                            uses_attn_mask = bool(getattr(sub_encoder, "enable_attention_masks", False))
+                            # Sort by token length so similarly-sized captions share a batch with minimal padding
+                            tokenized_jobs.sort(key=lambda item: len(item[1]))
+                            clip_batch_size = 8
+                            # Group into batches (if encoder does not use attention_mask, only group identical lengths)
+                            job_batches: List[List[Tuple[Tuple[str, str, bool, str], List[int]]]] = []
+                            cur_grp: List[Tuple[Tuple[str, str, bool, str], List[int]]] = []
+                            for job in tokenized_jobs:
+                                if cur_grp and (
+                                    len(cur_grp) >= clip_batch_size
+                                    or (not uses_attn_mask and len(job[1]) != len(cur_grp[0][1]))
+                                ):
+                                    job_batches.append(cur_grp)
+                                    cur_grp = []
+                                cur_grp.append(job)
+                            if cur_grp:
+                                job_batches.append(cur_grp)
+
+                            encoded_count = 0
+                            for grp in job_batches:
+                                if len(grp) < 2:
+                                    continue
+                                _check_comfy_interrupt()
+                                max_l = max(len(ids) for _, ids in grp)
+                                padded_ids = [
+                                    ids + [int(pad_tok_id)] * (max_l - len(ids))
+                                    for _, ids in grp
+                                ]
+                                enc_res = sub_encoder.encode(padded_ids)
+                                if not isinstance(enc_res, (tuple, list)) or len(enc_res) < 2:
+                                    continue
+                                out_t, pool_t = enc_res[0], enc_res[1]
+                                extra_t = enc_res[2] if len(enc_res) > 2 and isinstance(enc_res[2], dict) else {}
+                                if not (isinstance(out_t, torch.Tensor) and out_t.ndim == 3 and int(out_t.shape[0]) == len(grp)):
+                                    continue
+                                with torch.inference_mode(False):
+                                    for gi, (ck, ids) in enumerate(grp):
+                                        orig_l = len(ids)
+                                        c_clean = out_t[gi, :orig_l, :].detach().to(device="cpu", dtype=dtype).clone()
+                                        p_clean = (
+                                            pool_t[gi].detach().to(device="cpu", dtype=dtype).clone()
+                                            if (isinstance(pool_t, torch.Tensor) and pool_t.ndim >= 2 and int(pool_t.shape[0]) == len(grp))
+                                            else None
+                                        )
+                                        clean_extra: Dict[str, Any] = {}
+                                        for ek, ev in extra_t.items():
+                                            if isinstance(ev, torch.Tensor) and ev.ndim >= 2 and int(ev.shape[0]) == len(grp):
+                                                ev_i = ev[gi, :orig_l] if int(ev.shape[1]) == max_l else ev[gi]
+                                                clean_extra[ek] = ev_i.unsqueeze(0).detach().to(device="cpu").clone()
+                                            elif not isinstance(ev, torch.Tensor):
+                                                clean_extra[ek] = ev
+                                        prompt_cache[ck] = (c_clean, p_clean, clean_extra)
+                                        encoded_count += 1
+                            if encoded_count > 0:
+                                logging.info(
+                                    "[OmniLoRA] Batched text encoding: pre-encoded %d unique prompts in %d batch(es) (batch_size=%d).",
+                                    encoded_count,
+                                    sum(1 for g in job_batches if len(g) >= 2),
+                                    clip_batch_size,
+                                )
+                    except Exception as batch_exc:
+                        report_exception(
+                            "nodes.batched_clip_prewarm",
+                            "Batched CLIP pre-encoding failed; falling back to per-prompt encoding",
+                            batch_exc,
+                            level=logging.WARNING,
+                            once=True,
+                            logger_name="nodes",
+                        )
+
                 for batch_i in range(num_stage2):
                     _check_comfy_interrupt()
                     if use_streaming and streaming_batch_plans is not None and streaming_dataset is not None:
@@ -1590,85 +1820,225 @@ class OmniLoRAPrecomputeConditioning:
         pass_control_to_clip: str = "auto",
         clip_vision_resolution: int = 384,
         clip_prompt_template: str = "",
+        disk_cache: str = "auto (load or save)",
     ) -> Tuple[CachedConditioningBundle]:
         plan = detect_and_configure(preferred_backend="auto", requested_dtype="auto")
         dtype = plan.backend.torch_dtype
-
-        # Encode unique samples once (temporarily setting num_repeats=1 if >1), then expand repeats in CPU RAM.
-        # Prefer lazy streaming (`build_streaming_batch_plans`) so folder-backed datasets decode only
-        # 1 image pair at a time in O(1) CPU RAM instead of materializing the whole dataset up front.
         orig_repeats = max(1, dataset.config.num_repeats)
-        dataset.config.num_repeats = 1
-        use_streaming_plans = hasattr(dataset, "build_streaming_batch_plans") and hasattr(
-            dataset, "decode_sample_tensors"
-        )
-        unique_batch_plans: Optional[List[List[Any]]] = None
-        unique_pixel_batches: List[torch.Tensor] = []
-        unique_prompt_batches: List[List[str]] = []
-        unique_mask_batches: List[Optional[torch.Tensor]] = []
-        unique_control_batches: List[List[Optional[torch.Tensor]]] = []
-        unique_control_source_batches: List[List[Optional[str]]] = []
-        try:
-            if use_streaming_plans:
-                unique_batch_plans = dataset.build_streaming_batch_plans()
-            elif hasattr(dataset, "build_batches_full"):
-                (
-                    unique_pixel_batches,
-                    unique_prompt_batches,
-                    unique_mask_batches,
-                    unique_control_batches,
-                    unique_control_source_batches,
-                ) = dataset.build_batches_full()
-            elif hasattr(dataset, "build_batches_with_masks"):
-                unique_pixel_batches, unique_prompt_batches, unique_mask_batches = dataset.build_batches_with_masks()
-                unique_control_batches = [[None] * int(px.shape[0]) for px in unique_pixel_batches]
-                unique_control_source_batches = [[None] * int(px.shape[0]) for px in unique_pixel_batches]
-            else:
-                unique_pixel_batches, unique_prompt_batches = dataset.build_batches()
-                unique_mask_batches = [None] * len(unique_pixel_batches)
-                unique_control_batches = [[None] * int(px.shape[0]) for px in unique_pixel_batches]
-                unique_control_source_batches = [[None] * int(px.shape[0]) for px in unique_pixel_batches]
-        finally:
-            dataset.config.num_repeats = orig_repeats
 
-        self._last_clip_used_control_images = False
-        (
-            unique_cached_batches,
-            latent_scaled,
-            uncond_embed,
-            uncond_pooled,
-            uncond_extra,
-        ) = self._encode_with_comfy_or_adapter(
-            pixel_batches=unique_pixel_batches,
-            prompt_batches=unique_prompt_batches,
-            dtype=dtype,
-            vae=vae,
-            clip=clip,
-            model=model,
-            offload_between_encoders=offload_encoders_after_cache,
-            encode_flipped_latents=bool(dataset.config.random_flip),
-            mask_batches=unique_mask_batches,
-            control_batches=unique_control_batches,
-            control_source_batches=unique_control_source_batches,
-            pass_control_to_clip=pass_control_to_clip,
-            clip_vision_resolution=int(clip_vision_resolution),
-            clip_prompt_template=str(clip_prompt_template or ""),
-            streaming_dataset=dataset if use_streaming_plans else None,
-            streaming_batch_plans=unique_batch_plans if use_streaming_plans else None,
+        cache_mode = str(disk_cache or "off").strip().lower()
+        use_disk_cache = cache_mode.startswith("auto") or cache_mode.startswith("rebuild")
+        cache_dir = resolve_dataset_cache_dir(dataset) if use_disk_cache else None
+        dataset_root = (
+            os.path.abspath(dataset.config.dataset_path.strip())
+            if (use_disk_cache and isinstance(getattr(dataset.config, "dataset_path", ""), str) and dataset.config.dataset_path.strip())
+            else None
         )
+        dataset_fp = (
+            compute_dataset_fingerprint(
+                dataset,
+                clip_prompt_template=str(clip_prompt_template or ""),
+                pass_control_to_clip=str(pass_control_to_clip or "auto"),
+                clip_vision_resolution=int(clip_vision_resolution),
+            )
+            if use_disk_cache
+            else ""
+        )
+        encoder_sig = resolve_encoder_signature(vae=vae, clip=clip, model=model) if use_disk_cache else {}
+
+        loaded_from_cache = False
+        unique_cached_batches: List[Dict[str, Any]] = []
+        latent_scaled = True
+        uncond_embed: Optional[torch.Tensor] = None
+        uncond_pooled: Optional[torch.Tensor] = None
+        uncond_extra: Dict[str, Any] = {}
+        self._last_clip_used_control_images = False
+
+        if cache_mode.startswith("auto") and (cache_dir or dataset_root):
+            cached_hit = find_and_load_conditioning_cache(
+                cache_dir=cache_dir,
+                dataset_fp=dataset_fp,
+                encoder_sig=encoder_sig,
+                target_dtype=dtype,
+                dataset_root=dataset_root,
+            )
+            if cached_hit is not None:
+                (
+                    unique_cached_batches,
+                    latent_scaled,
+                    uncond_embed,
+                    uncond_pooled,
+                    uncond_extra,
+                    clip_used_ctrl,
+                    _hit_path,
+                ) = cached_hit
+                self._last_clip_used_control_images = bool(clip_used_ctrl)
+                loaded_from_cache = True
+                if model is not None and unique_cached_batches:
+                    adapter = resolve_model_adapter(model_id="auto", comfy_model=model)
+                    backbone = adapter.diffusion_model
+                    if isinstance(backbone, nn.Module):
+                        first_lat = unique_cached_batches[0].get("latents")
+                        first_emb = unique_cached_batches[0].get("prompt_embeds")
+                        if isinstance(first_lat, torch.Tensor):
+                            adapter._validate_and_prepare_latents(
+                                first_lat,
+                                backbone=backbone,
+                                latent_scaled=latent_scaled,
+                            )
+                        if isinstance(first_emb, torch.Tensor):
+                            adapter._validate_context_dim(first_emb, backbone=backbone)
+
+        if not loaded_from_cache:
+            if (vae is None or clip is None) and model is None:
+                hint = f" in '{cache_dir}'" if cache_dir else ""
+                raise ValueError(
+                    f"[OmniLoRA] No matching disk pre-cache found{hint}. "
+                    "Connect `vae` and `clip` to encode the dataset and build the cache."
+                )
+            # Encode unique samples once (temporarily setting num_repeats=1 if >1), then expand repeats in CPU RAM.
+            # Prefer lazy streaming (`build_streaming_batch_plans`) so folder-backed datasets decode only
+            # 1 image pair at a time in O(1) CPU RAM instead of materializing the whole dataset up front.
+            dataset.config.num_repeats = 1
+            use_streaming_plans = hasattr(dataset, "build_streaming_batch_plans") and hasattr(
+                dataset, "decode_sample_tensors"
+            )
+            unique_batch_plans: Optional[List[List[Any]]] = None
+            unique_pixel_batches: List[torch.Tensor] = []
+            unique_prompt_batches: List[List[str]] = []
+            unique_mask_batches: List[Optional[torch.Tensor]] = []
+            unique_control_batches: List[List[Optional[torch.Tensor]]] = []
+            unique_control_source_batches: List[List[Optional[str]]] = []
+            try:
+                if use_streaming_plans:
+                    unique_batch_plans = dataset.build_streaming_batch_plans()
+                elif hasattr(dataset, "build_batches_full"):
+                    (
+                        unique_pixel_batches,
+                        unique_prompt_batches,
+                        unique_mask_batches,
+                        unique_control_batches,
+                        unique_control_source_batches,
+                    ) = dataset.build_batches_full()
+                elif hasattr(dataset, "build_batches_with_masks"):
+                    unique_pixel_batches, unique_prompt_batches, unique_mask_batches = dataset.build_batches_with_masks()
+                    unique_control_batches = [[None] * int(px.shape[0]) for px in unique_pixel_batches]
+                    unique_control_source_batches = [[None] * int(px.shape[0]) for px in unique_pixel_batches]
+                else:
+                    unique_pixel_batches, unique_prompt_batches = dataset.build_batches()
+                    unique_mask_batches = [None] * len(unique_pixel_batches)
+                    unique_control_batches = [[None] * int(px.shape[0]) for px in unique_pixel_batches]
+                    unique_control_source_batches = [[None] * int(px.shape[0]) for px in unique_pixel_batches]
+            finally:
+                dataset.config.num_repeats = orig_repeats
+
+            self._last_clip_used_control_images = False
+            (
+                unique_cached_batches,
+                latent_scaled,
+                uncond_embed,
+                uncond_pooled,
+                uncond_extra,
+            ) = self._encode_with_comfy_or_adapter(
+                pixel_batches=unique_pixel_batches,
+                prompt_batches=unique_prompt_batches,
+                dtype=dtype,
+                vae=vae,
+                clip=clip,
+                model=model,
+                offload_between_encoders=offload_encoders_after_cache,
+                encode_flipped_latents=bool(dataset.config.random_flip),
+                mask_batches=unique_mask_batches,
+                control_batches=unique_control_batches,
+                control_source_batches=unique_control_source_batches,
+                pass_control_to_clip=pass_control_to_clip,
+                clip_vision_resolution=int(clip_vision_resolution),
+                clip_prompt_template=str(clip_prompt_template or ""),
+                streaming_dataset=dataset if use_streaming_plans else None,
+                streaming_batch_plans=unique_batch_plans if use_streaming_plans else None,
+            )
+            del (
+                unique_batch_plans,
+                unique_pixel_batches,
+                unique_prompt_batches,
+                unique_mask_batches,
+                unique_control_batches,
+                unique_control_source_batches,
+            )
+            if use_disk_cache and cache_dir and unique_cached_batches:
+                save_conditioning_cache(
+                    cache_dir=cache_dir,
+                    unique_batches=unique_cached_batches,
+                    latent_scaled=latent_scaled,
+                    uncond_embed=uncond_embed,
+                    uncond_pooled=uncond_pooled,
+                    uncond_extra=uncond_extra,
+                    clip_used_control_images=bool(getattr(self, "_last_clip_used_control_images", False)),
+                    num_controlled_images=int(getattr(dataset, "num_controlled_images", 0) or 0),
+                    resolution=int(dataset.config.resolution),
+                    dataset_fp=dataset_fp,
+                    encoder_sig=encoder_sig,
+                )
+        # On Cloud TPU, pad all cached text embeddings to a single static sequence length
+        # (multiple of 64) so variable caption lengths never trigger XLA HLO recompilations.
+        if plan.backend.backend_id == "tpu" and unique_cached_batches:
+            seq_lens: List[int] = []
+            embed_dim: Optional[int] = None
+            for cb in unique_cached_batches:
+                pe = cb.get("prompt_embeds")
+                if isinstance(pe, torch.Tensor) and pe.ndim == 3:
+                    seq_lens.append(int(pe.shape[1]))
+                    if embed_dim is None:
+                        embed_dim = int(pe.shape[2])
+            if isinstance(uncond_embed, torch.Tensor) and uncond_embed.ndim == 3 and (
+                embed_dim is None or int(uncond_embed.shape[2]) == embed_dim
+            ):
+                seq_lens.append(int(uncond_embed.shape[1]))
+            if seq_lens:
+                max_seq = max(seq_lens)
+                target_seq = max(64, ((max_seq + 63) // 64) * 64)
+
+                def _pad_seq_tensor(t: torch.Tensor, target_l: int) -> torch.Tensor:
+                    cur_l = int(t.shape[1])
+                    if cur_l >= target_l:
+                        return t
+                    pad_shape = list(t.shape)
+                    pad_shape[1] = target_l - cur_l
+                    pad = torch.zeros(pad_shape, dtype=t.dtype, device=t.device)
+                    return torch.cat([t, pad], dim=1)
+
+                for cb in unique_cached_batches:
+                    pe = cb.get("prompt_embeds")
+                    if isinstance(pe, torch.Tensor) and pe.ndim == 3 and int(pe.shape[1]) < target_seq:
+                        orig_l = int(pe.shape[1])
+                        cb["prompt_embeds"] = _pad_seq_tensor(pe, target_seq)
+                        ec = cb.get("extra_conds")
+                        if isinstance(ec, dict):
+                            am = ec.get("attention_mask")
+                            if isinstance(am, torch.Tensor) and am.ndim == 2 and int(am.shape[1]) == orig_l:
+                                ec["attention_mask"] = _pad_seq_tensor(am, target_seq)
+                if (
+                    isinstance(uncond_embed, torch.Tensor)
+                    and uncond_embed.ndim == 3
+                    and int(uncond_embed.shape[1]) < target_seq
+                    and (embed_dim is None or int(uncond_embed.shape[2]) == embed_dim)
+                ):
+                    orig_u = int(uncond_embed.shape[1])
+                    uncond_embed = _pad_seq_tensor(uncond_embed, target_seq)
+                    if isinstance(uncond_extra, dict):
+                        u_am = uncond_extra.get("attention_mask")
+                        if isinstance(u_am, torch.Tensor) and u_am.ndim == 2 and int(u_am.shape[1]) == orig_u:
+                            uncond_extra["attention_mask"] = _pad_seq_tensor(u_am, target_seq)
+                logging.info(
+                    "[OmniLoRA] TPU static-shape padding: aligned prompt_embeds to seq_len=%d to avoid XLA recompilations.",
+                    target_seq,
+                )
+
         has_ctrl_latents = any(
             isinstance(b.get("control_latents"), list) and any(c is not None for c in b["control_latents"])
             for b in unique_cached_batches
         )
         num_ctrl_imgs = int(getattr(dataset, "num_controlled_images", 0) or 0)
-        del (
-            unique_batch_plans,
-            unique_pixel_batches,
-            unique_prompt_batches,
-            unique_mask_batches,
-            unique_control_batches,
-            unique_control_source_batches,
-        )
 
         # Free uncompressed [3, H, W] float32 pixel & control tensors from host RAM now that latents are cached
         if hasattr(dataset, "release_pixel_memory"):
@@ -2571,6 +2941,7 @@ class OmniLoRATrainer:
             last_metrics = None
             saved_checkpoints: List[str] = []
             last_completed_step = 0
+            prompt_server: Optional[Any] = None
             filtered_resumed_state: Dict[str, torch.Tensor] = (
                 dict(resumed_bundle.state_dict) if resumed_bundle is not None else {}
             )
@@ -3232,6 +3603,7 @@ class OmniLoRATrainer:
                     "final_loss": round(float(last_metrics.loss) if last_metrics else 0.0, 6),
                     "final_ema_loss": round(final_avg_loss, 6),
                     "total_time_sec": round(total_train_time, 2),
+                    "avg_sec_per_step": round(avg_step_time, 3),
                 }
                 TRACKER_STORE.complete_run(complete_payload)
                 if prompt_server is not None:
@@ -3301,12 +3673,20 @@ class OmniLoRATrainer:
                     except Exception as emerg_exc:
                         logging.warning(f"[OmniLoRA] Could not write emergency checkpoint: {emerg_exc}")
 
+                elapsed_int = (
+                    max(0.0, time.perf_counter() - start_train_time)
+                    if "start_train_time" in locals()
+                    else 0.0
+                )
+                avg_int_step = (elapsed_int / completed_step_idx) if completed_step_idx > 0 else 0.0
                 interrupt_payload = {
                     "node_id": str(unique_id or ""),
                     "run_id": locals().get("run_id", ""),
                     "step": completed_step_idx,
                     "reason": str(exc),
                     "emergency_checkpoint": emergency_ckpt_path_str,
+                    "total_time_sec": round(elapsed_int, 2),
+                    "avg_sec_per_step": round(avg_int_step, 3),
                 }
                 TRACKER_STORE.interrupt_run(interrupt_payload)
                 if prompt_server is not None:
@@ -3321,7 +3701,14 @@ class OmniLoRATrainer:
                             once=True,
                             logger_name="nodes",
                         )
-                logging.error(f"[OmniLoRA] Training interrupted or failed ({type(exc).__name__}: {exc})")
+                if completed_step_idx > 0:
+                    logging.error(
+                        f"[OmniLoRA] Training interrupted or failed at step {completed_step_idx} "
+                        f"after {elapsed_int:.2f}s (avg {avg_int_step:.2f}s/step) "
+                        f"({type(exc).__name__}: {exc})"
+                    )
+                else:
+                    logging.error(f"[OmniLoRA] Training interrupted or failed ({type(exc).__name__}: {exc})")
                 raise
             finally:
                 # CRITICAL: Synchronize the accelerator stream first, disable gradient checkpointing,
@@ -3547,6 +3934,8 @@ class OmniLoRATrainer:
                 "resumed_lora_layers": setup_info.get("resumed_lora_layers", 0),
                 "steps_this_session": steps,
                 "cumulative_steps_trained": cumulative_steps,
+                "total_time_sec": round(total_train_time, 2),
+                "avg_sec_per_step": round(avg_step_time, 3),
                 "grad_accum_steps": grad_accum_steps,
                 "auto_checkpoints_saved": saved_checkpoints,
                 "checkpoint_dir": str(ckpt_target_dir),

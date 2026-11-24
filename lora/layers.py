@@ -797,7 +797,7 @@ class LoRALinear(nn.Module):
         dev_type = lora_in.device.type
         if torch.is_grad_enabled() and getattr(lora_in, "_base", None) is not None:
             lora_in = lora_in.clone()
-        if target_dt == torch.float32 and dev_type in ("cuda", "xpu", "cpu", "mps", "npu", "hpu"):
+        if target_dt == torch.float32 and dev_type in ("cuda", "xpu", "cpu", "mps", "npu", "hpu", "tpu"):
             try:
                 with torch.amp.autocast(device_type=dev_type, enabled=False):
                     return self.lora_B(self.lora_A(lora_in)) * self.scaling
@@ -1870,7 +1870,21 @@ class LoRAInjector:
         safetensors `mmap` backing, and uniform device placement for `LoraLoader` and `KSampler`.
         Also resets any model-level prefix KV caches (such as `QwenImage21Transformer2DModel.reset_prefix_cache`).
         """
-        # Wait for any in-flight GPU kernels on XPU/CUDA/NPU/HPU before replacing or releasing GPU parameters
+        # Wait for any in-flight GPU/TPU kernels before replacing or releasing device parameters
+        accel = getattr(torch, "accelerator", None)
+        if accel is not None and callable(getattr(accel, "is_available", None)) and callable(getattr(accel, "synchronize", None)):
+            try:
+                if accel.is_available():
+                    accel.synchronize()
+            except (RuntimeError, AttributeError) as exc:
+                report_exception(
+                    "lora.uninject_sync.accelerator",
+                    "torch.accelerator.synchronize() failed during LoRA uninject",
+                    exc,
+                    level=logging.DEBUG,
+                    once=True,
+                    logger_name="lora",
+                )
         for dev_attr in ("xpu", "cuda", "npu", "hpu"):
             dev_mod = getattr(torch, dev_attr, None)
             if dev_mod is not None and hasattr(dev_mod, "is_available") and hasattr(dev_mod, "synchronize"):

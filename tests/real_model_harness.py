@@ -2596,6 +2596,21 @@ def verify_real_model_on_backend(
             )
         assert bool(torch.isfinite(patched_out).all()), f"[{spec.model_id}] non-finite patched output on {device}/{dtype}"
         drift = float((patched_out.float() - baseline_out.float()).abs().max().item())
+        # On 16-bit BF16 hardware (7-bit mantissa, ~0.8% ULP), 2-step smoke deltas on deeply gated
+        # synthetic backbones (e.g. PixDiT) can fall below 0.5 ULP at strength=1.0; re-probe at
+        # strength=10.0 to confirm the patched LoRA is genuinely active in the forward graph.
+        if drift <= 1e-6 and dtype == torch.bfloat16 and lora_up_max > 1e-4:
+            patched_10x, _ = comfy.sd.load_lora_for_models(
+                spec.patcher, spec.clip, lora_bundle.state_dict, strength_model=10.0, strength_clip=10.0
+            )
+            with torch.inference_mode(False):
+                patched_10x_out = _run_real_forward_probe(
+                    patched_10x, adapter, probe_batch, device, dtype, patch_model_weights=True
+                )
+            assert bool(torch.isfinite(patched_10x_out).all()), (
+                f"[{spec.model_id}] non-finite 10x-patched output on {device}/{dtype}"
+            )
+            drift = float((patched_10x_out.float() - baseline_out.float()).abs().max().item())
         assert drift > 1e-6, (
             f"[{spec.model_id}] trained LoRA had zero measurable effect on {device}/{dtype} "
             f"(drift={drift}, lora_up_max={lora_up_max:.3e})"

@@ -1150,12 +1150,16 @@ class HardwareBackend(abc.ABC):
         free_mb = min(total_mb, max(0.0, free_mb))
 
         # 1. Hardware Available Ceiling (OS / WDDM paging reserve / CUDA context reserve)
-        if self.backend_id in ("xpu", "mps"):
+        # Headless Cloud TPUs have no display/WDDM overhead, so they only need a minimal 3% HBM reserve.
+        if self.backend_id == "tpu":
+            os_driver_reserve_mb = max(256.0, total_mb * 0.03)
+        elif self.backend_id in ("xpu", "mps"):
             os_driver_reserve_mb = max(768.0, total_mb * 0.125)
         else:
             os_driver_reserve_mb = max(512.0, total_mb * 0.085)
         spec_usable_mb = max(512.0, total_mb - os_driver_reserve_mb)
-        base_usable_mb = min(spec_usable_mb, max(512.0, free_mb - 384.0)) if free_mb > 512.0 else spec_usable_mb
+        free_pad_mb = 128.0 if self.backend_id == "tpu" else 384.0
+        base_usable_mb = min(spec_usable_mb, max(512.0, free_mb - free_pad_mb)) if free_mb > 512.0 else spec_usable_mb
         usable_mb = max(512.0, base_usable_mb - reserve_user_mb)
 
         # 2. Exact Optimizer + Gradient Footprint (from trainable_numel & optimizer state buffers in FP32)
@@ -1229,21 +1233,34 @@ class HardwareBackend(abc.ABC):
                 ckpt_inputs_mb = ckpt_inputs_cpu_mb
             base_headroom_mb = allocator_workspace_mb + activation_allowance_mb + optimizer_allowance_mb + ckpt_inputs_mb
         else:
-            # NORMAL_VRAM (12 GB - 23.9 GB, including 14.56 GiB T4 and 16 GB GPUs):
-            # Offload checkpointed block input snapshots to CPU RAM (`ckpt_inputs_cpu_mb`) so 40-60 blocks
-            # never consume 1.1+ GB of GPU VRAM, and scale allocator pool workspace by `peak_single_act_mb`.
-            # On CUDA / ROCm with < 15.5 GB VRAM (e.g. 14.56 GiB Tesla T4 running in fp16 + GradScaler),
-            # `cudaMallocAsync` requires ~1.4 GB of additional unfragmented pool headroom so the driver
-            # never stalls trimming the pool mid-backward.
-            offload_ckpt_inputs = True
-            ckpt_inputs_mb = ckpt_inputs_cpu_mb
-            if self.backend_id in ("xpu", "mps"):
-                allocator_workspace_mb = max(2450.0, 1750.0 + 6.5 * peak_single_act_mb)
-            elif total_mb < 15600.0 or needs_fp32_master:
-                allocator_workspace_mb = max(3600.0, 2650.0 + 10.0 * peak_single_act_mb)
+            # NORMAL_VRAM (12 GB - 23.9 GB, including 14.56 GiB T4 and 16 GB GPUs/TPUs):
+            # On headless Cloud TPU, CPU<->HBM copies are synchronous PJRT stalls, so use a lean
+            # XLA workspace reserve and keep checkpointed block inputs in HBM whenever they fit.
+            if self.backend_id == "tpu":
+                allocator_workspace_mb = max(1200.0, 900.0 + 4.0 * peak_single_act_mb)
+                headroom_gpu_ckpt = allocator_workspace_mb + activation_allowance_mb + optimizer_allowance_mb + ckpt_inputs_gpu_mb
+                if total_model_mb > 0.0 and (total_model_mb + headroom_gpu_ckpt) <= usable_mb:
+                    offload_ckpt_inputs = False
+                    ckpt_inputs_mb = ckpt_inputs_gpu_mb
+                else:
+                    offload_ckpt_inputs = True
+                    ckpt_inputs_mb = ckpt_inputs_cpu_mb
+                base_headroom_mb = allocator_workspace_mb + activation_allowance_mb + optimizer_allowance_mb + ckpt_inputs_mb
             else:
-                allocator_workspace_mb = max(2500.0, 1850.0 + 8.0 * peak_single_act_mb)
-            base_headroom_mb = allocator_workspace_mb + activation_allowance_mb + optimizer_allowance_mb + ckpt_inputs_mb
+                # Offload checkpointed block input snapshots to CPU RAM (`ckpt_inputs_cpu_mb`) so 40-60 blocks
+                # never consume 1.1+ GB of GPU VRAM, and scale allocator pool workspace by `peak_single_act_mb`.
+                # On CUDA / ROCm with < 15.5 GB VRAM (e.g. 14.56 GiB Tesla T4 running in fp16 + GradScaler),
+                # `cudaMallocAsync` requires ~1.4 GB of additional unfragmented pool headroom so the driver
+                # never stalls trimming the pool mid-backward.
+                offload_ckpt_inputs = True
+                ckpt_inputs_mb = ckpt_inputs_cpu_mb
+                if self.backend_id in ("xpu", "mps"):
+                    allocator_workspace_mb = max(2450.0, 1750.0 + 6.5 * peak_single_act_mb)
+                elif total_mb < 15600.0 or needs_fp32_master:
+                    allocator_workspace_mb = max(3600.0, 2650.0 + 10.0 * peak_single_act_mb)
+                else:
+                    allocator_workspace_mb = max(2500.0, 1850.0 + 8.0 * peak_single_act_mb)
+                base_headroom_mb = allocator_workspace_mb + activation_allowance_mb + optimizer_allowance_mb + ckpt_inputs_mb
 
         needs_streaming_buffer = (
             module is None

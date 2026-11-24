@@ -29,7 +29,15 @@ from ..diagnostics import report_exception
 
 
 def _has_any_torch_accelerator() -> bool:
-    """Return True if any PyTorch hardware accelerator is available in this runtime."""
+    """
+    Return True if any hardware accelerator natively recognized by ComfyUI's `comfy.model_management`
+    (`cuda`, `xpu`, `npu`, `hpu`, `mps`) is available.
+    Note: Cloud TPU (`torch.tpu` / `torch_xla`) is NOT natively recognized by upstream ComfyUI's
+    `get_torch_device()`, so TPU-only runtimes intentionally return False here so
+    `_configure_comfy_cpu_fallback_if_needed()` sets `cli_args.cpu = True` before `comfy.model_management`
+    imports (preventing `AssertionError: Torch not compiled with CUDA enabled`), while `TPUBackend`
+    independently detects `tpu:0` / `xla:0` via `torch.accelerator` / `torch_xla`.
+    """
     try:
         if torch.cuda.is_available():
             return True

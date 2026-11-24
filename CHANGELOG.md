@@ -5,6 +5,33 @@ Versioning follows [Semantic Versioning](https://semver.org/) and is tracked via
 
 ---
 
+## [1.2.0] - 2026-11-24
+
+### Added
+- **First-Class Google Cloud TPU (`torch.tpu` / `torch_xla`) Support & Automatic ComfyUI Hook**:
+  - Upgraded `TPUBackend` (`backends/tpu.py`) to prefer Google's native `torch.tpu` (`torch-tpu` / `tpu:0` via `torch.accelerator`) with legacy `torch_xla` (`xla:0`) fallback, plus `TPUBackend.optimize_module()` `openxla` compilation support.
+  - Added `install_comfy_tpu_hooks()` (auto-invoked on import in `__init__.py`, opt-out via `OMNI_LORA_DISABLE_COMFY_TPU_HOOK=1`), automatically upgrading vanilla ComfyUI launched with `--cpu --use-pytorch-cross-attention` to `tpu:0` in native `bfloat16` (no external boot wrapper required), switching attention to `attention_pytorch`, deduplicating `absl` root log handlers, and defaulting recurrent LLM text encoders to CPU (`OMNI_LORA_TPU_TEXT_ENCODER=1` to opt in).
+  - Verified **44/44 unmocked ComfyUI architectures** and live **5.15B `moss_image_base_bf16`** training on Cloud TPU v5e-1 (`~4.4 s/step`, 100% HBM-resident).
+- **Portable `.safetensors` Disk Pre-Cache & Lazy `VAE`/`CLIP` Skipping (`conditioning_cache.py`, `nodes.py`)**:
+  - Added `disk_cache` (`"auto (load or save)"` default, `"off"`, `"rebuild (overwrite)"`) and optional `model` input to `OmniLoRAPrecomputeConditioning`, saving unique pre-encoded latents, text embeddings, masks, control latents, and `uncond_*` tensors into `<dataset_path>/.omni_lora_cache/` using portable content fingerprints (relative filenames + byte sizes + captions — transfers cleanly from Windows to Colab/Linux).
+  - Marked `vae` and `clip` as ComfyUI `lazy: True` with `check_lazy_status()` so `VAELoader` and `CLIPLoader` are **completely skipped** on cache hits (zero disk read, zero RAM, zero encoding), and added `OUTPUT_NODE = True` + standalone [`example_workflows/omni_lora_precache_only_workflow.json`](./example_workflows/omni_lora_precache_only_workflow.json).
+- **TPU & Cross-Backend Training Speedups**:
+  - Tuned headless TPU HBM budget in `compute_vram_budget()` (3% HBM reserve, lean XLA workspace, and HBM-resident checkpointed block inputs when they fit) so 9.6 GB models stay 100% HBM-resident on 16 GB TPU v5e-1 instead of CPU-streaming.
+  - Added static-shape `prompt_embeds` padding (multiple of 64) on TPU to eliminate XLA recompilations from variable caption lengths.
+  - Switched `clip_grad_norm_fp32_` in `train_step()` to zero-`.item()` on-device clipping (`return_norm=False`) and removed redundant per-step TPU `synchronize()` stalls.
+  - Added batched CPU text encoding (`batch_size = 8`) in `OmniLoRAPrecomputeConditioning` for single-encoder LLM/CLIP models running on CPU.
+
+### Fixed
+- **TPU Masked SDPA Backward `NaN`**: Routed masked TPU training SDPA in `_wrapped_sdpa` (`pipelines/lora_trainer.py`) through FP32-softmax math attention with finite `-1e9` masking (fixing `hunyuan_video`, `ltxav_2_0`, `ltxav_2_5` on `torch-tpu`).
+- **Loss Tracker Active-Run Protection (`web/omni_lora_tracker.js`)**: `Clear` and `Delete` now preserve any `status === "active"` training run (sending `clear_runs=inactive` to `tracker_store.py`), and `↻ Sync` always un-dismisses active runs on the server.
+- **Early Setup Exception Handling (`nodes.py`)**: Initialized `prompt_server = None` before `pipeline.setup()` in `train_lora()` so early setup failures never raise `UnboundLocalError`.
+- **Synced All 7 Example Workflows**: Updated all `example_workflows/*.json` templates to match the latest `OmniLoRAPrecomputeConditioning` schema (`model` optional slot + `disk_cache = "auto (load or save)"`).
+
+### Documentation
+- Updated `README.md` Hardware Backends table (`tpu` $\rightarrow$ **Actively tested on hardware**, `rocm` $\rightarrow$ **Community-tested on hardware**), documented portable disk pre-caching & lazy VAE/CLIP skipping, added `omni_lora_precache_only_workflow.json` to the workflows table, and linked GitHub Discussions (Benchmarks) & Issues.
+
+---
+
 ## [1.1.4] - 2026-11-23
 
 ### Added

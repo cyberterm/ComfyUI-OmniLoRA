@@ -808,6 +808,32 @@ def _install_chunked_sdpa_wrapper() -> None:
                         chunk_q,
                     )
 
+        # On Google Cloud TPU (`torch-tpu`), masked `F.scaled_dot_product_attention` backward can
+        # produce `0 * -inf = NaN` gradients on masked-out padding tokens (affecting HunyuanVideo,
+        # LTXAV 2.0 / 2.5, etc. with `attn_mask != None`). Route masked training SDPA on TPU through
+        # FP32-softmax math attention with finite `-1e9` masking while keeping unmasked TPU SDPA fused.
+        if q_dev_type == "tpu" and attn_mask is not None and torch.is_grad_enabled():
+            scale_f = float(scale) if scale is not None else (1.0 / math.sqrt(max(1.0, float(query.shape[-1]))))
+            k_eff, v_eff = key, value
+            if enable_gqa and k_eff.ndim >= 4 and query.ndim >= 4 and k_eff.shape[-3] != query.shape[-3]:
+                rep = max(1, int(query.shape[-3]) // max(1, int(k_eff.shape[-3])))
+                k_eff = k_eff.repeat_interleave(rep, dim=-3)
+                v_eff = v_eff.repeat_interleave(rep, dim=-3)
+            scores = torch.matmul(query.to(dtype=torch.float32), k_eff.transpose(-2, -1).to(dtype=torch.float32)) * scale_f
+            if is_causal:
+                q_len, k_len = int(query.shape[-2]), int(k_eff.shape[-2])
+                c_mask = torch.ones((q_len, k_len), dtype=torch.bool, device=scores.device).tril()
+                scores = scores.masked_fill(~c_mask, -1e9)
+            if attn_mask.dtype == torch.bool or not attn_mask.is_floating_point():
+                m_bool = attn_mask if attn_mask.dtype == torch.bool else attn_mask.to(dtype=torch.bool)
+                scores = scores.masked_fill(~m_bool.to(device=scores.device), -1e9)
+            else:
+                m_f32 = attn_mask.to(device=scores.device, dtype=torch.float32)
+                m_f32 = torch.where(torch.isfinite(m_f32), m_f32, torch.full_like(m_f32, -1e9))
+                scores = scores + m_f32
+            probs = torch.softmax(scores, dim=-1).to(dtype=v_eff.dtype)
+            return torch.matmul(probs, v_eff)
+
         sdpa_kwargs: Dict[str, Any] = {}
         if scale is not None:
             sdpa_kwargs["scale"] = scale
@@ -2076,14 +2102,18 @@ class LoRATrainingPipeline:
         self._op_wrappers_finalizer: Optional[weakref.finalize] = None
 
     @staticmethod
-    def clip_grad_norm_fp32_(parameters: List[nn.Parameter], max_norm: float) -> float:
+    def clip_grad_norm_fp32_(
+        parameters: List[nn.Parameter],
+        max_norm: float,
+        return_norm: bool = True,
+    ) -> float:
         """
         Pure-FP32 L2 gradient norm clipping:
         - Never uses `torch.float64` (`.double()`).
         - Avoids `aten::linalg_vector_norm` on `float16` tensors (which overflows when squared norms
           exceed `65504.0`).
-        - Accumulates squared norms in `torch.float32` on the target device via a single batched
-          stack reduction and a single host read.
+        - Performs clipping completely on-device without a host `.item()` sync when `return_norm=False`
+          (eliminating a blocking TPU/GPU pipeline stall on every training step).
         """
         if not parameters or max_norm <= 0.0:
             return 0.0
@@ -2097,12 +2127,31 @@ class LoRATrainingPipeline:
                 for g in grads
             ]
             total_sq = torch.stack(sq_norms).sum()
-            total_norm = float(torch.sqrt(total_sq).item())
-            if math.isfinite(total_norm) and total_norm > max_norm:
-                clip_coef = float(max_norm / (total_norm + 1e-6))
-                for g in grads:
-                    g.mul_(clip_coef)
-            return total_norm
+            total_norm_t = torch.sqrt(total_sq)
+            if return_norm:
+                total_norm = float(total_norm_t.item())
+                if math.isfinite(total_norm) and total_norm > max_norm:
+                    clip_coef = float(max_norm / (total_norm + 1e-6))
+                    for g in grads:
+                        g.mul_(clip_coef)
+                return total_norm
+            max_norm_t = torch.tensor(float(max_norm), dtype=torch.float32, device=dev)
+            ones_t = torch.ones((), dtype=torch.float32, device=dev)
+            raw_coef = max_norm_t / (total_norm_t + 1e-6)
+            clip_coef_t = torch.where(
+                torch.isfinite(total_norm_t) & (total_norm_t > max_norm_t),
+                raw_coef,
+                ones_t,
+            )
+            coef_cache: Dict[Tuple[torch.device, torch.dtype], torch.Tensor] = {}
+            for g in grads:
+                ck = (g.device, g.dtype)
+                c_val = coef_cache.get(ck)
+                if c_val is None:
+                    c_val = clip_coef_t.to(device=g.device, dtype=g.dtype)
+                    coef_cache[ck] = c_val
+                g.mul_(c_val)
+            return 0.0
 
     def _resolve_lora_torch_dtype(self) -> torch.dtype:
         """
@@ -2596,10 +2645,17 @@ class LoRATrainingPipeline:
                     "[OmniLoRA] Auto-enabled gradient_checkpointing=True to keep large model activations within VRAM."
                 )
 
+            # On Cloud TPU, host<->HBM copies are synchronous PJRT stalls, so keep checkpointed
+            # block inputs resident in HBM unless layers are actually offloaded to CPU.
+            headroom_offload_trigger = (
+                self.backend.backend_id != "tpu"
+                and usable_mb > 0.0
+                and (usable_mb - resident_mb) < 4200.0
+            )
             if self.backend.backend_id != "cpu" and (
                 bool(vram_budget.get("offload_ckpt_inputs", 0.0))
                 or offloaded_mb > 0.0
-                or (usable_mb > 0.0 and (usable_mb - resident_mb) < 4200.0)
+                or headroom_offload_trigger
             ):
                 setattr(self.backbone, "_omni_offload_ckpt_inputs", True)
 
@@ -2664,7 +2720,8 @@ class LoRATrainingPipeline:
         dtype = self.backend.torch_dtype
         accum_steps = max(1, self.config.gradient_accumulation_steps)
 
-        self.backend.synchronize()
+        if self.backend.backend_id != "tpu":
+            self.backend.synchronize()
         t0 = time.perf_counter()
 
         max_oom_retries = 3
@@ -2723,7 +2780,7 @@ class LoRATrainingPipeline:
                     # (`UR_RESULT_ERROR_DEVICE_LOST`) or piles up unfreed sub-step activation buffers.
                     accumulated_loss = accumulated_loss + raw_loss.detach().to(device=device, dtype=torch.float32)
                     del raw_loss, loss
-                    if accum_steps > 1 or self.backend.backend_id == "tpu":
+                    if accum_steps > 1:
                         self.backend.synchronize()
 
                 # Single host-device scalar read inside the OOM-guarded try block
@@ -2806,15 +2863,18 @@ class LoRATrainingPipeline:
             )
 
         trainable_params = self._trainable_params or LoRAInjector.get_trainable_parameters(self.backbone)
+        # On TPU, avoid a blocking .item() sync in grad clipping; on GPU backends (XPU/CUDA/ROCm),
+        # checking total_norm lets us skip all 350+ g.mul_() kernel launches whenever total_norm <= max_norm.
+        clip_return_norm = self.backend.backend_id != "tpu"
         if self.grad_scaler is not None:
             self.grad_scaler.unscale_(self.optimizer)
             if self.config.max_grad_norm > 0:
-                self.clip_grad_norm_fp32_(trainable_params, self.config.max_grad_norm)
+                self.clip_grad_norm_fp32_(trainable_params, self.config.max_grad_norm, return_norm=clip_return_norm)
             self.grad_scaler.step(self.optimizer)
             self.grad_scaler.update()
         else:
             if self.config.max_grad_norm > 0:
-                self.clip_grad_norm_fp32_(trainable_params, self.config.max_grad_norm)
+                self.clip_grad_norm_fp32_(trainable_params, self.config.max_grad_norm, return_norm=clip_return_norm)
             self.optimizer.step()
 
         applied_lr = float(self.optimizer.param_groups[0]["lr"])

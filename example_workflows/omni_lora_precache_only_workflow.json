@@ -1,0 +1,272 @@
+{
+    "last_node_id":  5,
+    "last_link_id":  3,
+    "nodes":  [
+                  {
+                      "id":  1,
+                      "type":  "OmniLoRADatasetLoader",
+                      "title":  "OmniLoRA Dataset \u0026 Prompt Loader",
+                      "pos":  [
+                                  60,
+                                  100
+                              ],
+                      "size":  [
+                                   360,
+                                   460
+                               ],
+                      "flags":  {
+
+                                },
+                      "order":  0,
+                      "mode":  0,
+                      "inputs":  [
+                                     {
+                                         "name":  "images",
+                                         "type":  "IMAGE",
+                                         "link":  null
+                                     },
+                                     {
+                                         "name":  "masks",
+                                         "type":  "MASK",
+                                         "link":  null
+                                     },
+                                     {
+                                         "name":  "control_images",
+                                         "type":  "IMAGE",
+                                         "link":  null
+                                     }
+                                 ],
+                      "outputs":  [
+                                      {
+                                          "name":  "dataset",
+                                          "type":  "OMNILORA_DATASET",
+                                          "links":  [
+                                                        1
+                                                    ],
+                                          "slot_index":  0
+                                      },
+                                      {
+                                          "name":  "dataset_info",
+                                          "type":  "STRING",
+                                          "links":  null,
+                                          "slot_index":  1
+                                      }
+                                  ],
+                      "properties":  {
+                                         "Node name for S\u0026R":  "OmniLoRADatasetLoader"
+                                     },
+                      "widgets_values":  [
+                                             "./datasets/my_dataset",
+                                             "ohwx_subject",
+                                             "a photograph of subject",
+                                             1024,
+                                             1,
+                                             1,
+                                             true,
+                                             true,
+                                             true,
+                                             0.05,
+                                             "",
+                                             true,
+                                             0.1,
+                                             "",
+                                             "match_target"
+                                         ]
+                  },
+                  {
+                      "id":  2,
+                      "type":  "VAELoader",
+                      "pos":  [
+                                  60,
+                                  610
+                              ],
+                      "size":  [
+                                   360,
+                                   70
+                               ],
+                      "flags":  {
+
+                                },
+                      "order":  1,
+                      "mode":  0,
+                      "inputs":  [
+
+                                 ],
+                      "outputs":  [
+                                      {
+                                          "name":  "VAE",
+                                          "type":  "VAE",
+                                          "links":  [
+                                                        2
+                                                    ],
+                                          "slot_index":  0
+                                      }
+                                  ],
+                      "properties":  {
+                                         "Node name for S\u0026R":  "VAELoader"
+                                     },
+                      "widgets_values":  [
+                                             "flux2-vae.safetensors"
+                                         ]
+                  },
+                  {
+                      "id":  3,
+                      "type":  "CLIPLoader",
+                      "pos":  [
+                                  60,
+                                  730
+                              ],
+                      "size":  [
+                                   360,
+                                   110
+                               ],
+                      "flags":  {
+
+                                },
+                      "order":  2,
+                      "mode":  0,
+                      "inputs":  [
+
+                                 ],
+                      "outputs":  [
+                                      {
+                                          "name":  "CLIP",
+                                          "type":  "CLIP",
+                                          "links":  [
+                                                        3
+                                                    ],
+                                          "slot_index":  0
+                                      }
+                                  ],
+                      "properties":  {
+                                         "Node name for S\u0026R":  "CLIPLoader"
+                                     },
+                      "widgets_values":  [
+                                             "qwen35_9b_fp8_e4m3fn.safetensors",
+                                             "moss_image",
+                                             "default"
+                                         ]
+                  },
+                  {
+                      "id":  4,
+                      "type":  "OmniLoRAPrecomputeConditioning",
+                      "title":  "OmniLoRA VAE \u0026 CLIP Pre-Cache (Save to Disk)",
+                      "pos":  [
+                                  520,
+                                  300
+                              ],
+                      "size":  [
+                                   400,
+                                   290
+                               ],
+                      "flags":  {
+
+                                },
+                      "order":  3,
+                      "mode":  0,
+                      "inputs":  [
+                                     {
+                                         "name":  "dataset",
+                                         "type":  "OMNILORA_DATASET",
+                                         "link":  1
+                                     },
+                                     {
+                                         "name":  "vae",
+                                         "type":  "VAE",
+                                         "link":  2
+                                     },
+                                     {
+                                         "name":  "clip",
+                                         "type":  "CLIP",
+                                         "link":  3
+                                     },
+                                     {
+                                         "name":  "model",
+                                         "type":  "MODEL",
+                                         "link":  null
+                                     }
+                                 ],
+                      "outputs":  [
+                                      {
+                                          "name":  "cached_data",
+                                          "type":  "OMNILORA_CACHED_DATA",
+                                          "links":  null,
+                                          "slot_index":  0
+                                      }
+                                  ],
+                      "properties":  {
+                                         "Node name for S\u0026R":  "OmniLoRAPrecomputeConditioning"
+                                     },
+                      "widgets_values":  [
+                                             true,
+                                             "auto",
+                                             384,
+                                             "",
+                                             "auto (load or save)"
+                                         ]
+                  }
+              ],
+    "links":  [
+                  [
+                      1,
+                      1,
+                      0,
+                      4,
+                      0,
+                      "OMNILORA_DATASET"
+                  ],
+                  [
+                      2,
+                      2,
+                      0,
+                      4,
+                      1,
+                      "VAE"
+                  ],
+                  [
+                      3,
+                      3,
+                      0,
+                      4,
+                      2,
+                      "CLIP"
+                  ]
+              ],
+    "groups":  [
+                   {
+                       "title":  "1. Dataset, VAE \u0026 Text Encoder",
+                       "bounding":  [
+                                        40,
+                                        30,
+                                        400,
+                                        840
+                                    ],
+                       "color":  "#1e293b",
+                       "font_size":  20
+                   },
+                   {
+                       "title":  "2. Build Portable .safetensors Pre-Cache (No Trainer Needed)",
+                       "bounding":  [
+                                        490,
+                                        30,
+                                        460,
+                                        840
+                                    ],
+                       "color":  "#1e3a5f",
+                       "font_size":  20
+                   }
+               ],
+    "config":  {
+
+               },
+    "extra":  {
+                  "ds":  {
+                             "scale":  0.9,
+                             "offset":  [
+                                            20,
+                                            20
+                                        ]
+                         }
+              },
+    "version":  0.4
+}
